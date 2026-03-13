@@ -2,8 +2,8 @@
 
 use crate::args::BencherArgs;
 use args::{
-    BencherCommands, BenchmarkCompactionArgs, BenchmarkDbArgs, BenchmarkTransactionArgs,
-    CompactionSubcommands, KeyGeneratorSupplier,
+    BencherCommands, BenchmarkCompactionArgs, BenchmarkDbArgs, BenchmarkMultiWriterArgs,
+    BenchmarkTransactionArgs, CompactionSubcommands, KeyGeneratorSupplier,
 };
 use bytes::Bytes;
 use clap::Parser;
@@ -29,6 +29,7 @@ use transactions::TransactionBench;
 
 mod args;
 pub mod db;
+pub mod multi_writer;
 pub mod stats;
 pub mod system_monitor;
 pub mod transactions;
@@ -65,6 +66,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         BencherCommands::Transaction(subcommand_args) => {
             exec_benchmark_transaction(path.clone(), object_store.clone(), subcommand_args).await;
+        }
+        BencherCommands::MultiWriter(subcommand_args) => {
+            exec_benchmark_multi_writer(path.clone(), object_store.clone(), subcommand_args).await;
         }
     }
 
@@ -178,6 +182,34 @@ async fn exec_benchmark_transaction(
     bencher.run().await;
 
     db.close().await.expect("failed to close db");
+}
+
+async fn exec_benchmark_multi_writer(
+    path: Path,
+    object_store: Arc<dyn ObjectStore>,
+    args: BenchmarkMultiWriterArgs,
+) {
+    let (settings, memory_cache) = args.db_args.config().unwrap();
+    let write_options = WriteOptions {
+        await_durable: args.await_durable,
+    };
+
+    let bencher = multi_writer::MultiWriterBench::new(
+        path,
+        object_store,
+        settings,
+        memory_cache,
+        args.key_gen_supplier(),
+        args.val_len,
+        write_options,
+        args.num_writers,
+        args.concurrency,
+        args.duration.map(|d| Duration::from_secs(d as u64)),
+        args.put_percentage,
+        args.reopen_on_fence,
+        Duration::from_millis(args.reopen_delay_ms),
+    );
+    bencher.run().await;
 }
 
 /// Creates a lock file that's used as a signal to clean up test data.

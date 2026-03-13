@@ -53,6 +53,7 @@ pub(crate) enum BencherCommands {
     Db(BenchmarkDbArgs),
     Compaction(BenchmarkCompactionArgs),
     Transaction(BenchmarkTransactionArgs),
+    MultiWriter(BenchmarkMultiWriterArgs),
 }
 
 #[derive(Args, Clone)]
@@ -418,6 +419,100 @@ pub(crate) struct BenchmarkTransactionArgs {
         default_value_t = false
     )]
     pub(crate) await_durable: bool,
+}
+
+#[derive(Args, Clone)]
+#[command(about = "Benchmark SlateDB with multiple concurrent writers (fencing).")]
+pub(crate) struct BenchmarkMultiWriterArgs {
+    #[clap(flatten)]
+    pub(crate) db_args: DbArgs,
+
+    #[arg(long, help = "The duration in seconds to run the benchmark for.")]
+    pub(crate) duration: Option<u32>,
+
+    #[arg(
+        long,
+        help = "The key generator to use.",
+        default_value_t = KeyGeneratorType::FixedSet
+    )]
+    pub(crate) key_generator: KeyGeneratorType,
+
+    #[arg(
+        long,
+        help = "The number of keys to generate for FixedSet key generator.",
+        default_value_t = 100_000
+    )]
+    pub(crate) key_count: u64,
+
+    #[arg(
+        long,
+        help = "The length of the keys to generate.",
+        default_value_t = 16
+    )]
+    pub(crate) key_len: usize,
+
+    #[arg(
+        long,
+        help = "Whether to await durable writes.",
+        default_value_t = false
+    )]
+    pub(crate) await_durable: bool,
+
+    #[arg(
+        long,
+        help = "The number of concurrent read/write tasks per writer.",
+        default_value_t = 2
+    )]
+    pub(crate) concurrency: u32,
+
+    #[arg(
+        long,
+        help = "The length of the values to generate.",
+        default_value_t = 1024
+    )]
+    pub(crate) val_len: usize,
+
+    #[arg(
+        long,
+        help = "The percentage of writes to perform in each task.",
+        default_value_t = 100
+    )]
+    pub(crate) put_percentage: u32,
+
+    #[arg(
+        long,
+        help = "The number of concurrent Db writer instances.",
+        default_value_t = 3
+    )]
+    pub(crate) num_writers: u32,
+
+    #[arg(
+        long,
+        help = "Whether fenced writers should reopen the database.",
+        default_value_t = true
+    )]
+    pub(crate) reopen_on_fence: bool,
+
+    #[arg(
+        long,
+        help = "Delay in milliseconds before reopening after being fenced.",
+        default_value_t = 100
+    )]
+    pub(crate) reopen_delay_ms: u64,
+}
+
+impl KeyGeneratorSupplier for BenchmarkMultiWriterArgs {
+    fn key_generator(&self) -> KeyGeneratorType {
+        self.key_generator.clone()
+    }
+
+    fn key_len(&self) -> usize {
+        self.key_len
+    }
+
+    fn key_count(&self) -> u64 {
+        self.key_count
+    }
 }
 
 impl KeyGeneratorSupplier for BenchmarkTransactionArgs {
