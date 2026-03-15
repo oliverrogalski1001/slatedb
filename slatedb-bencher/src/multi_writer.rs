@@ -98,6 +98,7 @@ impl MultiWriterBench {
     pub async fn run(&self) {
         let stats = Arc::new(MultiWriterStatsRecorder::new());
         let duration = self.duration.unwrap_or(Duration::MAX);
+        let start = Instant::now();
         let mut writer_handles = Vec::new();
 
         for writer_id in 0..self.num_writers {
@@ -148,6 +149,34 @@ impl MultiWriterBench {
         for handle in writer_handles {
             handle.await.unwrap();
         }
+
+        let elapsed = start.elapsed();
+        let secs = elapsed.as_secs_f64();
+        let total_puts = stats.total_puts.load(Ordering::Relaxed);
+        let total_gets = stats.total_gets.load(Ordering::Relaxed);
+        let total_puts_bytes = stats.total_puts_bytes.load(Ordering::Relaxed);
+        let total_gets_bytes = stats.total_gets_bytes.load(Ordering::Relaxed);
+        let total_fences = stats.total_fences.load(Ordering::Relaxed);
+        let total_fbf = stats.total_fenced_before_flush.load(Ordering::Relaxed);
+        let effective_puts = total_puts.saturating_sub(total_fbf);
+        let effective_puts_bytes =
+            total_puts_bytes.saturating_sub(total_fbf * self.val_len as u64);
+
+        info!(
+            "multi-writer final [elapsed: {:.3}s, put/s: {:.3} ({:.3} MiB/s), effective put/s: {:.3} ({:.3} MiB/s), get/s: {:.3} ({:.3} MiB/s), total: puts={}, effective_puts={}, gets={}, fences={}, fenced-before-flush={}]",
+            secs,
+            total_puts as f64 / secs,
+            total_puts_bytes as f64 / secs / 1_048_576.0,
+            effective_puts as f64 / secs,
+            effective_puts_bytes as f64 / secs / 1_048_576.0,
+            total_gets as f64 / secs,
+            total_gets_bytes as f64 / secs / 1_048_576.0,
+            total_puts,
+            effective_puts,
+            total_gets,
+            total_fences,
+            total_fbf,
+        );
     }
 }
 
