@@ -682,6 +682,12 @@ pub struct Settings {
     #[serde(skip)]
     pub merge_operator: Option<MergeOperatorType>,
 
+    /// Configuration options for key-value separation (BlobDB/WiscKey-style).
+    /// When enabled, values larger than the configured threshold are stored as
+    /// separate blob objects on object storage rather than inline in SST blocks.
+    /// This reduces write amplification during compaction for large-value workloads.
+    pub blob_options: Option<BlobOptions>,
+
     /// The block format for SST files. This is only available in tests
     /// to verify backward compatibility between V1 and V2 formats.
     #[cfg(test)]
@@ -715,6 +721,7 @@ impl std::fmt::Debug for Settings {
             .field("garbage_collector_options", &self.garbage_collector_options)
             .field("filter_bits_per_key", &self.filter_bits_per_key)
             .field("default_ttl", &self.default_ttl)
+            .field("blob_options", &self.blob_options)
             .field(
                 "merge_operator",
                 &self
@@ -918,6 +925,7 @@ impl Default for Settings {
             filter_bits_per_key: 10,
             default_ttl: None,
             merge_operator: None,
+            blob_options: None,
             #[cfg(test)]
             block_format: None,
         }
@@ -1310,6 +1318,58 @@ impl Default for GarbageCollectorOptions {
             wal_options: Some(GarbageCollectorDirectoryOptions::default()),
             compacted_options: Some(GarbageCollectorDirectoryOptions::default()),
             compactions_options: Some(GarbageCollectorDirectoryOptions::default()),
+        }
+    }
+}
+
+/// Configuration for key-value separation (BlobDB/WiscKey-style).
+///
+/// When enabled, values larger than `min_value_size` are stored as individual
+/// blob objects on object storage (under the `blob/` prefix) rather than inline
+/// in SST blocks. The SST row stores a compact blob pointer instead of the
+/// full value. This reduces write amplification during compaction since only
+/// keys and small pointers are rewritten, not large values.
+///
+/// Blob cleanup is handled by deferred batch deletion: compaction records
+/// orphaned blob IDs when keys are dropped, and the garbage collector deletes
+/// them in the background.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BlobOptions {
+    /// The minimum value size in bytes for key-value separation. Values with
+    /// a size greater than or equal to this threshold are stored as separate
+    /// blob objects. Values smaller than this remain inline in SST blocks.
+    ///
+    /// Choosing a good threshold depends on your workload:
+    /// - Lower thresholds (e.g. 1024) reduce write amplification more aggressively
+    ///   but increase the number of blob objects and extra reads on the read path.
+    /// - Higher thresholds (e.g. 8192) keep more values inline for read locality
+    ///   but provide less write amplification savings.
+    ///
+    /// Default: 4096 bytes (4 KiB)
+    pub min_value_size: usize,
+
+    /// Optional compression codec for blob objects. If set, blob values are
+    /// compressed before being written to object storage. This is independent
+    /// of the SST compression codec.
+    ///
+    /// Default: None (no compression)
+    pub blob_compression_codec: Option<CompressionCodec>,
+
+    /// Garbage collection options for orphaned blob objects. Orphaned blobs
+    /// are created when compaction drops a key that references a blob (due to
+    /// overwrites or tombstones).
+    /// None means garbage collection is disabled for blobs (not recommended
+    /// for production — orphaned blobs will accumulate).
+    pub blob_gc_options: Option<GarbageCollectorDirectoryOptions>,
+}
+
+impl Default for BlobOptions {
+    fn default() -> Self {
+        Self {
+            min_value_size: 4096,
+            blob_compression_codec: None,
+            // TODO: Implement blob_gc_options
+            blob_gc_options: None,
         }
     }
 }
