@@ -12,6 +12,7 @@ bitflags! {
         const HAS_EXPIRE_TS = 0b00000010;
         const HAS_CREATE_TS = 0b00000100;
         const MERGE_OPERAND = 0b00001000;
+        const BLOB_REF = 0b00010000;
     }
 }
 
