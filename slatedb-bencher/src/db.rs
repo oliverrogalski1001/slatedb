@@ -204,6 +204,7 @@ impl DbBench {
     pub async fn run(&self) {
         let stats_recorder = Arc::new(DbStatsRecorder::new());
         let mut tasks = Vec::new();
+        let start = Instant::now();
         for _ in 0..self.concurrency {
             let mut task = Task::new(
                 (*self.key_gen_supplier)(),
@@ -218,10 +219,42 @@ impl DbBench {
             );
             tasks.push(tokio::spawn(async move { task.run().await }));
         }
-        tokio::spawn(async move { dump_stats(stats_recorder).await });
+        let stats_clone = stats_recorder.clone();
+        tokio::spawn(async move { dump_stats(stats_clone).await });
         for task in tasks {
             task.await.unwrap();
         }
+
+        let elapsed = start.elapsed();
+        let secs = elapsed.as_secs_f64();
+        let total_puts = stats_recorder.puts();
+        let total_gets = stats_recorder.gets();
+        let total_puts_bytes = stats_recorder
+            .total_puts_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let total_gets_bytes = stats_recorder
+            .total_gets_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let total_gets_hits = stats_recorder
+            .total_gets_hits
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let get_hit_pct = if total_gets > 0 {
+            total_gets_hits as f64 / total_gets as f64 * 100.0
+        } else {
+            0.0
+        };
+
+        info!(
+            "db final [elapsed: {:.3}s, put/s: {:.3} ({:.3} MiB/s), get/s: {:.3} ({:.3} MiB/s), get db hit ratio: {:.3}%, total: puts={}, gets={}]",
+            secs,
+            total_puts as f64 / secs,
+            total_puts_bytes as f64 / secs / 1_048_576.0,
+            total_gets as f64 / secs,
+            total_gets_bytes as f64 / secs / 1_048_576.0,
+            get_hit_pct,
+            total_puts,
+            total_gets,
+        );
     }
 }
 
