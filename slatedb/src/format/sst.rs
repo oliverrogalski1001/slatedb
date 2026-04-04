@@ -128,7 +128,9 @@ impl BlockBuilderWithStats {
         entry: crate::types::RowEntry,
     ) -> Result<bool, crate::error::SlateDBError> {
         match &entry.value {
-            crate::types::ValueDeletable::Value(_) => self.stats.num_puts += 1,
+            crate::types::ValueDeletable::Value(_) | crate::types::ValueDeletable::BlobRef(_) => {
+                self.stats.num_puts += 1
+            }
             crate::types::ValueDeletable::Merge(_) => self.stats.num_merges += 1,
             crate::types::ValueDeletable::Tombstone => self.stats.num_deletes += 1,
         }

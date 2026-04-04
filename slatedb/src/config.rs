@@ -178,6 +178,7 @@
 //!     min_age: '86400s'
 //! ```
 //!
+use crate::merge_operator::MergeOperatorType;
 use duration_str::{deserialize_duration, deserialize_option_duration};
 use figment::providers::{Env, Format, Json, Toml, Yaml};
 use figment::{Figment, Metadata, Provider};

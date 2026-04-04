@@ -105,6 +105,17 @@ impl RowEntry {
     }
 
     #[cfg(test)]
+    pub(crate) fn new_blob_ref(key: &[u8], value: &[u8], seq: u64) -> Self {
+        Self {
+            key: Bytes::copy_from_slice(key),
+            value: ValueDeletable::BlobRef(Bytes::copy_from_slice(value)),
+            seq,
+            create_ts: None,
+            expire_ts: None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_tombstone(key: &[u8], seq: u64) -> Self {
         Self {
             key: Bytes::copy_from_slice(key),
@@ -159,6 +170,7 @@ impl From<RowEntry> for KeyValue {
 /// - `Value`: A regular value entry
 /// - `Merge`: A merge operand (used with merge operators)
 /// - `Tombstone`: A deletion marker
+/// - `BlobRef`: A reference to a blob stored separately
 ///
 /// Compaction filters receive this type to determine entry type and decide
 /// how to handle each entry.
@@ -170,6 +182,8 @@ pub enum ValueDeletable {
     Merge(Bytes),
     /// A tombstone (deletion marker).
     Tombstone,
+    /// A blob reference
+    BlobRef(Bytes),
 }
 
 #[allow(clippy::len_without_is_empty)]
@@ -177,7 +191,9 @@ impl ValueDeletable {
     /// Returns the length of the value in bytes, or 0 for tombstones.
     pub fn len(&self) -> usize {
         match self {
-            ValueDeletable::Value(v) | ValueDeletable::Merge(v) => v.len(),
+            ValueDeletable::Value(v) | ValueDeletable::Merge(v) | ValueDeletable::BlobRef(v) => {
+                v.len()
+            }
             ValueDeletable::Tombstone => 0,
         }
     }
@@ -187,10 +203,12 @@ impl ValueDeletable {
         matches!(self, ValueDeletable::Tombstone)
     }
 
-    /// Returns the value bytes if this is a Value or Merge, None for Tombstone.
+    /// Returns the inner bytes if this is a Value, Merge, or BlobRef. None for Tombstone.
     pub fn as_bytes(&self) -> Option<Bytes> {
         match self {
-            ValueDeletable::Value(v) | ValueDeletable::Merge(v) => Some(v.clone()),
+            ValueDeletable::Value(v) | ValueDeletable::Merge(v) | ValueDeletable::BlobRef(v) => {
+                Some(v.clone())
+            }
             ValueDeletable::Tombstone => None,
         }
     }
@@ -228,6 +246,18 @@ mod tests {
         assert_eq!(entry.encoded_size(prefix_len), expected);
     }
 
+    // BlobRef encoding is the same layout as Value:
+    //   13 + key_suffix_len + 4 + value_len
+    // = 17 + key_suffix_len + value_len
+    #[rstest]
+    #[case(0, 25)] // key_suffix_len=5, value_len=3: 17 + 5 + 3 = 25
+    #[case(2, 23)] // key_suffix_len=3, value_len=3: 17 + 3 + 3 = 23
+    #[case(4, 21)] // key_suffix_len=1, value_len=3: 17 + 1 + 3 = 21
+    fn encoded_size_blob_ref(#[case] prefix_len: usize, #[case] expected: usize) {
+        let entry = RowEntry::new_blob_ref(b"hello", b"val", 1);
+        assert_eq!(entry.encoded_size(prefix_len), expected);
+    }
+
     #[test]
     fn encoded_size_matches_sst_row_entry() {
         let entry = RowEntry::new_value(b"prefixkey", b"value", 1);
@@ -240,5 +270,37 @@ mod tests {
             None,
         );
         assert_eq!(entry.encoded_size(6), sst_entry.size());
+    }
+
+    #[test]
+    fn encoded_size_matches_sst_row_entry_blob_ref() {
+        let entry = RowEntry::new_blob_ref(b"prefixkey", b"blobid", 1);
+        let sst_entry = SstRowEntry::new(
+            6,
+            Bytes::from("key"),
+            1,
+            ValueDeletable::BlobRef(Bytes::from("blobid")),
+            None,
+            None,
+        );
+        assert_eq!(entry.encoded_size(6), sst_entry.size());
+    }
+
+    #[test]
+    fn blob_ref_len() {
+        let v = ValueDeletable::BlobRef(Bytes::from("abc"));
+        assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    fn blob_ref_is_not_tombstone() {
+        let v = ValueDeletable::BlobRef(Bytes::from("abc"));
+        assert!(!v.is_tombstone());
+    }
+
+    #[test]
+    fn blob_ref_as_bytes() {
+        let v = ValueDeletable::BlobRef(Bytes::from("abc"));
+        assert_eq!(v.as_bytes(), Some(Bytes::from("abc")));
     }
 }

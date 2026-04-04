@@ -69,6 +69,7 @@ impl SstRowEntryV2 {
             ValueDeletable::Value(_) => RowFlags::default(),
             ValueDeletable::Merge(_) => RowFlags::MERGE_OPERAND,
             ValueDeletable::Tombstone => RowFlags::TOMBSTONE,
+            ValueDeletable::BlobRef(_) => RowFlags::BLOB_REF,
         };
         if self.expire_ts.is_some() {
             flags |= RowFlags::HAS_EXPIRE_TS;
@@ -93,7 +94,9 @@ impl SstRowEntryV2 {
         let shared_bytes_len = varint_len(self.shared_bytes);
         let unshared_bytes_len = varint_len(self.key_suffix.len() as u32);
         let value_len = match &self.value {
-            ValueDeletable::Value(v) | ValueDeletable::Merge(v) => v.len(),
+            ValueDeletable::Value(v) | ValueDeletable::Merge(v) | ValueDeletable::BlobRef(v) => {
+                v.len()
+            }
             ValueDeletable::Tombstone => 0,
         };
         let value_len_varint_size = varint_len(value_len as u32);
@@ -130,7 +133,9 @@ impl SstRowCodecV2 {
         encode_varint(output, row.key_suffix.len() as u32);
 
         let value_len = match &row.value {
-            ValueDeletable::Value(v) | ValueDeletable::Merge(v) => v.len(),
+            ValueDeletable::Value(v) | ValueDeletable::Merge(v) | ValueDeletable::BlobRef(v) => {
+                v.len()
+            }
             ValueDeletable::Tombstone => 0,
         };
         encode_varint(output, value_len as u32);
@@ -140,7 +145,7 @@ impl SstRowCodecV2 {
 
         // Encode value (if not tombstone)
         match &row.value {
-            ValueDeletable::Value(v) | ValueDeletable::Merge(v) => {
+            ValueDeletable::Value(v) | ValueDeletable::Merge(v) | ValueDeletable::BlobRef(v) => {
                 output.put(v.as_ref());
             }
             ValueDeletable::Tombstone => {
@@ -208,6 +213,8 @@ impl SstRowCodecV2 {
             ValueDeletable::Tombstone
         } else if flags.contains(RowFlags::MERGE_OPERAND) {
             ValueDeletable::Merge(value_bytes.unwrap_or_else(Bytes::new))
+        } else if flags.contains(RowFlags::BLOB_REF) {
+            ValueDeletable::BlobRef(value_bytes.unwrap_or_else(Bytes::new))
         } else {
             ValueDeletable::Value(value_bytes.unwrap_or_else(Bytes::new))
         };
@@ -249,6 +256,16 @@ impl SstRowCodecV2 {
                 message: "Tombstone and Merge Operand are mutually exclusive.".to_string(),
             });
         }
+        if parsed.contains(RowFlags::BLOB_REF)
+            && parsed.intersects(RowFlags::TOMBSTONE | RowFlags::MERGE_OPERAND)
+        {
+            return Err(SlateDBError::InvalidRowFlags {
+                encoded_bits: parsed.bits(),
+                known_bits: RowFlags::all().bits(),
+                message: "BlobRef is mutually exclusive with Tombstone and Merge Operand."
+                    .to_string(),
+            });
+        }
         Ok(parsed)
     }
 }
@@ -265,6 +282,7 @@ mod tests {
             "value" => ValueDeletable::Value(Bytes::from(data.unwrap())),
             "tombstone" => ValueDeletable::Tombstone,
             "merge" => ValueDeletable::Merge(Bytes::from(data.unwrap())),
+            "blob_ref" => ValueDeletable::BlobRef(Bytes::from(data.unwrap())),
             _ => panic!("unknown value tag: {}", tag),
         }
     }
@@ -275,6 +293,8 @@ mod tests {
     #[case("tombstone", 5, b"tomb".to_vec(), 42, "tombstone", None, Some(500), None)]
     #[case("tombstone with create_ts", 0, b"deleted_key".to_vec(), 999, "tombstone", None, Some(12345), None)]
     #[case("merge operand", 0, b"merge_key".to_vec(), 42, "merge", Some(b"merge_value".to_vec()), None, Some(1000))]
+    #[case("blob_ref entry", 0, b"bref_key".to_vec(), 7, "blob_ref", Some(b"blob_id_123".to_vec()), None, None)]
+    #[case("blob_ref with timestamps", 3, b"bkey".to_vec(), 50, "blob_ref", Some(b"ref".to_vec()), Some(100), Some(200))]
     #[case("2-byte varints", 200, vec![b'k'; 200], 1, "value", Some(vec![b'v'; 200]), None, None)]
     #[case("3-byte varints", 20000, vec![b'k'; 20000], 1, "value", Some(vec![b'v'; 20000]), None, None)]
     fn should_encode_decode_round_trip(
@@ -322,6 +342,7 @@ mod tests {
     #[case("empty suffix", 10, b"".to_vec(), "value", Some(b"value".to_vec()))]
     #[case("large shared bytes", 16384, b"x".to_vec(), "value", Some(b"v".to_vec()))]
     #[case("with tombstone", 3, b"deleted".to_vec(), "tombstone", None)]
+    #[case("with blob_ref", 4, b"bref".to_vec(), "blob_ref", Some(b"ref_data".to_vec()))]
     #[case("large key suffix", 0, vec![b'k'; 1000], "value", Some(b"v".to_vec()))]
     fn should_decode_key_only(
         #[case] _name: &str,
@@ -462,6 +483,8 @@ mod tests {
             prop::collection::vec(any::<u8>(), 0..1024)
                 .prop_map(|v| ValueDeletable::Merge(Bytes::from(v))),
             Just(ValueDeletable::Tombstone),
+            prop::collection::vec(any::<u8>(), 0..1024)
+                .prop_map(|v| ValueDeletable::BlobRef(Bytes::from(v))),
         ]
     }
 

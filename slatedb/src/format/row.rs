@@ -99,6 +99,7 @@ impl SstRowEntry {
             ValueDeletable::Value(_) => RowFlags::default(),
             ValueDeletable::Merge(_) => RowFlags::MERGE_OPERAND,
             ValueDeletable::Tombstone => RowFlags::TOMBSTONE,
+            ValueDeletable::BlobRef(_) => RowFlags::BLOB_REF,
         };
         if self.expire_ts.is_some() {
             flags |= RowFlags::HAS_EXPIRE_TS;
@@ -187,7 +188,7 @@ impl SstRowCodecV0 {
         }
 
         match &row.value {
-            ValueDeletable::Value(v) | ValueDeletable::Merge(v) => {
+            ValueDeletable::Value(v) | ValueDeletable::Merge(v) | ValueDeletable::BlobRef(v) => {
                 let value_len = u32::try_from(v.len()).expect("value len > u32");
                 output.put_u32(value_len);
                 output.put(v.as_ref());
@@ -243,6 +244,8 @@ impl SstRowCodecV0 {
             create_ts,
             value: if flags.contains(RowFlags::MERGE_OPERAND) {
                 ValueDeletable::Merge(value)
+            } else if flags.contains(RowFlags::BLOB_REF) {
+                ValueDeletable::BlobRef(value)
             } else {
                 ValueDeletable::Value(value)
             },
@@ -261,6 +264,16 @@ impl SstRowCodecV0 {
                 encoded_bits: parsed.bits(),
                 known_bits: RowFlags::all().bits(),
                 message: "Tombstone and Merge Operand are mutually exclusive.".to_string(),
+            });
+        }
+        if parsed.contains(RowFlags::BLOB_REF)
+            && parsed.intersects(RowFlags::TOMBSTONE | RowFlags::MERGE_OPERAND)
+        {
+            return Err(SlateDBError::InvalidRowFlags {
+                encoded_bits: parsed.bits(),
+                known_bits: RowFlags::all().bits(),
+                message: "BlobRef is mutually exclusive with Tombstone and Merge Operand."
+                    .to_string(),
             });
         }
         Ok(parsed)
@@ -472,8 +485,11 @@ mod tests {
 
         // Tombstone and Merge Operand are mutually exclusive
         tests.push(0b00001001);
+        // BlobRef + Tombstone are mutually exclusive
+        tests.push(0b00010001);
+        // BlobRef + Merge Operand are mutually exclusive
+        tests.push(0b00011000);
         // Unknown bits
-        tests.push(0b00010000);
         tests.push(0b00100000);
         tests.push(0b01000000);
         tests.push(0b10000000);
@@ -544,6 +560,39 @@ mod tests {
         assert_eq!(decoded.expire_ts, Some(1));
         assert_eq!(decoded.create_ts, Some(2));
         assert_eq!(decoded.size(), 43);
+    }
+
+    #[test]
+    fn test_encode_decode_blob_ref_row() {
+        let mut encoded_data = Vec::new();
+        let key_prefix_len = 5;
+        let key_suffix = b"bref_";
+        let value: &[u8] = b"blobid";
+
+        let codec = SstRowCodecV0::new();
+        codec.encode(
+            &mut encoded_data,
+            &SstRowEntry::new(
+                key_prefix_len,
+                Bytes::from(key_suffix.to_vec()),
+                1,
+                ValueDeletable::BlobRef(Bytes::from(value)),
+                Some(2),
+                Some(1),
+            ),
+        );
+
+        let first_key = Bytes::from(b"happybeefdata".as_ref());
+        let mut data = Bytes::from(encoded_data);
+        let decoded = codec.decode(&mut data).expect("decoding failed");
+
+        let expected_key = Bytes::from(b"happybref_" as &[u8]);
+        let expected_value = ValueDeletable::BlobRef(Bytes::from(value));
+
+        assert_eq!(decoded.restore_full_key(&first_key), &expected_key);
+        assert_eq!(decoded.value, expected_value);
+        assert_eq!(decoded.expire_ts, Some(1));
+        assert_eq!(decoded.create_ts, Some(2));
     }
 
     #[test]

@@ -5363,6 +5363,8 @@ mod tests {
             garbage_collector_options: None,
             default_ttl: ttl,
             block_format: None,
+            blob_options: None,
+            merge_operator: None,
         }
     }
 

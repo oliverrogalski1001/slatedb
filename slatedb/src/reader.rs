@@ -637,7 +637,7 @@ mod tests {
                     }
                     if let Some(ref mut batch) = wb_batch {
                         match &entry.value {
-                            ValueDeletable::Value(v) => {
+                            ValueDeletable::Value(v) | ValueDeletable::BlobRef(v) => {
                                 batch.put(entry.key, v.as_ref());
                             }
                             ValueDeletable::Tombstone => {

@@ -132,7 +132,9 @@ pub struct RowEntry {
 impl From<slatedb::RowEntry> for RowEntry {
     fn from(entry: slatedb::RowEntry) -> Self {
         let (kind, value) = match entry.value {
-            ValueDeletable::Value(value) => (RowEntryKind::Value, Some(value.to_vec())),
+            ValueDeletable::Value(value) | ValueDeletable::BlobRef(value) => {
+                (RowEntryKind::Value, Some(value.to_vec()))
+            }
             ValueDeletable::Tombstone => (RowEntryKind::Tombstone, None),
             ValueDeletable::Merge(value) => (RowEntryKind::Merge, Some(value.to_vec())),
         };
