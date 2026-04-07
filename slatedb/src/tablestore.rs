@@ -186,6 +186,30 @@ impl TableStore {
         self.sst_format.wal_table_builder()
     }
 
+    pub(crate) async fn put_blob(&self, blob_id: Ulid, data: Bytes) -> Result<(), SlateDBError> {
+        let object_store = self.object_stores.store_of(ObjectStoreType::Main);
+        let path = self.path_resolver.blob_object_path(&blob_id);
+        object_store
+            .put_opts(&path, data.into(), PutOptions::from(PutMode::Create))
+            .await
+            .map_err(SlateDBError::from)?;
+        Ok(())
+    }
+
+    pub(crate) async fn get_blob(&self, blob_id: Ulid) -> Result<Bytes, SlateDBError> {
+        let object_store = self.object_stores.store_of(ObjectStoreType::Main);
+        let path = self.path_resolver.blob_object_path(&blob_id);
+        let file = object_store.get(&path).await?;
+        file.bytes().await.map_err(SlateDBError::from)
+    }
+
+    pub(crate) async fn delete_blob(&self, blob_id: Ulid) -> Result<(), SlateDBError> {
+        let object_store = self.object_stores.store_of(ObjectStoreType::Main);
+        let path = self.path_resolver.blob_object_path(&blob_id);
+        debug!("deleting blob [path={}]", path);
+        object_store.delete(&path).await.map_err(SlateDBError::from)
+    }
+
     pub(crate) async fn write_sst(
         &self,
         id: &SsTableId,
@@ -712,6 +736,7 @@ mod tests {
     use rstest::rstest;
     use std::collections::VecDeque;
     use std::sync::Arc;
+    use ulid::Ulid;
 
     use crate::db_cache::test_utils::TestCache;
     use crate::db_cache::SplitCache;
@@ -1597,6 +1622,39 @@ mod tests {
         } else {
             assert_eq!(count_ssts_in(&main_store).await, 1);
         }
+    }
+
+    #[tokio::test]
+    async fn test_put_get_delete_blob() {
+        let main_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ts = Arc::new(TableStore::new(
+            ObjectStores::new(main_store.clone(), None),
+            SsTableFormat::default(),
+            Path::from(ROOT),
+            None,
+        ));
+
+        let blob_id = Ulid::from_string("01J79C21YKR31J2BS1EFXJZ7MR").unwrap();
+        let payload = Bytes::from_static(b"blob-payload");
+        let expected_path = Path::from("/root/blob/01J79C21YKR31J2BS1EFXJZ7MR.data");
+
+        ts.put_blob(blob_id, payload.clone()).await.unwrap();
+
+        let stored = main_store
+            .get(&expected_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(stored, payload);
+
+        let loaded = ts.get_blob(blob_id).await.unwrap();
+        assert_eq!(loaded, payload);
+
+        ts.delete_blob(blob_id).await.unwrap();
+        let err = main_store.get(&expected_path).await.unwrap_err();
+        assert!(matches!(err, object_store::Error::NotFound { .. }));
     }
 
     #[rstest]

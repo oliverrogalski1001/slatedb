@@ -62,6 +62,12 @@ fn emit_row(wal_id: u64, row: &RowEntry) {
             let value = String::from_utf8_lossy(value.as_ref());
             println!("wal_id={wal_id} seq={} upsert {key}={value}", row.seq);
         }
+        ValueDeletable::BlobRef(blob_ref) => {
+            println!(
+                "wal_id={wal_id} seq={} upsert {key}=<blob:{} size={}>",
+                row.seq, blob_ref.blob_id, blob_ref.size
+            );
+        }
         ValueDeletable::Merge(value) => {
             let value = String::from_utf8_lossy(value.as_ref());
             println!("wal_id={wal_id} seq={} merge {key}+={value}", row.seq);

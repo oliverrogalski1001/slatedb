@@ -115,6 +115,9 @@ pub(crate) enum SlateDBError {
         message: String,
     },
 
+    #[error("invalid blob reference bytes. expected_len=`20`, actual_len=`{actual_len}`")]
+    InvalidBlobRefBytes { actual_len: usize },
+
     #[error("read channel error")]
     ReadChannelError(#[from] tokio::sync::oneshot::error::RecvError),
 
@@ -537,6 +540,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::BlockCompressionError => Error::data(msg),
             SlateDBError::BlockTransformError => Error::data(msg),
             SlateDBError::InvalidRowFlags { .. } => Error::data(msg),
+            SlateDBError::InvalidBlobRefBytes { .. } => Error::data(msg),
             SlateDBError::CheckpointMissing(_) => Error::data(msg),
             SlateDBError::InvalidVersion { .. } => Error::data(msg),
             SlateDBError::ManifestMissing(_) => Error::data(msg),

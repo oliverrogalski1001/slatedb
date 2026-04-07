@@ -106,6 +106,8 @@ impl From<slatedb::KeyValue> for KeyValue {
 pub enum RowEntryKind {
     /// A regular value row.
     Value,
+    /// A row whose value points to an external blob object.
+    BlobRef,
     /// A delete tombstone.
     Tombstone,
     /// A merge operand row.
@@ -133,6 +135,9 @@ impl From<slatedb::RowEntry> for RowEntry {
     fn from(entry: slatedb::RowEntry) -> Self {
         let (kind, value) = match entry.value {
             ValueDeletable::Value(value) => (RowEntryKind::Value, Some(value.to_vec())),
+            ValueDeletable::BlobRef(blob_ref) => {
+                (RowEntryKind::BlobRef, Some(blob_ref.to_bytes().to_vec()))
+            }
             ValueDeletable::Tombstone => (RowEntryKind::Tombstone, None),
             ValueDeletable::Merge(value) => (RowEntryKind::Merge, Some(value.to_vec())),
         };

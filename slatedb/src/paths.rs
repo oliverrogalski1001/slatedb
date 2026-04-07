@@ -8,6 +8,7 @@ use ulid::Ulid;
 
 const WAL_PATH: &str = "wal";
 const COMPACTED_PATH: &str = "compacted";
+const BLOB_PATH: &str = "blob";
 
 #[derive(Clone, Debug)]
 pub(crate) struct PathResolver {
@@ -42,6 +43,11 @@ impl PathResolver {
 
     pub(crate) fn compacted_path(&self) -> Path {
         Path::from(format!("{}/{}/", &self.root_path, COMPACTED_PATH))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn blob_path(&self) -> Path {
+        Path::from(format!("{}/{}/", &self.root_path, BLOB_PATH))
     }
 
     pub(crate) fn parse_table_id(&self, path: &Path) -> Result<Option<SsTableId>, SlateDBError> {
@@ -80,6 +86,15 @@ impl PathResolver {
                 ulid.to_string()
             )),
         }
+    }
+
+    pub(crate) fn blob_object_path(&self, blob_id: &Ulid) -> Path {
+        Path::from(format!(
+            "{}/{}/{}.data",
+            &self.root_path,
+            BLOB_PATH,
+            blob_id
+        ))
     }
 }
 
@@ -137,5 +152,17 @@ mod tests {
         let path = Path::from("/root/invalid/00000000000000000001.sst");
         let id = path_resolver.parse_table_id(&path).unwrap();
         assert_eq!(id, None);
+
+        let path = Path::from("/root/blob/01J79C21YKR31J2BS1EFXJZ7MR.data");
+        let id = path_resolver.parse_table_id(&path).unwrap();
+        assert_eq!(id, None);
+    }
+
+    #[test]
+    fn test_blob_object_path() {
+        let path_resolver = PathResolver::new(Path::from(ROOT));
+        let blob_id = Ulid::from_string("01J79C21YKR31J2BS1EFXJZ7MR").unwrap();
+        let path = path_resolver.blob_object_path(&blob_id);
+        assert_eq!(path, Path::from("/root/blob/01J79C21YKR31J2BS1EFXJZ7MR.data"));
     }
 }

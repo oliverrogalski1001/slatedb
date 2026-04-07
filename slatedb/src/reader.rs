@@ -640,6 +640,9 @@ mod tests {
                             ValueDeletable::Value(v) => {
                                 batch.put(entry.key, v.as_ref());
                             }
+                            ValueDeletable::BlobRef(_) => {
+                                panic!("blob refs are not supported in write batches");
+                            }
                             ValueDeletable::Tombstone => {
                                 batch.delete(entry.key);
                             }

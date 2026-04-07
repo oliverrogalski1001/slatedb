@@ -1,4 +1,49 @@
 use bytes::Bytes;
+use ulid::Ulid;
+
+/// Reference to a blob object stored outside the SSTable.
+///
+/// The encoded form is:
+/// - 16 bytes: blob ULID in big-endian order
+/// - 4 bytes: blob size in big-endian order
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BlobRef {
+    pub blob_id: Ulid,
+    pub size: u32,
+}
+
+impl BlobRef {
+    pub const ENCODED_LEN: usize = 16 + std::mem::size_of::<u32>();
+
+    pub const fn new(blob_id: Ulid, size: u32) -> Self {
+        Self { blob_id, size }
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::ENCODED_LEN] {
+        let mut bytes = [0; Self::ENCODED_LEN];
+        bytes[..16].copy_from_slice(&self.blob_id.to_bytes());
+        bytes[16..].copy_from_slice(&self.size.to_be_bytes());
+        bytes
+    }
+
+    pub fn from_bytes(bytes: [u8; Self::ENCODED_LEN]) -> Self {
+        let mut blob_id = [0; 16];
+        blob_id.copy_from_slice(&bytes[..16]);
+
+        let mut size = [0; 4];
+        size.copy_from_slice(&bytes[16..]);
+
+        Self {
+            blob_id: Ulid::from_bytes(blob_id),
+            size: u32::from_be_bytes(size),
+        }
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Option<Self> {
+        let bytes: [u8; Self::ENCODED_LEN] = bytes.try_into().ok()?;
+        Some(Self::from_bytes(bytes))
+    }
+}
 
 /// Represents a key-value pair known not to be a tombstone.
 #[non_exhaustive]
@@ -157,6 +202,7 @@ impl From<RowEntry> for KeyValue {
 ///
 /// This enum distinguishes between:
 /// - `Value`: A regular value entry
+/// - `BlobRef`: A reference to a value stored outside the SST
 /// - `Merge`: A merge operand (used with merge operators)
 /// - `Tombstone`: A deletion marker
 ///
@@ -166,6 +212,8 @@ impl From<RowEntry> for KeyValue {
 pub enum ValueDeletable {
     /// A regular value.
     Value(Bytes),
+    /// A reference to an external blob object.
+    BlobRef(BlobRef),
     /// A merge operand (used with merge operators).
     Merge(Bytes),
     /// A tombstone (deletion marker).
@@ -178,6 +226,7 @@ impl ValueDeletable {
     pub fn len(&self) -> usize {
         match self {
             ValueDeletable::Value(v) | ValueDeletable::Merge(v) => v.len(),
+            ValueDeletable::BlobRef(_) => BlobRef::ENCODED_LEN,
             ValueDeletable::Tombstone => 0,
         }
     }
@@ -188,9 +237,12 @@ impl ValueDeletable {
     }
 
     /// Returns the value bytes if this is a Value or Merge, None for Tombstone.
+    ///
+    /// For `BlobRef`, this returns the encoded blob reference bytes.
     pub fn as_bytes(&self) -> Option<Bytes> {
         match self {
             ValueDeletable::Value(v) | ValueDeletable::Merge(v) => Some(v.clone()),
+            ValueDeletable::BlobRef(blob_ref) => Some(Bytes::copy_from_slice(&blob_ref.to_bytes())),
             ValueDeletable::Tombstone => None,
         }
     }
@@ -240,5 +292,37 @@ mod tests {
             None,
         );
         assert_eq!(entry.encoded_size(6), sst_entry.size());
+    }
+
+    #[test]
+    fn blob_ref_round_trips_through_bytes() {
+        let blob_ref = BlobRef::new(
+            Ulid::from_string("01J79C21YKR31J2BS1EFXJZ7MR").expect("valid ulid"),
+            4_096,
+        );
+
+        let encoded = blob_ref.to_bytes();
+        let decoded = BlobRef::from_bytes(encoded);
+
+        assert_eq!(decoded, blob_ref);
+    }
+
+    #[test]
+    fn blob_ref_round_trips_from_slice() {
+        let blob_ref = BlobRef::new(
+            Ulid::from_string("01J79C21YKR31J2BS1EFXJZ7MR").expect("valid ulid"),
+            123_456,
+        );
+
+        let encoded = blob_ref.to_bytes();
+        let decoded = BlobRef::from_slice(&encoded).expect("valid blob ref bytes");
+
+        assert_eq!(decoded, blob_ref);
+    }
+
+    #[test]
+    fn blob_ref_rejects_wrong_size_slice() {
+        let encoded = [0u8; BlobRef::ENCODED_LEN - 1];
+        assert!(BlobRef::from_slice(&encoded).is_none());
     }
 }

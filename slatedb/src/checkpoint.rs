@@ -410,6 +410,7 @@ mod tests {
         let sst_entry = sst_iter.next().await.unwrap().unwrap();
         let val = match sst_entry.value {
             crate::types::ValueDeletable::Value(v) => v,
+            crate::types::ValueDeletable::BlobRef(_) => panic!("Expected an inline Value"),
             _ => panic!("Expected a Value"),
         };
         assert_eq!(*kv.1, val)

@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 
 use crate::error::SlateDBError;
-use crate::types::ValueDeletable;
+use crate::types::{BlobRef, ValueDeletable};
 use bitflags::bitflags;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -12,6 +12,7 @@ bitflags! {
         const HAS_EXPIRE_TS = 0b00000010;
         const HAS_CREATE_TS = 0b00000100;
         const MERGE_OPERAND = 0b00001000;
+        const BLOB_REF = 0b00010000;
     }
 }
 
@@ -96,6 +97,7 @@ impl SstRowEntry {
     pub(crate) fn flags(&self) -> RowFlags {
         let mut flags = match &self.value {
             ValueDeletable::Value(_) => RowFlags::default(),
+            ValueDeletable::BlobRef(_) => RowFlags::BLOB_REF,
             ValueDeletable::Merge(_) => RowFlags::MERGE_OPERAND,
             ValueDeletable::Tombstone => RowFlags::TOMBSTONE,
         };
@@ -191,6 +193,10 @@ impl SstRowCodecV0 {
                 output.put_u32(value_len);
                 output.put(v.as_ref());
             }
+            ValueDeletable::BlobRef(blob_ref) => {
+                output.put_u32(BlobRef::ENCODED_LEN as u32);
+                output.put(blob_ref.to_bytes().as_slice());
+            }
             ValueDeletable::Tombstone => {
                 // skip encoding value for tombstone
             }
@@ -234,13 +240,21 @@ impl SstRowCodecV0 {
         // decode value
         let value_len = data.get_u32() as usize;
         let value = data.slice(..value_len);
+        data.advance(value_len);
         Ok(SstRowEntry {
             key_prefix_len,
             key_suffix,
             seq,
             expire_ts,
             create_ts,
-            value: if flags.contains(RowFlags::MERGE_OPERAND) {
+            value: if flags.contains(RowFlags::BLOB_REF) {
+                let blob_ref = BlobRef::from_slice(value.as_ref()).ok_or(
+                    SlateDBError::InvalidBlobRefBytes {
+                        actual_len: value_len,
+                    },
+                )?;
+                ValueDeletable::BlobRef(blob_ref)
+            } else if flags.contains(RowFlags::MERGE_OPERAND) {
                 ValueDeletable::Merge(value)
             } else {
                 ValueDeletable::Value(value)
@@ -262,6 +276,20 @@ impl SstRowCodecV0 {
                 message: "Tombstone and Merge Operand are mutually exclusive.".to_string(),
             });
         }
+        if parsed.contains(RowFlags::TOMBSTONE | RowFlags::BLOB_REF) {
+            return Err(SlateDBError::InvalidRowFlags {
+                encoded_bits: parsed.bits(),
+                known_bits: RowFlags::all().bits(),
+                message: "Tombstone and Blob Ref are mutually exclusive.".to_string(),
+            });
+        }
+        if parsed.contains(RowFlags::MERGE_OPERAND | RowFlags::BLOB_REF) {
+            return Err(SlateDBError::InvalidRowFlags {
+                encoded_bits: parsed.bits(),
+                known_bits: RowFlags::all().bits(),
+                message: "Merge Operand and Blob Ref are mutually exclusive.".to_string(),
+            });
+        }
         Ok(parsed)
     }
 }
@@ -270,7 +298,7 @@ impl SstRowCodecV0 {
 mod tests {
     use super::*;
     use crate::test_utils::assert_debug_snapshot;
-    use crate::types::ValueDeletable;
+    use crate::types::{BlobRef, ValueDeletable};
     use rstest::rstest;
 
     #[derive(Debug)]
@@ -471,8 +499,11 @@ mod tests {
 
         // Tombstone and Merge Operand are mutually exclusive
         tests.push(0b00001001);
+        // Tombstone and Blob Ref are mutually exclusive
+        tests.push(0b00010001);
+        // Merge Operand and Blob Ref are mutually exclusive
+        tests.push(0b00011000);
         // Unknown bits
-        tests.push(0b00010000);
         tests.push(0b00100000);
         tests.push(0b01000000);
         tests.push(0b10000000);
@@ -543,6 +574,40 @@ mod tests {
         assert_eq!(decoded.expire_ts, Some(1));
         assert_eq!(decoded.create_ts, Some(2));
         assert_eq!(decoded.size(), 43);
+    }
+
+    #[test]
+    fn test_encode_decode_blob_ref_row() {
+        let mut encoded_data = Vec::new();
+        let key_prefix_len = 5;
+        let key_suffix = b"blobr";
+        let blob_ref = BlobRef::new(
+            ulid::Ulid::from_string("01J79C21YKR31J2BS1EFXJZ7MR").expect("valid ulid"),
+            4_096,
+        );
+
+        let codec = SstRowCodecV0::new();
+        codec.encode(
+            &mut encoded_data,
+            &SstRowEntry::new(
+                key_prefix_len,
+                Bytes::from(key_suffix.to_vec()),
+                7,
+                ValueDeletable::BlobRef(blob_ref),
+                Some(2),
+                Some(1),
+            ),
+        );
+
+        let mut data = Bytes::from(encoded_data);
+        let decoded = codec.decode(&mut data).expect("decoding failed");
+
+        assert_eq!(decoded.key_prefix_len, key_prefix_len);
+        assert_eq!(decoded.key_suffix.as_ref(), key_suffix);
+        assert_eq!(decoded.seq, 7);
+        assert_eq!(decoded.value, ValueDeletable::BlobRef(blob_ref));
+        assert_eq!(decoded.expire_ts, Some(1));
+        assert_eq!(decoded.create_ts, Some(2));
     }
 
     #[test]
