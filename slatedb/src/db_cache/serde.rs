@@ -10,6 +10,7 @@ use crate::error::SlateDBError;
 use crate::filter::BloomFilter;
 use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::format::block::Block;
+use crate::sst_stats::SstStats;
 use bytes::Bytes;
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -94,6 +95,7 @@ enum SerializedCachedEntryV1 {
     Block(Bytes),
     SsTableIndex(Bytes),
     BloomFilter(Bytes),
+    SstStats(Bytes),
 }
 
 impl SerializedCachedEntryV1 {
@@ -110,6 +112,10 @@ impl SerializedCachedEntryV1 {
             SerializedCachedEntryV1::BloomFilter(encoded) => {
                 let filter = BloomFilter::decode(encoded.as_ref());
                 CachedItem::BloomFilter(Arc::new(filter))
+            }
+            SerializedCachedEntryV1::SstStats(encoded) => {
+                let stats = SstStats::decode(encoded)?;
+                CachedItem::SstStats(Arc::new(stats))
             }
         };
         Ok(CachedEntry { item })
@@ -144,6 +150,10 @@ impl From<CachedEntry> for SerializedCachedEntry {
                 let encoded = filter.encode();
                 SerializedCachedEntry::V1(SerializedCachedEntryV1::BloomFilter(encoded))
             }
+            CachedItem::SstStats(stats) => {
+                let encoded = stats.encode();
+                SerializedCachedEntry::V1(SerializedCachedEntryV1::SstStats(encoded))
+            }
         }
     }
 }
@@ -173,7 +183,7 @@ impl<'de> Deserialize<'de> for CachedEntry {
 
 #[cfg(test)]
 mod tests {
-    use crate::block_iterator::BlockIterator;
+    use crate::block_iterator::BlockIteratorLatest;
     use crate::db_cache::{CachedEntry, CachedItem, CachedKey};
     use crate::db_state::SsTableId;
     use crate::filter::BloomFilterBuilder;
@@ -182,6 +192,7 @@ mod tests {
     };
     use crate::format::sst::BlockBuilder;
     use crate::iter::IterationOrder;
+    use crate::sst_stats::SstStats;
     use crate::test_utils::assert_iterator;
     use crate::types::RowEntry;
     use bytes::Bytes;
@@ -223,7 +234,7 @@ mod tests {
             RowEntry::new_merge(b"biz", b"baz", 1),
             RowEntry::new_tombstone(b"bla", 2),
         ];
-        let mut builder = BlockBuilder::new_v1(4096);
+        let mut builder = BlockBuilder::new_latest(4096);
         for row in rows.iter() {
             assert!(builder.add(row.clone()).unwrap());
         }
@@ -237,7 +248,7 @@ mod tests {
 
         let decoded_block = decoded.block().unwrap();
         assert!(block.as_ref() == decoded_block.as_ref());
-        let mut iter = BlockIterator::new(decoded_block, IterationOrder::Ascending);
+        let mut iter = BlockIteratorLatest::new(decoded_block, IterationOrder::Ascending);
         assert_iterator(&mut iter, rows).await;
     }
 
@@ -273,6 +284,27 @@ mod tests {
 
         let decoded_filter = decoded.bloom_filter().unwrap();
         assert!(filter.as_ref() == decoded_filter.as_ref());
+    }
+
+    #[test]
+    fn test_should_serialize_deserialize_stats() {
+        let stats = Arc::new(SstStats {
+            num_puts: 100,
+            num_deletes: 10,
+            num_merges: 5,
+            raw_key_size: 2048,
+            raw_val_size: 8192,
+            block_stats: vec![],
+        });
+        let entry = CachedEntry {
+            item: CachedItem::SstStats(stats.clone()),
+        };
+
+        let encoded = bincode::serialize(&entry).unwrap();
+        let decoded: CachedEntry = bincode::deserialize(&encoded).unwrap();
+
+        let decoded_stats = decoded.sst_stats().unwrap();
+        assert_eq!(stats.as_ref(), decoded_stats.as_ref());
     }
 
     fn build_index_with_first_keys(first_keys: &[&[u8]]) -> SsTableIndexOwned {

@@ -82,23 +82,20 @@ async fn main() -> Result<(), Error> {
 
     // Scan over bound range
     let mut iter = kv_store.scan("test_key1"..="test_key2").await?;
-    assert_eq!(
-        iter.next().await?,
-        Some((b"test_key1", b"test_value1").into())
-    );
-    assert_eq!(
-        iter.next().await?,
-        Some((b"test_key2", b"test_value2").into())
-    );
+    let item = iter.next().await?.expect("missing test_key1");
+    assert_eq!(item.key.as_ref(), b"test_key1");
+    assert_eq!(item.value.as_ref(), b"test_value1");
+    let item = iter.next().await?.expect("missing test_key2");
+    assert_eq!(item.key.as_ref(), b"test_key2");
+    assert_eq!(item.value.as_ref(), b"test_value2");
 
     // Seek ahead to next key
     let mut iter = kv_store.scan::<Vec<u8>, _>(..).await?;
     let next_key = b"test_key4";
     iter.seek(next_key).await?;
-    assert_eq!(
-        iter.next().await?,
-        Some((b"test_key4", b"test_value4").into())
-    );
+    let item = iter.next().await?.expect("missing test_key4");
+    assert_eq!(item.key.as_ref(), b"test_key4");
+    assert_eq!(item.value.as_ref(), b"test_value4");
     assert_eq!(iter.next().await?, None);
 
     // Close
@@ -116,10 +113,12 @@ Visit [slatedb.io](https://slatedb.io) to learn more.
 
 ## Bindings
 
-- [Go](https://github.com/slatedb/slatedb/tree/main/slatedb-go) (official)
-- [Java](https://github.com/slatedb/slatedb/tree/main/slatedb-java) (official)
-- [Python](https://github.com/slatedb/slatedb/tree/main/slatedb-py) (official)
+- [Go](https://github.com/slatedb/slatedb/tree/main/bindings/go) (official)
+- [Java](https://github.com/slatedb/slatedb/tree/main/bindings/java) (official)
+- [.NET](https://github.com/Pulsy-Global/slatedb-dotnet)
+- [Python](https://github.com/slatedb/slatedb/tree/main/bindings/python) (official)
 - [Ruby](https://github.com/catkins/slatedb-rb)
+- [TypeScript](https://github.com/gadget-inc/slatedb-node)
 
 ## Features
 
@@ -136,7 +135,7 @@ Visit [slatedb.io](https://slatedb.io) to learn more.
 - [x] Merge operator ([#328](https://github.com/slatedb/slatedb/issues/328))
 - [x] Clones ([#49](https://github.com/slatedb/slatedb/issues/49))
 - [ ] Range deletions ([#577](https://github.com/slatedb/slatedb/issues/577))
-- [ ] Change data capture (CDC) ([#249](https://github.com/slatedb/slatedb/issues/249))
+- [x] Change data capture (CDC) ([#249](https://github.com/slatedb/slatedb/issues/249))
 - [ ] Database splitting
 - [ ] Database merging
 
@@ -153,13 +152,19 @@ SlateDB follows Semantic Versioning. We release new versions approximately every
 See who's using SlateDB.
 
 - [Embucket](https://www.embucket.com)
+- [Gadget](https://gadget.dev)
+- [Goldsky](https://goldsky.com)
+- [HelixDB](https://github.com/HelixDB/helix-db)
 - [Malstrom](https://github.com/MalstromDevelopers/malstrom)
 - [Massive](https://massive.com)
 - [Merklemap](https://merklemap.com)
+- [OpenData](https://www.opendata.dev)
 - [Responsive](https://responsive.dev)
 - [s2-lite](https://github.com/s2-streamstore/s2)
 - [SQLync](https://sqlync.com)
+- [Storrito](https://storrito.com)
 - [Tensorlake](https://www.tensorlake.ai)
+- [Volga](https://github.com/volga-project/volga)
 - [ZeroFS](https://zerofs.net)
 
 ## Talks
@@ -169,6 +174,13 @@ See who's using SlateDB.
 - [Internals of SlateDB — by Vignesh Chandramohan](https://www.youtube.com/watch?v=qqF_zFWqFYk) (Vignesh Chandramohan, 2025)
 - [Database Internals - SlateDB](https://www.youtube.com/watch?v=wEAcNoJOBFI) (Chris Riccomini, 2024)
 - [Building a Cloud Native LSM on Object Storage](https://www.p99conf.io/session/building-a-cloud-native-lsm-on-object-storage/) (Rohan Desai/Chris Riccomini, 2024)
+
+## Infrastructure Sponsors
+
+Thanks to the following companies for donating services and infrastructure to the SlateDB project.
+
+- **[Pulumi](https://www.pulumi.com/)** - Open source platform for automating, securing, and managing cloud resources, configuration, and secrets.
+- **[Tigris](https://www.tigrisdata.com/)** – Globally distributed S3-compatible object storage service.
 
 ## License
 
@@ -182,10 +194,3 @@ SlateDB is a member of the [Commonhaus Foundation](https://www.commonhaus.org/).
   <source media="(prefers-color-scheme: dark)" srcset="https://github.com/commonhaus/artwork/blob/main/foundation/brand/png/CF_logo_horizontal_single_reverse_200px.png?raw=true">
   <img src="https://github.com/commonhaus/artwork/blob/main/foundation/brand/png/CF_logo_horizontal_single_default_200px.png?raw=true">
 </picture>
-
-## Infrastructure Sponsors
-
-Thanks to the following companies for donating services and infrastructure to the SlateDB project.
-
-- **[Pulumi](https://www.pulumi.com/)** - Open source platform for automating, securing, and managing cloud resources, configuration, and secrets.
-- **[Tigris](https://www.tigrisdata.com/)** – Globally distributed S3-compatible object storage service.

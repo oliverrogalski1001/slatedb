@@ -1,6 +1,3 @@
-#![allow(dead_code)]
-use std::cmp::Ordering;
-
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 
@@ -8,7 +5,7 @@ use crate::block_iterator::BlockLike;
 use crate::error::SlateDBError;
 use crate::format::row_codec_v2::SstRowCodecV2;
 use crate::iter::IterationOrder;
-use crate::iter::KeyValueIterator;
+use crate::iter::RowEntryIterator;
 use crate::types::RowEntry;
 
 /// Internal state for ascending iteration.
@@ -59,6 +56,7 @@ impl<B: BlockLike> BlockIteratorV2<B> {
         }
     }
 
+    #[allow(dead_code)] // Used in tests
     pub(crate) fn new_ascending(block: B) -> Self {
         Self::new(block, IterationOrder::Ascending)
     }
@@ -130,13 +128,15 @@ impl<B: BlockLike> AscendingState<B> {
         self.exhausted || self.offset_in_block >= self.block.data().len()
     }
 
-    /// Returns the largest restart index where the key at that restart point is <= target.
-    fn find_restart_for_key(&self, target: &[u8]) -> usize {
+    /// Returns the restart index to start scanning from when seeking to target.
+    ///
+    /// When a restart point has key exactly equal to target, we return the PREVIOUS
+    /// restart point to ensure we don't miss any entries with that key that might
+    /// exist before the found restart point.
+    /// Binary search for the first restart index where key >= target.
+    /// Returns `restarts.len()` if no such restart exists.
+    fn binary_search_restarts(&self, target: &[u8]) -> usize {
         let restarts = self.block.offsets();
-        if restarts.is_empty() {
-            return 0;
-        }
-
         let mut low = 0;
         let mut high = restarts.len();
 
@@ -144,10 +144,63 @@ impl<B: BlockLike> AscendingState<B> {
             let mid = low + (high - low) / 2;
             let restart_key = BlockIteratorV2::decode_first_key_at_restart(&self.block, mid);
 
-            match restart_key.as_ref().cmp(target) {
-                Ordering::Less => low = mid + 1,
-                Ordering::Equal => return mid,
-                Ordering::Greater => high = mid,
+            if restart_key.as_ref() < target {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+
+        low
+    }
+
+    /// Find the restart region to begin an ascending scan for `target`.
+    /// Backs up one position when target exactly matches a restart point's first key,
+    /// so that duplicate keys straddling restart boundaries aren't missed.
+    fn find_restart_for_key_ascending(&self, target: &[u8]) -> usize {
+        let restarts = self.block.offsets();
+        if restarts.is_empty() {
+            return 0;
+        }
+
+        let low = self.binary_search_restarts(target);
+
+        if low < restarts.len() {
+            let restart_key = BlockIteratorV2::decode_first_key_at_restart(&self.block, low);
+            if restart_key.as_ref() == target {
+                return low.saturating_sub(1);
+            }
+        }
+
+        low.saturating_sub(1)
+    }
+
+    /// Find the restart region to begin a descending scan for `target`.
+    /// Returns the last restart whose first key <= target, so that for duplicate keys
+    /// spanning multiple restart regions we start from the last one.
+    fn find_restart_for_key_descending(&self, target: &[u8]) -> usize {
+        let restarts = self.block.offsets();
+        if restarts.is_empty() {
+            return 0;
+        }
+
+        // binary_search_restarts finds the first restart with key >= target.
+        let low = self.binary_search_restarts(target);
+
+        if low < restarts.len() {
+            let restart_key = BlockIteratorV2::decode_first_key_at_restart(&self.block, low);
+            if restart_key.as_ref() == target {
+                // Scan forward to find the last restart with the same first key.
+                let mut last = low;
+                while last + 1 < restarts.len() {
+                    let next_key =
+                        BlockIteratorV2::decode_first_key_at_restart(&self.block, last + 1);
+                    if next_key.as_ref() != target {
+                        break;
+                    }
+                    last += 1;
+                }
+                return last;
             }
         }
 
@@ -174,12 +227,12 @@ impl<B: BlockLike> AscendingState<B> {
 }
 
 #[async_trait]
-impl<B: BlockLike> KeyValueIterator for BlockIteratorV2<B> {
+impl<B: BlockLike> RowEntryIterator for BlockIteratorV2<B> {
     async fn init(&mut self) -> Result<(), SlateDBError> {
         Ok(())
     }
 
-    async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+    async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         match &mut self.inner {
             BlockIteratorInner::Ascending(state) => {
                 if state.is_empty() {
@@ -209,7 +262,7 @@ impl<B: BlockLike> KeyValueIterator for BlockIteratorV2<B> {
 
                 Ok(Some(entry))
             }
-            BlockIteratorInner::Descending(iter) => iter.next_entry().await,
+            BlockIteratorInner::Descending(iter) => iter.next().await,
         }
     }
 
@@ -221,7 +274,7 @@ impl<B: BlockLike> KeyValueIterator for BlockIteratorV2<B> {
                     return Ok(());
                 }
 
-                let start_restart_idx = state.find_restart_for_key(next_key);
+                let start_restart_idx = state.find_restart_for_key_ascending(next_key);
 
                 // Iterate through restart regions starting from binary search result.
                 for restart_idx in start_restart_idx..state.block.offsets().len() {
@@ -338,7 +391,7 @@ impl<B: BlockLike> DescendingBlockIteratorV2<B> {
 }
 
 #[async_trait]
-impl<B: BlockLike> KeyValueIterator for DescendingBlockIteratorV2<B> {
+impl<B: BlockLike> RowEntryIterator for DescendingBlockIteratorV2<B> {
     async fn init(&mut self) -> Result<(), SlateDBError> {
         if !self.initialized && !self.exhausted {
             self.load_restart_region(self.current_restart_idx as usize)?;
@@ -347,7 +400,7 @@ impl<B: BlockLike> KeyValueIterator for DescendingBlockIteratorV2<B> {
         Ok(())
     }
 
-    async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+    async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         if !self.initialized {
             self.init().await?;
         }
@@ -382,8 +435,8 @@ impl<B: BlockLike> KeyValueIterator for DescendingBlockIteratorV2<B> {
             return Ok(());
         }
 
-        // Find the largest key <= next_key by searching backwards through restart regions
-        let start_restart_idx = self.ascending.find_restart_for_key(next_key);
+        // Find the last restart region whose first key <= next_key, then scan backwards.
+        let start_restart_idx = self.ascending.find_restart_for_key_descending(next_key);
 
         for restart_idx in (0..=start_restart_idx).rev() {
             self.current_restart_idx = restart_idx as isize;
@@ -451,17 +504,17 @@ mod tests {
         let mut iter = BlockIteratorV2::new_ascending(&block);
 
         // when/then: iterating returns all entries in order
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"apple");
         assert_eq!(kv.value, ValueDeletable::Value(Bytes::from("1")));
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"banana");
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"cherry");
 
-        assert!(iter.next_entry().await.unwrap().is_none());
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -483,7 +536,7 @@ mod tests {
         iter.seek(b"banana").await.unwrap();
 
         // then: returns that key
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"banana");
     }
 
@@ -498,7 +551,7 @@ mod tests {
         iter.seek(b"banana").await.unwrap();
 
         // then: returns the next key >= banana
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"cherry");
     }
 
@@ -524,7 +577,7 @@ mod tests {
         iter.seek(b"e").await.unwrap();
 
         // then: finds the correct entry
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"e");
     }
 
@@ -547,11 +600,11 @@ mod tests {
         iter.seek(b"user:1001").await.unwrap();
 
         // then: correct entries are returned
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"user:1001");
         assert_eq!(kv.value, ValueDeletable::Value(Bytes::from("bob")));
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"user:1002");
     }
 
@@ -571,12 +624,12 @@ mod tests {
         iter.seek(b"key_00050").await.unwrap();
 
         // then: correct key is found
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"key_00050");
 
         // Seek to another key
         iter.seek(b"key_00075").await.unwrap();
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"key_00075");
     }
 
@@ -591,7 +644,7 @@ mod tests {
         iter.seek(b"apple").await.unwrap();
 
         // then: first entry is returned
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"apple");
     }
 
@@ -606,7 +659,7 @@ mod tests {
         iter.seek(b"apple").await.unwrap();
 
         // then: first entry is returned
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"banana");
     }
 
@@ -621,7 +674,7 @@ mod tests {
         iter.seek(b"zebra").await.unwrap();
 
         // then: no more entries
-        assert!(iter.next_entry().await.unwrap().is_none());
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -632,11 +685,11 @@ mod tests {
         let mut iter = BlockIteratorV2::new_ascending(&block);
 
         // when: iterating
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"only");
 
         // then: no more entries
-        assert!(iter.next_entry().await.unwrap().is_none());
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -650,7 +703,7 @@ mod tests {
         iter.seek(b"only").await.unwrap();
 
         // then: entry is returned
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"only");
     }
 
@@ -677,12 +730,12 @@ mod tests {
         let mut iter = BlockIteratorV2::new_ascending(&block);
 
         // when: iterating
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"key1");
         assert_eq!(kv.create_ts, Some(100));
         assert_eq!(kv.expire_ts, Some(200));
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"key2");
         assert!(matches!(kv.value, ValueDeletable::Tombstone));
         assert_eq!(kv.create_ts, Some(300));
@@ -705,11 +758,11 @@ mod tests {
 
         // when/then: all entries are returned in order
         for i in 0..10 {
-            let kv = iter.next_entry().await.unwrap().unwrap();
+            let kv = iter.next().await.unwrap().unwrap();
             let expected_key = format!("key_{}", i);
             assert_eq!(kv.key.as_ref(), expected_key.as_bytes());
         }
-        assert!(iter.next_entry().await.unwrap().is_none());
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -730,17 +783,17 @@ mod tests {
 
         // when: seeking multiple times
         iter.seek(b"b").await.unwrap();
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"b");
 
         iter.seek(b"d").await.unwrap();
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"d");
 
         iter.seek(b"a").await.unwrap();
         // Note: seeking backward from current position may not work as expected
         // because we don't reset the iterator. Let's test seeking forward from current.
-        let kv = iter.next_entry().await.unwrap();
+        let kv = iter.next().await.unwrap();
         // After seeking to "a" from position "d", behavior depends on implementation
         // Our implementation should allow seeking to any position
         assert!(kv.is_some());
@@ -769,10 +822,10 @@ mod tests {
         let mut iter = BlockIteratorV2::new_ascending(&block);
 
         // when: iterating
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert!(matches!(kv.value, ValueDeletable::Value(_)));
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert!(matches!(kv.value, ValueDeletable::Merge(_)));
         if let ValueDeletable::Merge(v) = kv.value {
             assert_eq!(v.as_ref(), b"delta");
@@ -792,16 +845,16 @@ mod tests {
         let mut iter = DescendingBlockIteratorV2::new(&block);
 
         // when/then: iterating returns all entries in reverse order
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"cherry");
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"banana");
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"apple");
 
-        assert!(iter.next_entry().await.unwrap().is_none());
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -823,22 +876,22 @@ mod tests {
         let mut iter = DescendingBlockIteratorV2::new(&block);
 
         // when/then: iterating returns all entries in reverse order
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"e");
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"d");
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"c");
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"b");
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"a");
 
-        assert!(iter.next_entry().await.unwrap().is_none());
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -860,11 +913,11 @@ mod tests {
         iter.seek(b"cherry").await.unwrap();
 
         // then: returns that key
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"cherry");
 
         // and continues descending
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"banana");
     }
 
@@ -879,11 +932,11 @@ mod tests {
         iter.seek(b"banana").await.unwrap();
 
         // then: returns the largest key <= banana, which is apple
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"apple");
 
         // and no more entries (we're at the beginning)
-        assert!(iter.next_entry().await.unwrap().is_none());
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -897,7 +950,7 @@ mod tests {
         iter.seek(b"zebra").await.unwrap();
 
         // then: returns the last (largest) key
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"banana");
     }
 
@@ -912,7 +965,7 @@ mod tests {
         iter.seek(b"apple").await.unwrap();
 
         // then: no entries (nothing <= apple)
-        assert!(iter.next_entry().await.unwrap().is_none());
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -923,11 +976,11 @@ mod tests {
         let mut iter = DescendingBlockIteratorV2::new(&block);
 
         // when: iterating
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"only");
 
         // then: no more entries
-        assert!(iter.next_entry().await.unwrap().is_none());
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -946,20 +999,20 @@ mod tests {
         let mut iter = DescendingBlockIteratorV2::new(&block);
 
         // when/then: iterating returns entries in reverse order
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"user:1003");
         assert_eq!(kv.value, ValueDeletable::Value(Bytes::from("dave")));
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"user:1002");
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"user:1001");
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"user:1000");
 
-        assert!(iter.next_entry().await.unwrap().is_none());
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -980,11 +1033,11 @@ mod tests {
 
         // when/then: all entries are returned in reverse order
         for i in (0..20).rev() {
-            let kv = iter.next_entry().await.unwrap().unwrap();
+            let kv = iter.next().await.unwrap().unwrap();
             let expected_key = format!("key_{:02}", i);
             assert_eq!(kv.key.as_ref(), expected_key.as_bytes());
         }
-        assert!(iter.next_entry().await.unwrap().is_none());
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1012,35 +1065,35 @@ mod tests {
         iter.seek(b"key_10").await.unwrap();
 
         // then: returns key_10 and continues descending
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"key_10");
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"key_09");
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"key_08");
 
         // crosses into previous restart region
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"key_07");
 
         // when: seeking to a key between entries
         iter.seek(b"key_14a").await.unwrap();
 
         // then: returns the largest key <= key_14a, which is key_14
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"key_14");
 
         // when: seeking to a key at the start of a restart region
         iter.seek(b"key_04").await.unwrap();
 
         // then: returns key_04
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"key_04");
 
         // and continues to previous region
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"key_03");
     }
 
@@ -1058,16 +1111,16 @@ mod tests {
         let mut iter = BlockIteratorV2::new(&block, IterationOrder::Descending);
 
         // then: iterating returns all entries in reverse order
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"cherry");
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"banana");
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"apple");
 
-        assert!(iter.next_entry().await.unwrap().is_none());
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1086,10 +1139,383 @@ mod tests {
         iter.seek(b"key_10").await.unwrap();
 
         // then: returns key_10 and continues descending
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"key_10");
 
-        let kv = iter.next_entry().await.unwrap().unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
         assert_eq!(kv.key.as_ref(), b"key_09");
+    }
+
+    // ==================== Duplicate Key Edge Case Tests ====================
+
+    #[tokio::test]
+    async fn should_seek_finds_all_entries_with_duplicate_keys_across_restarts() {
+        // given: a block with duplicate keys spanning multiple restart regions
+        let mut builder = BlockBuilder::new_v2_with_restart_interval(4096, 2);
+        // 6 entries with same key, restart_interval=2 means restarts at 0, 2, 4
+        for i in 0..6 {
+            let value = format!("val_{}", i);
+            let _ = builder.add(make_entry(b"dup", value.as_bytes(), i as u64));
+        }
+        let block = builder.build().expect("build failed");
+
+        assert_eq!(block.offsets().len(), 3); // restarts at entries 0, 2, 4
+
+        let mut iter = BlockIteratorV2::new_ascending(&block);
+
+        // when: seeking to "dup"
+        iter.seek(b"dup").await.unwrap();
+
+        // then: should find all 6 entries starting from the first
+        for expected_seq in 0..6u64 {
+            let kv = iter.next().await.unwrap().unwrap();
+            assert_eq!(kv.key.as_ref(), b"dup");
+            assert_eq!(
+                kv.seq, expected_seq,
+                "expected seq {} but got {}",
+                expected_seq, kv.seq
+            );
+        }
+
+        assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn should_seek_with_duplicate_keys_at_specific_restart() {
+        // given: entries where duplicate keys start at a restart point
+        // [a, a] [dup, dup] [dup, dup] [b, b]
+        //  ^r0     ^r1        ^r2       ^r3
+        let mut builder = BlockBuilder::new_v2_with_restart_interval(4096, 2);
+        let _ = builder.add(make_entry(b"a", b"v0", 0));
+        let _ = builder.add(make_entry(b"a", b"v1", 1));
+        let _ = builder.add(make_entry(b"dup", b"v2", 2)); // restart 1
+        let _ = builder.add(make_entry(b"dup", b"v3", 3));
+        let _ = builder.add(make_entry(b"dup", b"v4", 4)); // restart 2
+        let _ = builder.add(make_entry(b"dup", b"v5", 5));
+        let _ = builder.add(make_entry(b"b", b"v6", 6)); // restart 3
+        let _ = builder.add(make_entry(b"b", b"v7", 7));
+        let block = builder.build().expect("build failed");
+
+        assert_eq!(block.offsets().len(), 4);
+
+        let mut iter = BlockIteratorV2::new_ascending(&block);
+
+        // when: seeking to "dup"
+        iter.seek(b"dup").await.unwrap();
+
+        // then: should find all 4 "dup" entries starting from seq=2
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"dup");
+        assert_eq!(kv.seq, 2);
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"dup");
+        assert_eq!(kv.seq, 3);
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"dup");
+        assert_eq!(kv.seq, 4);
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"dup");
+        assert_eq!(kv.seq, 5);
+
+        // next should be "b"
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"b");
+    }
+
+    #[tokio::test]
+    async fn should_seek_with_dup_key_straddling_first_restart() {
+        // given: a block where duplicate keys start in the FIRST restart region
+        // This tests that we don't go to restart -1 (which doesn't exist)
+        // Layout with restart_interval=2:
+        // restart 0: [dup, dup]    - key "dup"
+        // restart 1: [dup, dup]    - key "dup"
+        // restart 2: [z, z]        - key "z"
+        let mut builder = BlockBuilder::new_v2_with_restart_interval(4096, 2);
+        let _ = builder.add(make_entry(b"dup", b"v0", 0)); // restart 0
+        let _ = builder.add(make_entry(b"dup", b"v1", 1));
+        let _ = builder.add(make_entry(b"dup", b"v2", 2)); // restart 1
+        let _ = builder.add(make_entry(b"dup", b"v3", 3));
+        let _ = builder.add(make_entry(b"z", b"v4", 4)); // restart 2
+        let _ = builder.add(make_entry(b"z", b"v5", 5));
+        let block = builder.build().expect("build failed");
+
+        assert_eq!(block.offsets().len(), 3);
+
+        let mut iter = BlockIteratorV2::new_ascending(&block);
+
+        // when: seeking to "dup"
+        iter.seek(b"dup").await.unwrap();
+
+        // then: should find ALL dup entries starting from the very first one (seq=0)
+        for expected_seq in 0..4u64 {
+            let kv = iter.next().await.unwrap().unwrap();
+            assert_eq!(kv.key.as_ref(), b"dup");
+            assert_eq!(kv.seq, expected_seq);
+        }
+
+        // next should be "z"
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"z");
+    }
+
+    #[tokio::test]
+    async fn should_seek_descending_finds_all_entries_with_duplicate_keys_across_restarts() {
+        // given: a block with duplicate keys spanning multiple restart regions
+        let mut builder = BlockBuilder::new_v2_with_restart_interval(4096, 2);
+        // 6 entries with same key, restart_interval=2 means restarts at 0, 2, 4
+        for i in 0..6 {
+            let value = format!("val_{}", i);
+            let _ = builder.add(make_entry(b"dup", value.as_bytes(), i as u64));
+        }
+        let block = builder.build().expect("build failed");
+
+        assert_eq!(block.offsets().len(), 3); // restarts at entries 0, 2, 4
+
+        let mut iter = DescendingBlockIteratorV2::new(&block);
+
+        // when: seeking to "dup"
+        iter.seek(b"dup").await.unwrap();
+
+        // then: should find all 6 entries in reverse order (last seq first)
+        for expected_seq in (0..6u64).rev() {
+            let kv = iter.next().await.unwrap().unwrap();
+            assert_eq!(kv.key.as_ref(), b"dup");
+            assert_eq!(
+                kv.seq, expected_seq,
+                "expected seq {} but got {}",
+                expected_seq, kv.seq
+            );
+        }
+
+        assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn should_seek_descending_with_duplicate_keys_at_specific_restart() {
+        // given: entries where duplicate keys start at a restart point
+        // [a, a] [dup, dup] [dup, dup] [b, b]
+        //  ^r0     ^r1        ^r2       ^r3
+        let mut builder = BlockBuilder::new_v2_with_restart_interval(4096, 2);
+        let _ = builder.add(make_entry(b"a", b"v0", 0));
+        let _ = builder.add(make_entry(b"a", b"v1", 1));
+        let _ = builder.add(make_entry(b"dup", b"v2", 2)); // restart 1
+        let _ = builder.add(make_entry(b"dup", b"v3", 3));
+        let _ = builder.add(make_entry(b"dup", b"v4", 4)); // restart 2
+        let _ = builder.add(make_entry(b"dup", b"v5", 5));
+        let _ = builder.add(make_entry(b"b", b"v6", 6)); // restart 3
+        let _ = builder.add(make_entry(b"b", b"v7", 7));
+        let block = builder.build().expect("build failed");
+
+        assert_eq!(block.offsets().len(), 4);
+
+        let mut iter = DescendingBlockIteratorV2::new(&block);
+
+        // when: seeking to "dup"
+        iter.seek(b"dup").await.unwrap();
+
+        // then: should find all 4 "dup" entries in reverse order
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"dup");
+        assert_eq!(kv.seq, 5);
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"dup");
+        assert_eq!(kv.seq, 4);
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"dup");
+        assert_eq!(kv.seq, 3);
+
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"dup");
+        assert_eq!(kv.seq, 2);
+
+        // next should be "a"
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"a");
+    }
+
+    #[tokio::test]
+    async fn should_seek_descending_with_dup_key_straddling_restarts() {
+        // given: a block where duplicate keys straddle restart boundaries
+        // Layout with restart_interval=2:
+        // [a, dup] [dup, dup] [dup, y] [y, z]
+        //   ^r0       ^r1       ^r2      ^r3
+        let mut builder = BlockBuilder::new_v2_with_restart_interval(4096, 2);
+        let _ = builder.add(make_entry(b"a", b"v0", 0)); // restart 0
+        let _ = builder.add(make_entry(b"dup", b"v1", 1));
+        let _ = builder.add(make_entry(b"dup", b"v2", 2)); // restart 1
+        let _ = builder.add(make_entry(b"dup", b"v3", 3));
+        let _ = builder.add(make_entry(b"dup", b"v4", 4)); // restart 2
+        let _ = builder.add(make_entry(b"y", b"v5", 5));
+        let _ = builder.add(make_entry(b"y", b"v6", 6)); // restart 3
+        let _ = builder.add(make_entry(b"z", b"v7", 7));
+        let block = builder.build().expect("build failed");
+
+        assert_eq!(block.offsets().len(), 4);
+
+        let mut iter = DescendingBlockIteratorV2::new(&block);
+
+        // when: seeking to "dup"
+        iter.seek(b"dup").await.unwrap();
+
+        // then: should find ALL dup entries in reverse order (last seq first)
+        for expected_seq in (1..5u64).rev() {
+            let kv = iter.next().await.unwrap().unwrap();
+            assert_eq!(kv.key.as_ref(), b"dup");
+            assert_eq!(kv.seq, expected_seq);
+        }
+
+        // next should be "a"
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key.as_ref(), b"a");
+    }
+
+    // ==================== Property-Based Tests ====================
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+        use proptest::test_runner::TestCaseError;
+
+        /// Strategy that generates a sorted list of (key, seq) pairs where keys
+        /// may have duplicates. Each key is 1-4 lowercase letters, and there can
+        /// be 1-36 copies of any given key (with increasing seq numbers). Using
+        /// up to 36 copies ensures duplicate keys can span more than 2 restart
+        /// points even with the default restart interval of 16.
+        fn sorted_entries_strategy() -> impl Strategy<Value = Vec<(Vec<u8>, u64)>> {
+            prop::collection::vec(
+                (prop::collection::vec(b'a'..=b'z', 1..=4), 1..=36usize),
+                2..=10,
+            )
+            .prop_map(|key_specs| {
+                let mut entries = Vec::new();
+                let mut seq = 0u64;
+                let mut key_specs = key_specs;
+                key_specs.sort_by(|a, b| a.0.cmp(&b.0));
+                key_specs.dedup_by(|a, b| a.0 == b.0);
+                for (key, count) in key_specs {
+                    for _ in 0..count {
+                        entries.push((key.clone(), seq));
+                        seq += 1;
+                    }
+                }
+                entries
+            })
+        }
+
+        fn build_block_from_entries(entries: &[(Vec<u8>, u64)], restart_interval: usize) -> Block {
+            let mut builder = BlockBuilder::new_v2_with_restart_interval(65536, restart_interval);
+            for (key, seq) in entries {
+                let _ = builder.add(make_entry(key, b"v", *seq));
+            }
+            builder.build().expect("build failed")
+        }
+
+        fn distinct_keys(entries: &[(Vec<u8>, u64)]) -> Vec<Vec<u8>> {
+            let mut keys: Vec<Vec<u8>> = entries.iter().map(|(k, _)| k.clone()).collect();
+            keys.dedup();
+            keys
+        }
+
+        proptest! {
+            #[test]
+            fn should_seek_and_iterate_ascending(
+                entries in sorted_entries_strategy(),
+                restart_interval in 2..=16usize,
+            ) {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result: Result<(), TestCaseError> = rt.block_on(async {
+                    let block = build_block_from_entries(&entries, restart_interval);
+
+                    for seek_key in &distinct_keys(&entries) {
+                        let mut iter = BlockIteratorV2::new_ascending(&block);
+                        iter.seek(seek_key).await.unwrap();
+
+                        // Collect all expected entries at or after the seek key
+                        let expected: Vec<_> = entries.iter()
+                            .filter(|(k, _)| k >= seek_key)
+                            .collect();
+
+                        // First entry should be the first occurrence of the seek key
+                        let first = iter.next().await.unwrap();
+                        prop_assert!(first.is_some(), "seek to {:?} should find an entry", seek_key);
+                        let first = first.unwrap();
+                        prop_assert_eq!(
+                            first.key.as_ref(), expected[0].0.as_slice(),
+                            "first key mismatch after seek to {:?}", seek_key
+                        );
+                        prop_assert_eq!(
+                            first.seq, expected[0].1,
+                            "first seq mismatch after seek to {:?}", seek_key
+                        );
+
+                        // Remaining entries should match in order
+                        for (expected_key, expected_seq) in &expected[1..] {
+                            let entry = iter.next().await.unwrap();
+                            prop_assert!(entry.is_some());
+                            let entry = entry.unwrap();
+                            prop_assert_eq!(entry.key.as_ref(), expected_key.as_slice());
+                            prop_assert_eq!(entry.seq, *expected_seq);
+                        }
+
+                        prop_assert!(iter.next().await.unwrap().is_none());
+                    }
+                    Ok(())
+                });
+                result?;
+            }
+
+            #[test]
+            fn should_seek_and_iterate_descending(
+                entries in sorted_entries_strategy(),
+                restart_interval in 2..=16usize,
+            ) {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result: Result<(), TestCaseError> = rt.block_on(async {
+                    let block = build_block_from_entries(&entries, restart_interval);
+
+                    for seek_key in &distinct_keys(&entries) {
+                        let mut iter = DescendingBlockIteratorV2::new(&block);
+                        iter.seek(seek_key).await.unwrap();
+
+                        // Collect all expected entries at or before the seek key, reversed
+                        let expected: Vec<_> = entries.iter()
+                            .filter(|(k, _)| k <= seek_key)
+                            .rev()
+                            .collect();
+
+                        // First entry should be the last occurrence of the seek key
+                        let first = iter.next().await.unwrap();
+                        prop_assert!(first.is_some(), "descending seek to {:?} should find an entry", seek_key);
+                        let first = first.unwrap();
+                        prop_assert_eq!(
+                            first.key.as_ref(), expected[0].0.as_slice(),
+                            "first key mismatch after descending seek to {:?}", seek_key
+                        );
+                        prop_assert_eq!(
+                            first.seq, expected[0].1,
+                            "first seq mismatch after descending seek to {:?}", seek_key
+                        );
+
+                        // Remaining entries should match in reverse order
+                        for (expected_key, expected_seq) in &expected[1..] {
+                            let entry = iter.next().await.unwrap();
+                            prop_assert!(entry.is_some());
+                            let entry = entry.unwrap();
+                            prop_assert_eq!(entry.key.as_ref(), expected_key.as_slice());
+                            prop_assert_eq!(entry.seq, *expected_seq);
+                        }
+
+                        prop_assert!(iter.next().await.unwrap().is_none());
+                    }
+                    Ok(())
+                });
+                result?;
+            }
+        }
     }
 }

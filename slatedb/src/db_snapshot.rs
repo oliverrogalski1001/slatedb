@@ -6,6 +6,7 @@ use uuid::Uuid;
 use crate::bytes_range::BytesRange;
 use crate::config::{ReadOptions, ScanOptions};
 use crate::db_iter::DbIterator;
+use crate::types::KeyValue;
 
 use crate::db::DbInner;
 use crate::transaction_manager::TransactionManager;
@@ -26,9 +27,9 @@ impl DbSnapshot {
     pub(crate) fn new(
         db_inner: Arc<DbInner>,
         txn_manager: Arc<TransactionManager>,
-        seq: u64,
+        seq: Option<u64>,
     ) -> Arc<Self> {
-        let txn_id = txn_manager.new_txn(seq, true);
+        let (txn_id, seq) = txn_manager.new_snapshot(seq);
 
         Arc::new(Self {
             txn_id,
@@ -36,6 +37,12 @@ impl DbSnapshot {
             txn_manager,
             db_inner,
         })
+    }
+
+    /// Get the sequence number this snapshot was started at. This determines data visibility
+    /// for reads in this snapshot.
+    pub fn seq(&self) -> u64 {
+        self.started_seq
     }
 
     /// Get a value from the snapshot with default read options.
@@ -62,13 +69,35 @@ impl DbSnapshot {
         key: K,
         options: &ReadOptions,
     ) -> Result<Option<Bytes>, crate::Error> {
+        self.get_key_value_with_options(key, options)
+            .await
+            .map(|kv_opt| kv_opt.map(|kv| kv.value))
+    }
+
+    /// Get a key-value pair from the snapshot with default read options.
+    pub async fn get_key_value<K: AsRef<[u8]> + Send>(
+        &self,
+        key: K,
+    ) -> Result<Option<KeyValue>, crate::Error> {
+        self.get_key_value_with_options(key, &ReadOptions::default())
+            .await
+    }
+
+    /// Get a key-value pair from the snapshot with custom read options.
+    pub async fn get_key_value_with_options<K: AsRef<[u8]> + Send>(
+        &self,
+        key: K,
+        options: &ReadOptions,
+    ) -> Result<Option<KeyValue>, crate::Error> {
         self.db_inner.status()?;
         let db_state = self.db_inner.state.read().view();
-        self.db_inner
+        let kv = self
+            .db_inner
             .reader
-            .get_with_options(key, options, &db_state, None, Some(self.started_seq))
+            .get_key_value_with_options(key, options, &db_state, None, Some(self.started_seq))
             .await
-            .map_err(Into::into)
+            .map_err(crate::Error::from)?;
+        Ok(kv)
     }
 
     /// Scan a range of keys using the default scan options.
@@ -171,6 +200,14 @@ impl DbRead for DbSnapshot {
         options: &ReadOptions,
     ) -> Result<Option<Bytes>, crate::Error> {
         self.get_with_options(key, options).await
+    }
+
+    async fn get_key_value_with_options<K: AsRef<[u8]> + Send>(
+        &self,
+        key: K,
+        options: &ReadOptions,
+    ) -> Result<Option<KeyValue>, crate::Error> {
+        self.get_key_value_with_options(key, options).await
     }
 
     async fn scan_with_options<K, T>(
@@ -718,7 +755,7 @@ mod tests {
 
         // At this point the data is in the memtable but not committed; create the snapshot
         let snapshot = db.snapshot().await?;
-        assert_eq!(snapshot.started_seq, recent_committed_seq);
+        assert_eq!(snapshot.seq(), recent_committed_seq);
 
         // Turn off the failpoint to let the put complete
         fail_parallel::cfg(fp_registry.clone(), "write-batch-pre-commit", "off").unwrap();

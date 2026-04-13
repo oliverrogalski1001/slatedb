@@ -6,7 +6,7 @@
 
 use crate::config::{MergeOptions, PutOptions};
 use crate::error::SlateDBError;
-use crate::iter::{IterationOrder, KeyValueIterator};
+use crate::iter::{IterationOrder, RowEntryIterator};
 use crate::mem_table::{KVTableInternalKeyRange, SequencedKey};
 use crate::merge_operator::{MergeOperatorIterator, MergeOperatorType};
 use crate::types::{RowEntry, ValueDeletable};
@@ -281,12 +281,12 @@ impl WriteBatch {
         self.write_idx += 1;
     }
 
-    pub(crate) fn keys(&self) -> HashSet<Bytes> {
-        self.ops.keys().map(|key| key.user_key.clone()).collect()
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.ops.is_empty()
+    pub(crate) fn keys(&self) -> HashSet<Bytes> {
+        self.ops.keys().map(|key| key.user_key.clone()).collect()
     }
 
     /// Converts a WriteBatch into a vector of RowEntry objects with seq and timestamp set,
@@ -298,7 +298,7 @@ impl WriteBatch {
         default_ttl: Option<u64>,
         merger: Option<MergeOperatorType>,
     ) -> Result<Vec<RowEntry>, SlateDBError> {
-        let mut it: Box<dyn KeyValueIterator> = Box::new(WriteBatchIterator::new_with_seq_and_ttl(
+        let mut it: Box<dyn RowEntryIterator> = Box::new(WriteBatchIterator::new_with_seq_and_ttl(
             self,
             ..,
             IterationOrder::Ascending,
@@ -311,13 +311,12 @@ impl WriteBatch {
                 merge_operator.clone(),
                 it,
                 false,
-                now,
                 None,
             ));
         }
 
         let mut entries = Vec::new();
-        while let Some(entry) = it.next_entry().await? {
+        while let Some(entry) = it.next().await? {
             entries.push(entry);
         }
         Ok(entries)
@@ -393,12 +392,12 @@ impl WriteBatchIterator {
 }
 
 #[async_trait]
-impl KeyValueIterator for WriteBatchIterator {
+impl RowEntryIterator for WriteBatchIterator {
     async fn init(&mut self) -> Result<(), crate::error::SlateDBError> {
         Ok(())
     }
 
-    async fn next_entry(&mut self) -> Result<Option<RowEntry>, crate::error::SlateDBError> {
+    async fn next(&mut self) -> Result<Option<RowEntry>, crate::error::SlateDBError> {
         Ok(self.iter.next().map(|(_, entry)| entry))
     }
 
@@ -625,7 +624,7 @@ mod tests {
         let batch = WriteBatch::new();
         let mut iter = WriteBatchIterator::new(batch.clone(), .., IterationOrder::Ascending);
 
-        let result = iter.next_entry().await.unwrap();
+        let result = iter.next().await.unwrap();
         assert!(result.is_none());
     }
 
@@ -641,7 +640,7 @@ mod tests {
         iter.seek(b"key2").await.unwrap();
 
         // Should get key3 (next available)
-        let result = iter.next_entry().await.unwrap();
+        let result = iter.next().await.unwrap();
         assert!(result.is_some());
         let entry = result.unwrap();
         assert_eq!(entry.key, Bytes::from_static(b"key3"));
@@ -663,7 +662,7 @@ mod tests {
         iter.seek(b"key9").await.unwrap();
 
         // Should be exhausted
-        let result = iter.next_entry().await.unwrap();
+        let result = iter.next().await.unwrap();
         assert!(result.is_none());
     }
 
@@ -711,7 +710,7 @@ mod tests {
         iter.seek(b"key1").await.unwrap();
 
         // Should get key2 (first available)
-        let result = iter.next_entry().await.unwrap();
+        let result = iter.next().await.unwrap();
         assert!(result.is_some());
         let entry = result.unwrap();
         assert_eq!(entry.key, Bytes::from_static(b"key2"));

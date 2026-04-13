@@ -16,6 +16,8 @@
 //! +------------------+
 //! |   Index Block    |  <- Block metadata (offsets, first keys)
 //! +------------------+
+//! |   Stats Block    |  <- Per-SST statistics (num_puts, num_deletes, etc.)
+//! +------------------+
 //! |   SST Info       |  <- Table metadata (key range, compression, etc.)
 //! +------------------+
 //! |  Metadata offset |  <- Metadata offset (8 bytes)
@@ -55,36 +57,46 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::config::CompressionCodec;
-use crate::db_state::SsTableInfoCodec;
+use crate::db_state::{SsTableInfoCodec, SstType};
 use crate::error::SlateDBError;
 use crate::filter::BloomFilterBuilder;
 use crate::flatbuffer_types::{BlockMeta, BlockMetaArgs};
-#[cfg(test)]
-use crate::format::sst::SST_FORMAT_VERSION_V2;
 use crate::format::sst::{
-    BlockBuilder, EncodedSsTable, EncodedSsTableBlock, EncodedSsTableBlockBuilder,
-    EncodedSsTableFooterBuilder, SsTableFormat, SST_FORMAT_VERSION,
+    BlockBuilder, BlockBuilderWithStats, EncodedSsTable, EncodedSsTableBlock,
+    EncodedSsTableBlockBuilder, EncodedSsTableFooterBuilder, SsTableFormat, SST_FORMAT_VERSION,
+    SST_FORMAT_VERSION_LATEST, SST_FORMAT_VERSION_V2,
 };
+use crate::sst_stats::SstStats;
 use crate::types::RowEntry;
 use crate::utils::compute_index_key;
 use crate::BlockTransformer;
 use bytes::Bytes;
 use flatbuffers::DefaultAllocator;
 
+/// SST block format version.
+///
+/// This enum is only available under `#[cfg(test)]` for integration tests
+/// to verify backward compatibility between V1 and V2 formats.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum BlockFormat {
+#[allow(unreachable_pub)] // Exported conditionally under #[cfg(test)] in lib.rs
+pub enum BlockFormat {
+    /// Original block format (V1) with per-entry offsets.
+    #[allow(dead_code)] // Used in tests
     V1,
-    #[allow(dead_code)]
+    /// Prefix compression block format (V2) with restart points.
+    #[allow(dead_code)] // Used in tests
     V2,
+    /// Latest block format (V2) with restart points.
+    Latest,
 }
 
 impl BlockFormat {
     /// Returns the SST format version corresponding to this block format.
-    #[cfg(test)]
-    pub(crate) fn sst_format_version(self) -> u16 {
+    fn sst_format_version(self) -> u16 {
         match self {
             BlockFormat::V1 => SST_FORMAT_VERSION,
             BlockFormat::V2 => SST_FORMAT_VERSION_V2,
+            BlockFormat::Latest => SST_FORMAT_VERSION_LATEST,
         }
     }
 }
@@ -97,6 +109,9 @@ impl SsTableFormat {
             self.sst_codec.clone(),
             self.filter_bits_per_key,
         );
+        if let Some(block_format) = self.block_format {
+            builder = builder.with_block_format(block_format);
+        }
         if let Some(codec) = self.compression_codec {
             builder = builder.with_compression_codec(codec);
         }
@@ -109,10 +124,11 @@ impl SsTableFormat {
 
 /// Builds an SSTable from key-value pairs.
 pub(crate) struct EncodedSsTableBuilder<'a> {
-    builder: BlockBuilder,
+    builder: BlockBuilderWithStats,
     index_builder: flatbuffers::FlatBufferBuilder<'a, DefaultAllocator>,
     first_key: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
     sst_first_key: Option<Bytes>,
+    sst_last_key: Option<Bytes>,
     current_block_max_key: Option<Bytes>,
     block_meta: Vec<flatbuffers::WIPOffset<BlockMeta<'a>>>,
     current_len: u64,
@@ -121,7 +137,7 @@ pub(crate) struct EncodedSsTableBuilder<'a> {
     block_format: BlockFormat,
     sst_format_version: u16,
     min_filter_keys: u32,
-    num_keys: u32,
+    stats: SstStats,
     filter_builder: BloomFilterBuilder,
     sst_codec: Box<dyn SsTableInfoCodec>,
     compression_codec: Option<CompressionCodec>,
@@ -142,13 +158,14 @@ impl EncodedSsTableBuilder<'_> {
             block_meta: Vec::new(),
             first_key: None,
             sst_first_key: None,
+            sst_last_key: None,
             current_block_max_key: None,
             block_size,
-            block_format: BlockFormat::V1,
-            builder: BlockBuilder::new_v1(block_size),
-            sst_format_version: SST_FORMAT_VERSION,
+            block_format: BlockFormat::Latest,
+            builder: BlockBuilderWithStats::new(BlockBuilder::new_latest(block_size)),
+            sst_format_version: SST_FORMAT_VERSION_LATEST,
             min_filter_keys,
-            num_keys: 0,
+            stats: SstStats::default(),
             filter_builder: BloomFilterBuilder::new(filter_bits_per_key),
             index_builder: flatbuffers::FlatBufferBuilder::new(),
             sst_codec,
@@ -157,11 +174,13 @@ impl EncodedSsTableBuilder<'_> {
         }
     }
 
-    fn new_block_builder(&self) -> BlockBuilder {
-        match self.block_format {
+    fn new_block_builder(&self) -> BlockBuilderWithStats {
+        let builder = match self.block_format {
             BlockFormat::V1 => BlockBuilder::new_v1(self.block_size),
             BlockFormat::V2 => BlockBuilder::new_v2(self.block_size),
-        }
+            BlockFormat::Latest => BlockBuilder::new_latest(self.block_size),
+        };
+        BlockBuilderWithStats::new(builder)
     }
 
     /// Sets the compression codec for compressing the blocks
@@ -182,10 +201,9 @@ impl EncodedSsTableBuilder<'_> {
     /// # Panics
     /// Panics if called after data has been added to the builder, as this would
     /// result in mixed block types within the SST.
-    #[cfg(test)]
     pub(crate) fn with_block_format(mut self, block_format: BlockFormat) -> Self {
         assert!(
-            self.num_keys == 0,
+            self.sst_first_key.is_none(),
             "cannot change block format after data has been added"
         );
         self.block_format = block_format;
@@ -198,7 +216,8 @@ impl EncodedSsTableBuilder<'_> {
     /// The block size is calculated after applying any compression if enabled.
     /// The block size is None if the builder has not finished compacting a block yet.
     pub(crate) async fn add(&mut self, entry: RowEntry) -> Result<Option<usize>, SlateDBError> {
-        self.num_keys += 1;
+        self.stats.raw_key_size += entry.key.len() as u64;
+        self.stats.raw_val_size += entry.value.len() as u64;
 
         let index_key = compute_index_key(self.current_block_max_key.take(), &entry.key);
         let is_sst_first_key = self.sst_first_key.is_none();
@@ -215,6 +234,7 @@ impl EncodedSsTableBuilder<'_> {
         if is_sst_first_key {
             self.sst_first_key = Some(entry.key.clone());
         }
+        self.sst_last_key = Some(entry.key.clone());
         self.current_block_max_key = Some(entry.key.clone());
 
         self.builder.add(entry)?;
@@ -227,14 +247,15 @@ impl EncodedSsTableBuilder<'_> {
         &mut self,
         key: &[u8],
         val: &[u8],
-        attrs: crate::types::RowAttributes,
+        ts: Option<i64>,
+        expire_ts: Option<i64>,
     ) -> Result<Option<usize>, SlateDBError> {
         let entry = RowEntry::new(
             key.to_vec().into(),
             crate::types::ValueDeletable::Value(Bytes::copy_from_slice(val)),
             0,
-            attrs.ts,
-            attrs.expire_ts,
+            ts,
+            expire_ts,
         );
         self.add(entry).await
     }
@@ -255,7 +276,8 @@ impl EncodedSsTableBuilder<'_> {
         }
 
         let new_builder = self.new_block_builder();
-        let builder = std::mem::replace(&mut self.builder, new_builder);
+        let old_builder = std::mem::replace(&mut self.builder, new_builder);
+        let (builder, block_stats) = old_builder.into_parts();
         let mut block_builder = EncodedSsTableBlockBuilder::new(builder, self.current_len);
         if let Some(codec) = self.compression_codec {
             block_builder = block_builder.with_compression_codec(codec);
@@ -272,6 +294,10 @@ impl EncodedSsTableBuilder<'_> {
             },
         );
         self.block_meta.push(block_meta);
+        self.stats.num_puts += block_stats.num_puts as u64;
+        self.stats.num_deletes += block_stats.num_deletes as u64;
+        self.stats.num_merges += block_stats.num_merges as u64;
+        self.stats.block_stats.push(block_stats);
 
         let block_size = block.len();
         self.current_len += block_size as u64;
@@ -303,6 +329,13 @@ impl EncodedSsTableBuilder<'_> {
     /// |  | 4-byte Checksum (CRC32 of index data)       |  |
     /// |  +---------------------------------------------+  |
     /// +---------------------------------------------------+
+    /// |                Stats Block                        |
+    /// |  +---------------------------------------------+  |
+    /// |  | Stats Data (compressed encoded stats)       |  |
+    /// |  +---------------------------------------------+  |
+    /// |  | 4-byte Checksum (CRC32 of stats data)       |  |
+    /// |  +---------------------------------------------+  |
+    /// +---------------------------------------------------+
     /// |                Metadata Block                     |
     /// |    (SsTableInfo encoded with FlatBuffers)         |
     /// +---------------------------------------------------+
@@ -319,10 +352,12 @@ impl EncodedSsTableBuilder<'_> {
         let mut footer_builder = EncodedSsTableFooterBuilder::new(
             self.current_len,
             self.sst_first_key,
+            self.sst_last_key,
             &*self.sst_codec,
             self.index_builder,
             self.block_meta,
             self.sst_format_version,
+            SstType::Compacted,
         );
         if let Some(codec) = self.compression_codec {
             footer_builder = footer_builder.with_compression_codec(codec);
@@ -330,20 +365,22 @@ impl EncodedSsTableBuilder<'_> {
         if let Some(transformer) = self.block_transformer.clone() {
             footer_builder = footer_builder.with_block_transformer(transformer);
         }
-
         // Add filter if enough keys
-        if self.num_keys >= self.min_filter_keys {
+        if self.stats.num_rows() >= self.min_filter_keys as u64 {
             let filter = Arc::new(self.filter_builder.build());
             let encoded_filter = filter.encode();
             footer_builder = footer_builder.with_filter(filter, encoded_filter);
         }
+        footer_builder = footer_builder.with_stats(self.stats);
 
         let footer = footer_builder.build().await?;
 
         Ok(EncodedSsTable {
+            format_version: self.sst_format_version,
             info: footer.info,
             index: footer.index,
             filter: footer.filter,
+            stats: footer.stats,
             unconsumed_blocks: self.blocks,
             footer: footer.encoded_bytes,
         })
@@ -369,16 +406,15 @@ mod tests {
 
     use super::*;
     use crate::blob::ReadOnlyBlob;
-    use crate::block_iterator::BlockIterator;
+    use crate::block_iterator::{BlockIteratorLatest, BlockLike};
     use crate::bytes_range::BytesRange;
-    use crate::db_state::SsTableId;
+    use crate::db_state::{SsTableId, SsTableView};
     use crate::filter::filter_hash;
     use crate::format::block::Block;
-    use crate::iter::IterationOrder::Ascending;
     use crate::object_stores::ObjectStores;
     use crate::sst_iter::{SstIterator, SstIteratorOptions};
     use crate::tablestore::TableStore;
-    use crate::test_utils::{assert_iterator, build_test_sst, gen_attrs, gen_empty_attrs};
+    use crate::test_utils::{assert_iterator, build_test_sst};
 
     #[test]
     fn test_estimate_encoded_size() {
@@ -409,11 +445,11 @@ mod tests {
         assert!(size_with_filter > size_without_filter); // Should be larger due to bloom filter
     }
 
-    fn next_block_to_iter(builder: &mut EncodedSsTableBuilder) -> BlockIterator<Block> {
+    fn next_block_to_iter(builder: &mut EncodedSsTableBuilder) -> BlockIteratorLatest<Block> {
         let block = builder.next_block();
         assert!(block.is_some());
         let block = block.unwrap().block;
-        BlockIterator::new(block, Ascending)
+        BlockIteratorLatest::new_ascending(block)
     }
 
     #[tokio::test]
@@ -432,15 +468,15 @@ mod tests {
         );
         let mut builder = table_store.table_builder();
         builder
-            .add_value(&[b'a'; 8], &[b'1'; 8], gen_attrs(1))
+            .add_value(&[b'a'; 8], &[b'1'; 8], Some(1), None)
             .await
             .unwrap();
         builder
-            .add_value(&[b'b'; 8], &[b'2'; 8], gen_attrs(2))
+            .add_value(&[b'b'; 8], &[b'2'; 8], Some(2), None)
             .await
             .unwrap();
         builder
-            .add_value(&[b'c'; 8], &[b'3'; 8], gen_attrs(3))
+            .add_value(&[b'c'; 8], &[b'3'; 8], Some(3), None)
             .await
             .unwrap();
 
@@ -459,7 +495,7 @@ mod tests {
         .await;
         assert!(builder.next_block().is_none());
         builder
-            .add_value(&[b'd'; 8], &[b'4'; 8], gen_attrs(1))
+            .add_value(&[b'd'; 8], &[b'4'; 8], Some(1), None)
             .await
             .unwrap();
         let mut iter = next_block_to_iter(&mut builder);
@@ -487,15 +523,15 @@ mod tests {
         );
         let mut builder = table_store.table_builder();
         builder
-            .add_value(&[b'a'; 8], &[b'1'; 8], gen_attrs(1))
+            .add_value(&[b'a'; 8], &[b'1'; 8], Some(1), None)
             .await
             .unwrap();
         builder
-            .add_value(&[b'b'; 8], &[b'2'; 8], gen_attrs(2))
+            .add_value(&[b'b'; 8], &[b'2'; 8], Some(2), None)
             .await
             .unwrap();
         builder
-            .add_value(&[b'c'; 8], &[b'3'; 8], gen_attrs(3))
+            .add_value(&[b'c'; 8], &[b'3'; 8], Some(3), None)
             .await
             .unwrap();
         let first_block = builder.next_block();
@@ -515,7 +551,7 @@ mod tests {
             .read_block_raw(&encoded.info, &index, 0, &raw_sst)
             .await
             .unwrap();
-        let mut iter = BlockIterator::new_ascending(block);
+        let mut iter = BlockIteratorLatest::new_ascending(block);
         assert_iterator(
             &mut iter,
             vec![RowEntry::new_value(&[b'a'; 8], &[b'1'; 8], 0).with_create_ts(1)],
@@ -525,7 +561,7 @@ mod tests {
             .read_block_raw(&encoded.info, &index, 1, &raw_sst)
             .await
             .unwrap();
-        let mut iter = BlockIterator::new_ascending(block);
+        let mut iter = BlockIteratorLatest::new_ascending(block);
         assert_iterator(
             &mut iter,
             vec![RowEntry::new_value(&[b'b'; 8], &[b'2'; 8], 0).with_create_ts(2)],
@@ -535,7 +571,7 @@ mod tests {
             .read_block_raw(&encoded.info, &index, 2, &raw_sst)
             .await
             .unwrap();
-        let mut iter = BlockIterator::new_ascending(block);
+        let mut iter = BlockIteratorLatest::new_ascending(block);
         assert_iterator(
             &mut iter,
             vec![RowEntry::new_value(&[b'c'; 8], &[b'3'; 8], 0).with_create_ts(3)],
@@ -589,7 +625,8 @@ mod tests {
                 .add_value(
                     format!("key{}", k).as_bytes(),
                     format!("value{}", k).as_bytes(),
-                    gen_attrs(k),
+                    Some(k),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -667,11 +704,11 @@ mod tests {
         );
         let mut builder = table_store.table_builder();
         builder
-            .add_value(b"key1", b"value1", gen_attrs(1))
+            .add_value(b"key1", b"value1", Some(1), None)
             .await
             .unwrap();
         builder
-            .add_value(b"key2", b"value2", gen_attrs(2))
+            .add_value(b"key2", b"value2", Some(2), None)
             .await
             .unwrap();
         let encoded = builder.build().await.unwrap();
@@ -736,11 +773,11 @@ mod tests {
         );
         let mut builder = table_store.table_builder();
         builder
-            .add_value(b"key1", b"value1", gen_attrs(1))
+            .add_value(b"key1", b"value1", Some(1), None)
             .await
             .unwrap();
         builder
-            .add_value(b"key2", b"value2", gen_attrs(2))
+            .add_value(b"key2", b"value2", Some(2), None)
             .await
             .unwrap();
         let encoded = builder.build().await.unwrap();
@@ -823,19 +860,19 @@ mod tests {
         );
         let mut builder = table_store.table_builder();
         builder
-            .add_value(&[b'a'; 2], &[1u8; 2], gen_empty_attrs())
+            .add_value(&[b'a'; 2], &[1u8; 2], None, None)
             .await
             .unwrap();
         builder
-            .add_value(&[b'b'; 2], &[2u8; 2], gen_empty_attrs())
+            .add_value(&[b'b'; 2], &[2u8; 2], None, None)
             .await
             .unwrap();
         builder
-            .add_value(&[b'c'; 20], &[3u8; 20], gen_attrs(3))
+            .add_value(&[b'c'; 20], &[3u8; 20], Some(3), None)
             .await
             .unwrap();
         builder
-            .add_value(&[b'd'; 20], &[4u8; 20], gen_attrs(4))
+            .add_value(&[b'd'; 20], &[4u8; 20], Some(4), None)
             .await
             .unwrap();
         let encoded = builder.build().await.unwrap();
@@ -852,7 +889,7 @@ mod tests {
 
         // then:
         for expected_entries in expected_blocks {
-            let mut iter = BlockIterator::new(blocks.pop_front().unwrap(), Ascending);
+            let mut iter = BlockIteratorLatest::new_ascending(blocks.pop_front().unwrap());
             assert_iterator(&mut iter, expected_entries).await;
         }
         assert!(blocks.is_empty())
@@ -875,11 +912,11 @@ mod tests {
         );
         let mut builder = table_store.table_builder();
         builder
-            .add_value(b"key1", b"value1", gen_attrs(1))
+            .add_value(b"key1", b"value1", Some(1), None)
             .await
             .unwrap();
         builder
-            .add_value(b"key2", b"value2", gen_attrs(2))
+            .add_value(b"key2", b"value2", Some(2), None)
             .await
             .unwrap();
         let encoded = builder.build().await.unwrap();
@@ -943,11 +980,11 @@ mod tests {
         );
         let mut builder = table_store.table_builder();
         builder
-            .add_value(b"key1", b"value1", gen_attrs(1))
+            .add_value(b"key1", b"value1", Some(1), None)
             .await
             .unwrap();
         builder
-            .add_value(b"key2", b"value2", gen_attrs(2))
+            .add_value(b"key2", b"value2", Some(2), None)
             .await
             .unwrap();
         let encoded = builder.build().await.unwrap();
@@ -957,7 +994,7 @@ mod tests {
         let valid_blob = BytesBlob {
             bytes: bytes.clone(),
         };
-        let result = format.read_info(&valid_blob).await;
+        let result = format.read_info_and_version(&valid_blob).await;
         match result {
             Ok(_) => {}
             Err(e) => {
@@ -972,7 +1009,7 @@ mod tests {
             bytes: invalid_bytes.freeze(),
         };
         assert!(matches!(
-            format.read_info(&invalid_blob).await,
+            format.read_info_and_version(&invalid_blob).await,
             Err(SlateDBError::InvalidVersion { .. })
         ));
     }
@@ -999,17 +1036,14 @@ mod tests {
         let mut builder = table_store.table_builder();
         for key in 'a'..='z' {
             let key_bytes = [key as u8];
-            builder
-                .add_value(&key_bytes, b"value", gen_empty_attrs())
-                .await?;
+            builder.add_value(&key_bytes, b"value", None, None).await?;
         }
         let encoded = builder.build().await?;
 
         let sst_id = SsTableId::Wal(0);
-        let sst_handle = table_store
-            .write_sst(&sst_id, encoded, false)
-            .await?
-            .with_visible_range(BytesRange::from_ref("c"..="f"));
+        let sst_handle =
+            SsTableView::identity(table_store.write_sst(&sst_id, encoded, false).await?)
+                .with_visible_range(BytesRange::from_ref("c"..="f"));
 
         let expected_entries = vec![
             RowEntry::new_value(b"c", b"value", 0),
@@ -1121,11 +1155,11 @@ mod tests {
         );
         let mut builder = table_store.table_builder();
         builder
-            .add_value(b"key1", b"value1", gen_attrs(1))
+            .add_value(b"key1", b"value1", Some(1), None)
             .await
             .unwrap();
         builder
-            .add_value(b"key2", b"value2", gen_attrs(2))
+            .add_value(b"key2", b"value2", Some(2), None)
             .await
             .unwrap();
         let encoded = builder.build().await.unwrap();
@@ -1178,11 +1212,11 @@ mod tests {
         );
         let mut builder = table_store.table_builder();
         builder
-            .add_value(b"key1", b"value1", gen_attrs(1))
+            .add_value(b"key1", b"value1", Some(1), None)
             .await
             .unwrap();
         builder
-            .add_value(b"key2", b"value2", gen_attrs(2))
+            .add_value(b"key2", b"value2", Some(2), None)
             .await
             .unwrap();
         let encoded = builder.build().await.unwrap();
@@ -1219,11 +1253,431 @@ mod tests {
         let format = SsTableFormat::default();
         let mut builder = format.table_builder();
         builder
-            .add_value(b"key1", b"value1", gen_attrs(1))
+            .add_value(b"key1", b"value1", Some(1), None)
             .await
             .unwrap();
 
         // when/then: with_block_format should panic
         let _ = builder.with_block_format(BlockFormat::V2);
+    }
+
+    #[test]
+    fn should_default_to_latest_block_format() {
+        // given/when: create a new builder
+        let format = SsTableFormat::default();
+        let builder = format.table_builder();
+
+        // then: it should default to latest block format (currently V2)
+        assert_eq!(builder.block_format, BlockFormat::Latest);
+        assert_eq!(builder.sst_format_version, SST_FORMAT_VERSION_LATEST);
+    }
+
+    #[test]
+    fn should_use_v1_format_version_when_explicitly_configured() {
+        // given: a builder configured to use V1 format
+        let format = SsTableFormat::default();
+        let builder = format.table_builder().with_block_format(BlockFormat::V1);
+
+        // then: the builder should have V1 format settings
+        assert_eq!(builder.block_format, BlockFormat::V1);
+        assert_eq!(builder.sst_format_version, SST_FORMAT_VERSION);
+    }
+
+    #[tokio::test]
+    async fn should_read_v1_sst_written_with_explicit_config() {
+        // given: an SST built with explicit V1 configuration and enough entries
+        // to distinguish V1 (per-entry offsets) from V2 (restart point offsets)
+        let num_entries = 20;
+        let root_path = Path::from("");
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let format = SsTableFormat::default();
+        let table_store = TableStore::new(
+            ObjectStores::new(object_store, None),
+            format.clone(),
+            root_path,
+            None,
+        );
+        let mut builder = table_store
+            .table_builder()
+            .with_block_format(BlockFormat::V1);
+        let mut expected = Vec::new();
+        for i in 0..num_entries {
+            let key = format!("key_{:03}", i);
+            let value = format!("value_{}", i);
+            builder
+                .add_value(key.as_bytes(), value.as_bytes(), Some(i as i64), None)
+                .await
+                .unwrap();
+            expected.push(
+                RowEntry::new_value(key.as_bytes(), value.as_bytes(), 0).with_create_ts(i as i64),
+            );
+        }
+        let encoded = builder.build().await.unwrap();
+        let sst_handle = table_store
+            .write_sst(&SsTableId::Wal(0), encoded, false)
+            .await
+            .unwrap();
+
+        // then: the stored SST should be V1 format
+        let version = table_store.read_sst_version(&sst_handle.id).await.unwrap();
+        assert_eq!(version, SST_FORMAT_VERSION);
+        assert_eq!(sst_handle.format_version, SST_FORMAT_VERSION);
+
+        // then: V1 blocks should have one offset per entry
+        let blocks = table_store.read_blocks(&sst_handle, 0..1).await.unwrap();
+        let block = &blocks[0];
+        // V1: offsets.len() == number of entries in the block, which should be
+        // much larger than 1 (unlike V2 which would have ~1 restart point)
+        assert_eq!(
+            block.offsets().len(),
+            num_entries,
+            "V1 blocks should have one offset per entry"
+        );
+
+        // when: reading the SST back
+        let mut iter = SstIterator::new_owned_initialized(
+            ..,
+            SsTableView::identity(sst_handle),
+            Arc::new(table_store),
+            SstIteratorOptions::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // then: all data should be readable
+        assert_iterator(&mut iter, expected).await;
+    }
+
+    #[tokio::test]
+    async fn should_read_v2_sst_written_with_default() {
+        // given: an SST built with default settings (V2) and enough entries
+        // to distinguish V2 (restart point offsets) from V1 (per-entry offsets)
+        let num_entries = 20;
+        let root_path = Path::from("");
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let format = SsTableFormat::default();
+        let table_store = TableStore::new(
+            ObjectStores::new(object_store, None),
+            format.clone(),
+            root_path,
+            None,
+        );
+        let mut builder = table_store.table_builder();
+        let mut expected = Vec::new();
+        for i in 0..num_entries {
+            let key = format!("key_{:03}", i);
+            let value = format!("value_{}", i);
+            builder
+                .add_value(key.as_bytes(), value.as_bytes(), Some(i as i64), None)
+                .await
+                .unwrap();
+            expected.push(
+                RowEntry::new_value(key.as_bytes(), value.as_bytes(), 0).with_create_ts(i as i64),
+            );
+        }
+        let encoded = builder.build().await.unwrap();
+        let sst_handle = table_store
+            .write_sst(&SsTableId::Wal(1), encoded, false)
+            .await
+            .unwrap();
+
+        // then: the stored SST should be V2 format
+        let version = table_store.read_sst_version(&sst_handle.id).await.unwrap();
+        assert_eq!(version, SST_FORMAT_VERSION_LATEST);
+        assert_eq!(sst_handle.format_version, SST_FORMAT_VERSION_LATEST);
+
+        // then: V2 blocks should have fewer offsets than entries (restart points only)
+        let blocks = table_store.read_blocks(&sst_handle, 0..1).await.unwrap();
+        let block = &blocks[0];
+        // V2 default restart interval is 16, so 20 entries -> 2 restart points
+        assert!(
+            block.offsets().len() < num_entries,
+            "V2 blocks should have fewer offsets (restart points) than entries: {} offsets vs {} entries",
+            block.offsets().len(),
+            num_entries,
+        );
+
+        // when: reading the SST back
+        let mut iter = SstIterator::new_owned_initialized(
+            ..,
+            SsTableView::identity(sst_handle),
+            Arc::new(table_store),
+            SstIteratorOptions::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // then: all data should be readable
+        assert_iterator(&mut iter, expected).await;
+    }
+
+    #[tokio::test]
+    async fn test_stats_block_with_mixed_entry_types() {
+        use crate::types::ValueDeletable;
+
+        let root_path = Path::from("");
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let format = SsTableFormat::default();
+        let table_store = TableStore::new(
+            ObjectStores::new(object_store, None),
+            format,
+            root_path,
+            None,
+        );
+        let mut builder = table_store.table_builder();
+
+        // Add a put
+        builder
+            .add(RowEntry::new(
+                Bytes::from_static(b"key1"),
+                ValueDeletable::Value(Bytes::from_static(b"val1")),
+                0,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        // Add a delete
+        builder
+            .add(RowEntry::new(
+                Bytes::from_static(b"key2"),
+                ValueDeletable::Tombstone,
+                0,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        // Add a merge
+        builder
+            .add(RowEntry::new(
+                Bytes::from_static(b"key3"),
+                ValueDeletable::Merge(Bytes::from_static(b"merge_val")),
+                0,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        // Add another put
+        builder
+            .add(RowEntry::new(
+                Bytes::from_static(b"key4"),
+                ValueDeletable::Value(Bytes::from_static(b"val4")),
+                0,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+
+        let encoded = builder.build().await.unwrap();
+        let sst_handle = table_store
+            .write_sst(&SsTableId::Wal(0), encoded, false)
+            .await
+            .unwrap();
+        let stats = table_store
+            .read_stats(&sst_handle, true)
+            .await
+            .unwrap()
+            .expect("stats should be present");
+
+        assert_eq!(stats.num_puts, 2);
+        assert_eq!(stats.num_deletes, 1);
+        assert_eq!(stats.num_merges, 1);
+        assert_eq!(
+            stats.raw_key_size,
+            (b"key1".len() + b"key2".len() + b"key3".len() + b"key4".len()) as u64
+        );
+        // Tombstone has 0 value size
+        assert_eq!(
+            stats.raw_val_size,
+            (b"val1".len() + b"merge_val".len() + b"val4".len()) as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stats_block_backward_compat() {
+        // Old SSTs without stats block should return None
+        let info = crate::db_state::SsTableInfo {
+            stats_offset: 0,
+            stats_len: 0,
+            ..Default::default()
+        };
+        let format = SsTableFormat::default();
+        let bytes = Bytes::from(vec![0u8; 100]);
+        let blob = BytesBlob { bytes };
+        let stats = format.read_stats(&info, &blob).await.unwrap();
+        assert!(stats.is_none());
+    }
+
+    #[rstest]
+    #[case::none(None)]
+    #[cfg_attr(feature = "snappy", case::snappy(Some(CompressionCodec::Snappy)))]
+    #[cfg_attr(feature = "zlib", case::zlib(Some(CompressionCodec::Zlib)))]
+    #[cfg_attr(feature = "lz4", case::lz4(Some(CompressionCodec::Lz4)))]
+    #[cfg_attr(feature = "zstd", case::zstd(Some(CompressionCodec::Zstd)))]
+    #[tokio::test]
+    async fn test_stats_block_with_compression(#[case] compression: Option<CompressionCodec>) {
+        let root_path = Path::from("");
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let format = SsTableFormat {
+            compression_codec: compression,
+            ..SsTableFormat::default()
+        };
+        let table_store = TableStore::new(
+            ObjectStores::new(object_store, None),
+            format,
+            root_path,
+            None,
+        );
+        let mut builder = table_store.table_builder();
+        builder
+            .add_value(b"key1", b"value1", Some(1), None)
+            .await
+            .unwrap();
+        builder
+            .add_value(b"key2", b"value2", Some(2), None)
+            .await
+            .unwrap();
+        let encoded = builder.build().await.unwrap();
+        let sst_handle = table_store
+            .write_sst(&SsTableId::Wal(0), encoded, false)
+            .await
+            .unwrap();
+        let stats = table_store
+            .read_stats(&sst_handle, true)
+            .await
+            .unwrap()
+            .expect("stats should be present");
+
+        assert_eq!(stats.num_puts, 2);
+        assert_eq!(stats.num_deletes, 0);
+        assert_eq!(stats.num_merges, 0);
+        assert_eq!(stats.raw_key_size, 8);
+        assert_eq!(stats.raw_val_size, 12);
+    }
+
+    #[tokio::test]
+    async fn test_stats_block_with_block_transformer() {
+        let root_path = Path::from("");
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let transformer = Arc::new(XorTransformer { key: 0x42 });
+        let format = SsTableFormat {
+            block_transformer: Some(transformer),
+            ..SsTableFormat::default()
+        };
+        let table_store = TableStore::new(
+            ObjectStores::new(object_store, None),
+            format,
+            root_path,
+            None,
+        );
+        let mut builder = table_store.table_builder();
+        builder
+            .add_value(b"key1", b"value1", Some(1), None)
+            .await
+            .unwrap();
+        builder
+            .add_value(b"key2", b"value2", Some(2), None)
+            .await
+            .unwrap();
+        let encoded = builder.build().await.unwrap();
+        let sst_handle = table_store
+            .write_sst(&SsTableId::Wal(0), encoded, false)
+            .await
+            .unwrap();
+        let stats = table_store
+            .read_stats(&sst_handle, true)
+            .await
+            .unwrap()
+            .expect("stats should be present");
+
+        assert_eq!(stats.num_puts, 2);
+        assert_eq!(stats.num_deletes, 0);
+        assert_eq!(stats.num_merges, 0);
+        assert_eq!(stats.raw_key_size, 8);
+        assert_eq!(stats.raw_val_size, 12);
+    }
+
+    #[tokio::test]
+    async fn test_block_stats_multi_block() {
+        use crate::types::ValueDeletable;
+        // Use a small block_size (32) with large entries (16-byte keys + 16-byte
+        // values) so every entry exceeds the block capacity and lands in its own
+        // block regardless of value type.
+        let root_path = Path::from("");
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let format = SsTableFormat {
+            block_size: 32,
+            ..SsTableFormat::default()
+        };
+        let table_store = TableStore::new(
+            ObjectStores::new(object_store, None),
+            format,
+            root_path,
+            None,
+        );
+        let mut builder = table_store.table_builder();
+        // Block 0: put
+        builder
+            .add_value(&[b'a'; 16], &[b'1'; 16], Some(1), None)
+            .await
+            .unwrap();
+        // Block 1: delete
+        builder
+            .add(RowEntry::new(
+                Bytes::from_static(&[b'b'; 16]),
+                ValueDeletable::Tombstone,
+                0,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        // Block 2: merge
+        builder
+            .add(RowEntry::new(
+                Bytes::from_static(&[b'c'; 16]),
+                ValueDeletable::Merge(Bytes::from_static(&[b'3'; 16])),
+                0,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+
+        let encoded = builder.build().await.unwrap();
+        let sst_handle = table_store
+            .write_sst(&SsTableId::Wal(0), encoded, false)
+            .await
+            .unwrap();
+        let stats = table_store
+            .read_stats(&sst_handle, true)
+            .await
+            .unwrap()
+            .expect("stats should be present");
+
+        // Aggregate totals
+        assert_eq!(stats.num_puts, 1);
+        assert_eq!(stats.num_deletes, 1);
+        assert_eq!(stats.num_merges, 1);
+
+        // Block stats: one block per entry, each with the correct type.
+        assert_eq!(stats.block_stats.len(), 3);
+        // Block 0: put
+        assert_eq!(stats.block_stats[0].num_puts, 1);
+        assert_eq!(stats.block_stats[0].num_deletes, 0);
+        assert_eq!(stats.block_stats[0].num_merges, 0);
+        // Block 1: delete
+        assert_eq!(stats.block_stats[1].num_puts, 0);
+        assert_eq!(stats.block_stats[1].num_deletes, 1);
+        assert_eq!(stats.block_stats[1].num_merges, 0);
+        // Block 2: merge
+        assert_eq!(stats.block_stats[2].num_puts, 0);
+        assert_eq!(stats.block_stats[2].num_deletes, 0);
+        assert_eq!(stats.block_stats[2].num_merges, 1);
     }
 }

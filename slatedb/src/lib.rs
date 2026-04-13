@@ -42,7 +42,7 @@ pub use compaction_filter::{
 };
 pub use compactor::CompactorBuilder;
 pub use config::{Settings, SstBlockSize};
-pub use db::{Db, DbBuilder};
+pub use db::{Db, DbBuilder, DbReaderBuilder, DbStatus, WriteHandle};
 pub use db_cache::stats as db_cache_stats;
 pub use db_iter::DbIterator;
 pub use db_read::DbRead;
@@ -55,9 +55,15 @@ pub use garbage_collector::stats as garbage_collector_stats;
 pub use garbage_collector::GarbageCollectorBuilder;
 pub use merge_operator::{MergeOperator, MergeOperatorError};
 pub use rand::DbRand;
+#[cfg(test)]
+pub use sst_builder::BlockFormat;
+pub use sst_reader::{SstFile, SstReader};
+pub use sst_stats::{BlockStats, SstStats};
+pub use tablestore::SstFileMetadata;
 pub use transaction_manager::IsolationLevel;
 pub use types::KeyValue;
 pub use types::{RowEntry, ValueDeletable};
+pub use wal_reader::{WalFile, WalFileIterator, WalFileMetadata, WalReader};
 
 pub mod admin;
 pub mod cached_object_store;
@@ -96,10 +102,12 @@ mod comparable_range;
 mod db;
 mod db_common;
 mod db_iter;
+mod db_metrics;
 mod db_read;
 mod db_reader;
 mod db_snapshot;
 mod db_state;
+mod db_status;
 mod db_transaction;
 mod dispatcher;
 mod error;
@@ -110,7 +118,6 @@ mod flush;
 mod format;
 mod garbage_collector;
 mod iter;
-mod map_iter;
 mod mem_table;
 mod mem_table_flush;
 mod merge_iterator;
@@ -129,6 +136,8 @@ mod retrying_object_store;
 mod sorted_run_iterator;
 mod sst_builder;
 mod sst_iter;
+mod sst_reader;
+mod sst_stats;
 mod store_provider;
 mod tablestore;
 #[cfg(test)]
@@ -140,6 +149,7 @@ mod utils;
 mod wal;
 mod wal_buffer;
 mod wal_id;
+mod wal_reader;
 mod wal_replay;
 
 // Initialize test infrastructure (deadlock detector, tracing) for all tests.

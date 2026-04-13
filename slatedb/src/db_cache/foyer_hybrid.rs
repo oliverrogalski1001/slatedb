@@ -52,7 +52,7 @@
 //!             .unwrap();
 //!     let cache = Arc::new(FoyerHybridCache::new_with_cache(cache));
 //!     let db = Db::builder("path/to/db", object_store)
-//!         .with_memory_cache(cache)
+//!         .with_db_cache(cache)
 //!         .build()
 //!         .await;
 //! }
@@ -99,6 +99,10 @@ impl DbCache for FoyerHybridCache {
         self.get(key).await
     }
 
+    async fn get_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        self.get(key).await
+    }
+
     async fn insert(&self, key: CachedKey, value: CachedEntry) {
         self.inner.insert(key, value);
     }
@@ -119,7 +123,6 @@ mod tests {
     use crate::db_cache::{CachedEntry, CachedKey, DbCache};
     use crate::db_state::SsTableId;
     use crate::format::sst::BlockBuilder;
-    use crate::types::RowAttributes;
     use foyer::{DirectFsDeviceOptions, Engine, HybridCacheBuilder};
     use rand::RngCore;
     use std::collections::HashMap;
@@ -155,20 +158,13 @@ mod tests {
 
     fn build_block() -> CachedEntry {
         let mut rng = rand::rng();
-        let mut builder = BlockBuilder::new_v1(1024);
+        let mut builder = BlockBuilder::new_latest(1024);
         loop {
             let mut k = vec![0u8; 32];
             rng.fill_bytes(&mut k);
             let mut v = vec![0u8; 128];
             rng.fill_bytes(&mut v);
-            if builder.add_value(
-                &k,
-                &v,
-                RowAttributes {
-                    ts: None,
-                    expire_ts: None,
-                },
-            ) {
+            if builder.add_value(&k, &v, None, None) {
                 break;
             }
         }

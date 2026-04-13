@@ -1,23 +1,23 @@
 use crate::block_iterator::BlockIterator;
-use crate::clock::MonotonicClock;
-use crate::config::DurabilityLevel;
-use crate::config::DurabilityLevel::{Memory, Remote};
+use crate::block_iterator_v2::BlockIteratorV2;
+use crate::cached_object_store::CachedObjectStore;
+use crate::config::PreloadLevel;
+use crate::db_state::ManifestCore;
 use crate::db_state::SortedRun;
 use crate::db_state::SsTableHandle;
 use crate::error::SlateDBError;
-use crate::iter::{IterationOrder, KeyValueIterator};
+use crate::format::sst::{SST_FORMAT_VERSION, SST_FORMAT_VERSION_V2};
+use crate::iter::{IterationOrder, RowEntryIterator};
+use crate::paths::PathResolver;
 use crate::tablestore::TableStore;
-use crate::types::RowEntry;
 use bytes::{BufMut, Bytes};
 use futures::FutureExt;
-use log::error;
+use log::{error, warn};
 use rand::{Rng, RngCore};
 use slatedb_common::clock::SystemClock;
 use std::any::Any;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use ulid::Ulid;
@@ -34,7 +34,7 @@ pub(crate) struct WatchableOnceCell<T: Clone> {
     tx: tokio::sync::watch::Sender<Option<T>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct WatchableOnceCellReader<T: Clone> {
     rx: tokio::sync::watch::Receiver<Option<T>>,
 }
@@ -115,41 +115,6 @@ where
     handle.spawn(wrapped)
 }
 
-#[allow(dead_code)] // unused during DST
-pub(crate) async fn get_now_for_read(
-    mono_clock: Arc<MonotonicClock>,
-    durability_level: DurabilityLevel,
-) -> Result<i64, SlateDBError> {
-    /*
-     Note: the semantics of filtering expired records on read differ slightly depending on
-     the configured ReadLevel. For Uncommitted we can just use the actual clock's "now"
-     as this corresponds to the current time seen by uncommitted writes but is not persisted
-     and only enforces monotonicity via the local in-memory MonotonicClock. This means it's
-     possible for the mono_clock.now() to go "backwards" following a crash and recovery, which
-     could result in records that were filtered out before the crash coming back to life and being
-     returned after the crash.
-     If the read level is instead set to Committed, we only use the last_tick of the monotonic
-     clock to filter out expired records, since this corresponds to the highest time of any
-     persisted batch and is thus recoverable following a crash. Since the last tick is the
-     last persisted time we are guaranteed monotonicity of the #get_last_tick function and
-     thus will not see this "time travel" phenomenon -- with Committed, once a record is
-     filtered out due to ttl expiry, it is guaranteed not to be seen again by future Committed
-     reads.
-    */
-    match durability_level {
-        Remote => Ok(mono_clock.get_last_durable_tick()),
-        Memory => mono_clock.now().await,
-    }
-}
-
-pub(crate) fn is_not_expired(entry: &RowEntry, now: i64) -> bool {
-    if let Some(expire_ts) = entry.expire_ts {
-        expire_ts > now
-    } else {
-        true
-    }
-}
-
 /// Merge two options using the provided function.
 pub(crate) fn merge_options<T>(
     current: Option<T>,
@@ -194,12 +159,26 @@ pub(crate) async fn last_written_key_and_seq(
 
     // Sort descending so we get the last row from the last block, which
     // should be the last written key/seq.
-    let mut block_iter = BlockIterator::new(block, IterationOrder::Descending);
-    block_iter.init().await?;
-    Ok(block_iter
-        .next_entry()
-        .await?
-        .map(|entry| (entry.key, entry.seq)))
+    let entry = match output_sst.format_version {
+        SST_FORMAT_VERSION => {
+            let mut block_iter = BlockIterator::new(block, IterationOrder::Descending);
+            block_iter.init().await?;
+            block_iter.next().await?
+        }
+        SST_FORMAT_VERSION_V2 => {
+            let mut block_iter = BlockIteratorV2::new(block, IterationOrder::Descending);
+            block_iter.init().await?;
+            block_iter.next().await?
+        }
+        _ => {
+            return Err(SlateDBError::InvalidVersion {
+                format_name: "SST",
+                supported_versions: vec![SST_FORMAT_VERSION, SST_FORMAT_VERSION_V2],
+                actual_version: output_sst.format_version,
+            });
+        }
+    };
+    Ok(entry.map(|e| (e.key, e.seq)))
 }
 
 fn bytes_into_minimal_vec(bytes: &Bytes) -> Vec<u8> {
@@ -243,35 +222,6 @@ fn compute_lower_bound(prev_block_last_key: &Bytes, this_block_first_key: &Bytes
     // if we didn't find a mismatch yet then the prev block's key must be shorter,
     // so just use the common prefix plus the next byte in this block's key
     this_block_first_key.slice(..prev_block_last_key.len() + 1)
-}
-
-#[derive(Debug)]
-pub(crate) struct MonotonicSeq {
-    val: AtomicU64,
-}
-
-impl MonotonicSeq {
-    pub(crate) fn new(initial_value: u64) -> Self {
-        Self {
-            val: AtomicU64::new(initial_value),
-        }
-    }
-
-    pub(crate) fn next(&self) -> u64 {
-        self.val.fetch_add(1, SeqCst) + 1
-    }
-
-    pub(crate) fn store(&self, value: u64) {
-        self.val.store(value, SeqCst);
-    }
-
-    pub(crate) fn load(&self) -> u64 {
-        self.val.load(SeqCst)
-    }
-
-    pub(crate) fn store_if_greater(&self, value: u64) {
-        self.val.fetch_max(value, SeqCst);
-    }
 }
 
 /// An extension trait that adds a `.send_safely(...)` method to tokio's `UnboundedSender<T>`.
@@ -477,7 +427,7 @@ pub(crate) fn sign_extend(val: u32, bits: u8) -> i32 {
 /// Returns:
 /// - The effective max parallelism.
 pub(crate) fn compute_max_parallel(l0_count: usize, srs: &[SortedRun], cap: usize) -> usize {
-    let total_ssts = l0_count + srs.iter().map(|sr| sr.ssts.len()).sum::<usize>();
+    let total_ssts = l0_count + srs.iter().map(|sr| sr.sst_views.len()).sum::<usize>();
     total_ssts.min(cap).max(1)
 }
 
@@ -503,7 +453,7 @@ pub(crate) fn estimate_bytes_before_key(sorted_runs: &[SortedRun], key: &Bytes) 
                 return 0;
             };
             sorted_run
-                .ssts
+                .sst_views
                 .iter()
                 .take(idx)
                 .map(|sst| sst.estimate_size())
@@ -738,14 +688,76 @@ pub(crate) fn varint_len(mut value: u32) -> usize {
     len
 }
 
+/// Preload SST files into the disk cache based on the configured [`PreloadLevel`].
+pub(crate) async fn preload_cache_from_manifest(
+    core: &ManifestCore,
+    cached_obj_store: &CachedObjectStore,
+    path_resolver: &PathResolver,
+    preload_level: Option<PreloadLevel>,
+    max_cache_size: usize,
+) -> Result<(), SlateDBError> {
+    match preload_level {
+        Some(PreloadLevel::AllSst) => {
+            let mut all_sst_paths: Vec<object_store::path::Path> = Vec::with_capacity(
+                core.l0.len()
+                    + core
+                        .compacted
+                        .iter()
+                        .map(|sr| sr.sst_views.len())
+                        .sum::<usize>(),
+            );
+            all_sst_paths.extend(
+                core.l0
+                    .iter()
+                    .map(|view| path_resolver.table_path(&view.sst.id)),
+            );
+            all_sst_paths.extend(
+                core.compacted
+                    .iter()
+                    .flat_map(|sr| &sr.sst_views)
+                    .map(|view| path_resolver.table_path(&view.sst.id)),
+            );
+            if !all_sst_paths.is_empty() {
+                if let Err(e) = cached_obj_store
+                    .load_files_to_cache(all_sst_paths, max_cache_size)
+                    .await
+                {
+                    warn!("Failed to preload all SSTs to cache: {:?}", e);
+                }
+            }
+        }
+        Some(PreloadLevel::L0Sst) => {
+            let l0_sst_paths: Vec<object_store::path::Path> = core
+                .l0
+                .iter()
+                .map(|view| path_resolver.table_path(&view.sst.id))
+                .collect();
+            if !l0_sst_paths.is_empty() {
+                if let Err(e) = cached_obj_store
+                    .load_files_to_cache(l0_sst_paths, max_cache_size)
+                    .await
+                {
+                    warn!("Failed to preload L0 SSTs to cache: {:?}", e);
+                }
+            }
+        }
+        None => {
+            // No preloading
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
     use slatedb_common::MockSystemClock;
 
     use crate::clock::MonotonicClock;
-    use crate::db_state::{SortedRun, SsTableHandle, SsTableId, SsTableInfo};
+    use crate::db_state::{SortedRun, SsTableHandle, SsTableId, SsTableInfo, SsTableView};
     use crate::error::SlateDBError;
+    use crate::format::sst::SST_FORMAT_VERSION_LATEST;
+    use crate::sst_builder::BlockFormat;
     use crate::types::RowEntry;
     use crate::utils::{
         build_concurrent, bytes_into_minimal_vec, clamp_allocated_size_bytes, compute_index_key,
@@ -785,14 +797,18 @@ mod tests {
         }
     }
 
-    fn make_compacted_sst(start_key: &str, size: u64) -> SsTableHandle {
+    fn make_sst_view(start_key: &str, size: u64) -> SsTableView {
         let info = SsTableInfo {
             first_entry: Some(Bytes::from(start_key.as_bytes().to_vec())),
             index_offset: size.saturating_sub(1),
             index_len: 1,
             ..Default::default()
         };
-        SsTableHandle::new_compacted(SsTableId::Compacted(Ulid::new()), info, None)
+        SsTableView::identity(SsTableHandle::new(
+            SsTableId::Compacted(Ulid::new()),
+            SST_FORMAT_VERSION_LATEST,
+            info,
+        ))
     }
 
     #[test]
@@ -1082,6 +1098,47 @@ mod tests {
         assert_eq!(last_seq, 4);
     }
 
+    #[tokio::test]
+    async fn should_get_last_written_key_and_seq_from_v1_sst() {
+        // given: an SST built with V1 block format
+        let os = Arc::new(InMemory::new());
+        let path = "testdb-last-written-v1".to_string();
+        let clock = Arc::new(MockSystemClock::new());
+        let db = Db::builder(path, os.clone())
+            .with_system_clock(clock.clone())
+            .build()
+            .await
+            .unwrap();
+        let table_store = db.inner.table_store.clone();
+
+        let mut sst_builder = table_store
+            .table_builder()
+            .with_block_format(BlockFormat::V1);
+        sst_builder
+            .add(RowEntry::new_value(b"aaa", b"1", 10))
+            .await
+            .unwrap();
+        sst_builder
+            .add(RowEntry::new_value(b"zzz", b"2", 20))
+            .await
+            .unwrap();
+        let encoded_sst = sst_builder.build().await.unwrap();
+        let sst = table_store
+            .write_sst(&SsTableId::Compacted(Ulid::new()), encoded_sst, false)
+            .await
+            .unwrap();
+
+        // when: getting last written key and seq
+        let (last_key, last_seq) = last_written_key_and_seq(table_store.clone(), &sst)
+            .await
+            .unwrap()
+            .expect("missing last entry");
+
+        // then: should return the last key and seq from the V1 formatted SST
+        assert_eq!(last_key, Bytes::from(b"zzz".as_slice()));
+        assert_eq!(last_seq, 20);
+    }
+
     #[rstest]
     #[case("alternating_bits", vec![true, false, true, false, true, false, true, false], vec![], vec![], vec![0xAA])]
     #[case("u64_value", vec![], vec![(0xAB, 8)], vec![], vec![0xAB])]
@@ -1235,16 +1292,16 @@ mod tests {
     fn test_estimate_bytes_before_key() {
         let run1 = SortedRun {
             id: 1,
-            ssts: vec![
-                make_compacted_sst("a", 10),
-                make_compacted_sst("k", 20), // k < m < z, so only "a" counts
-                make_compacted_sst("z", 30),
+            sst_views: vec![
+                make_sst_view("a", 10),
+                make_sst_view("k", 20), // k < m < z, so only "a" counts
+                make_sst_view("z", 30),
             ],
         };
         let run2 = SortedRun {
             id: 2,
             // f < m < ..., so only "b" counts
-            ssts: vec![make_compacted_sst("b", 40), make_compacted_sst("f", 50)],
+            sst_views: vec![make_sst_view("b", 40), make_sst_view("f", 50)],
         };
 
         let key = Bytes::from("m");

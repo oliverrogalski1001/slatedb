@@ -159,27 +159,28 @@ impl BlockBuilderV1 {
         &mut self,
         key: &[u8],
         value: &[u8],
-        attrs: crate::types::RowAttributes,
+        ts: Option<i64>,
+        expire_ts: Option<i64>,
     ) -> bool {
         let entry = RowEntry::new(
             key.to_vec().into(),
             crate::types::ValueDeletable::Value(Bytes::copy_from_slice(value)),
             0,
-            attrs.ts,
-            attrs.expire_ts,
+            ts,
+            expire_ts,
         );
         self.add(entry).unwrap_or(false)
     }
 
     #[allow(dead_code)]
     #[cfg(test)]
-    fn add_tombstone(&mut self, key: &[u8], attrs: crate::types::RowAttributes) -> bool {
+    fn add_tombstone(&mut self, key: &[u8], ts: Option<i64>, expire_ts: Option<i64>) -> bool {
         let entry = RowEntry::new(
             key.to_vec().into(),
             crate::types::ValueDeletable::Tombstone,
             0,
-            attrs.ts,
-            attrs.expire_ts,
+            ts,
+            expire_ts,
         );
         self.add(entry).unwrap_or(false)
     }
@@ -204,7 +205,8 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::block_iterator::BlockIterator;
+    use crate::block_iterator::BlockIteratorLatest;
+    use crate::format::sst::BlockBuilder;
     use crate::test_utils::assert_iterator;
     use crate::{
         test_utils::{assert_debug_snapshot, decode_codec_entries},
@@ -359,7 +361,7 @@ mod tests {
     })]
     #[tokio::test]
     async fn test_should_clamp_allocated_size(#[case] case: ClampAllocTestCase) {
-        let mut builder = BlockBuilderV1::new(4096);
+        let mut builder = BlockBuilder::new_latest(4096);
         for e in case.entries.iter() {
             assert!(builder.add(e.clone()).unwrap());
         }
@@ -376,7 +378,7 @@ mod tests {
         assert_eq!(block.data, block_clamped.data);
         assert_eq!(block.offsets, block_clamped.offsets);
         assert_ne!(block.data.as_ptr(), block_clamped.data.as_ptr());
-        let mut iter = BlockIterator::new_ascending(block_clamped);
+        let mut iter = BlockIteratorLatest::new_ascending(block_clamped);
         assert_iterator(&mut iter, case.entries).await;
     }
 

@@ -11,6 +11,7 @@ use crate::manifest::store::{ManifestStore, StoredManifest};
 use slatedb_common::clock::SystemClock;
 
 use crate::clone;
+use crate::db_status::ClosedResultWriter;
 use crate::object_stores::{ObjectStoreType, ObjectStores};
 use crate::rand::DbRand;
 use crate::seq_tracker::FindOption;
@@ -19,6 +20,7 @@ use chrono::{DateTime, Utc};
 use fail_parallel::FailPointRegistry;
 use object_store::path::Path;
 use object_store::ObjectStore;
+use rand::RngCore;
 use std::env;
 use std::env::VarError;
 use std::error::Error;
@@ -48,6 +50,9 @@ pub struct Admin {
     pub(crate) system_clock: Arc<dyn SystemClock>,
     /// The random number generator to use for randomness.
     pub(crate) rand: Arc<DbRand>,
+    #[cfg(feature = "compaction_filters")]
+    pub(crate) compaction_filter_supplier:
+        Option<Arc<dyn crate::compaction_filter::CompactionFilterSupplier>>,
 }
 
 impl Admin {
@@ -172,13 +177,9 @@ impl Admin {
         spec: CompactionSpec,
     ) -> Result<Compaction, Box<dyn Error>> {
         let compactions_store = Arc::new(self.compactions_store());
-        let compaction_id = Compactor::submit(
-            spec,
-            compactions_store,
-            Arc::new(DbRand::new(self.rand.seed())),
-            self.system_clock.clone(),
-        )
-        .await?;
+        let rand = Arc::new(DbRand::new(self.rand.rng().next_u64()));
+        let compaction_id =
+            Compactor::submit(spec, compactions_store, rand, self.system_clock.clone()).await?;
         let Some(compaction) = self.read_compaction(compaction_id, None).await? else {
             return Err(Box::new(SlateDBError::InvalidDBState));
         };
@@ -250,7 +251,7 @@ impl Admin {
         .with_system_clock(self.system_clock.clone())
         .with_wal_object_store(self.object_stores.store_of(ObjectStoreType::Wal).clone())
         .with_options(gc_opts)
-        .with_seed(self.rand.seed())
+        .with_seed(self.rand.rng().next_u64())
         .build();
         gc.run_gc_once().await;
         Ok(())
@@ -272,11 +273,11 @@ impl Admin {
         .with_system_clock(self.system_clock.clone())
         .with_wal_object_store(self.object_stores.store_of(ObjectStoreType::Wal).clone())
         .with_options(gc_opts)
-        .with_seed(self.rand.seed())
+        .with_seed(self.rand.rng().next_u64())
         .build();
 
         let (_, rx) = mpsc::unbounded_channel();
-        let closed_result = WatchableOnceCell::new();
+        let closed_result = ClosedResultWriter::new(WatchableOnceCell::new());
         let task_executor = MessageHandlerExecutor::new(closed_result, self.system_clock.clone());
 
         task_executor
@@ -298,17 +299,27 @@ impl Admin {
     ///
     /// This method blocks until `cancellation_token` is cancelled, at which point it requests a
     /// graceful shutdown and waits for the compactor to stop.
+    ///
+    /// To use compaction filters with the standalone compactor, configure the `AdminBuilder`
+    /// with [`AdminBuilder::with_compaction_filter_supplier`] before building.
     pub async fn run_compactor(
         &self,
         cancellation_token: CancellationToken,
     ) -> Result<(), crate::Error> {
-        let compactor = crate::CompactorBuilder::new(
+        #[allow(unused_mut)]
+        let mut builder = crate::CompactorBuilder::new(
             self.path.clone(),
             self.object_stores.store_of(ObjectStoreType::Main).clone(),
         )
         .with_system_clock(self.system_clock.clone())
-        .with_seed(self.rand.seed())
-        .build();
+        .with_seed(self.rand.rng().next_u64());
+
+        #[cfg(feature = "compaction_filters")]
+        if let Some(supplier) = &self.compaction_filter_supplier {
+            builder = builder.with_compaction_filter_supplier(supplier.clone());
+        }
+
+        let compactor = builder.build();
 
         let mut run_task = tokio::spawn({
             let compactor = compactor.clone();
@@ -375,11 +386,14 @@ impl Admin {
             &self.path,
             self.object_stores.store_of(ObjectStoreType::Main).clone(),
         ));
-        manifest_store
-            .validate_no_wal_object_store_configured()
-            .await?;
         let mut stored_manifest =
             StoredManifest::load(manifest_store, self.system_clock.clone()).await?;
+
+        let manifest_has_wal = stored_manifest.db_state().wal_object_store_uri.is_some();
+        if self.object_stores.has_wal_object_store() != manifest_has_wal {
+            return Err(SlateDBError::WalStoreReconfigurationError.into());
+        }
+
         let checkpoint_id = self.rand.rng().gen_uuid();
         let checkpoint = stored_manifest
             .write_checkpoint(checkpoint_id, options)
@@ -906,5 +920,49 @@ mod tests {
         assert_eq!(compaction.spec().destination(), 3);
         assert_eq!(compaction.spec().sources(), &vec![SourceId::SortedRun(3)]);
         assert_eq!(compaction.status(), CompactionStatus::Submitted);
+    }
+
+    #[cfg(feature = "compaction_filters")]
+    #[test]
+    fn test_admin_builder_with_compaction_filter_supplier() {
+        use crate::compaction_filter::{
+            CompactionFilter, CompactionFilterDecision, CompactionFilterError,
+            CompactionFilterSupplier, CompactionJobContext,
+        };
+        use crate::types::RowEntry;
+
+        struct NoopFilter;
+
+        #[async_trait::async_trait]
+        impl CompactionFilter for NoopFilter {
+            async fn filter(
+                &mut self,
+                _entry: &RowEntry,
+            ) -> Result<CompactionFilterDecision, CompactionFilterError> {
+                Ok(CompactionFilterDecision::Keep)
+            }
+            async fn on_compaction_end(&mut self) -> Result<(), CompactionFilterError> {
+                Ok(())
+            }
+        }
+
+        struct NoopFilterSupplier;
+
+        #[async_trait::async_trait]
+        impl CompactionFilterSupplier for NoopFilterSupplier {
+            async fn create_compaction_filter(
+                &self,
+                _context: &CompactionJobContext,
+            ) -> Result<Box<dyn CompactionFilter>, CompactionFilterError> {
+                Ok(Box::new(NoopFilter))
+            }
+        }
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let admin = AdminBuilder::new("/tmp/test_filter_supplier", object_store)
+            .with_compaction_filter_supplier(Arc::new(NoopFilterSupplier))
+            .build();
+
+        assert!(admin.compaction_filter_supplier.is_some());
     }
 }

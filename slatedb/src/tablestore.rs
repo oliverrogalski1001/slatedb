@@ -24,6 +24,7 @@ use crate::format::sst::{EncodedSsTable, SsTableFormat};
 use crate::object_stores::{ObjectStoreType, ObjectStores};
 use crate::paths::PathResolver;
 use crate::sst_builder::EncodedSsTableBuilder;
+use crate::sst_stats::SstStats;
 use crate::types::RowEntry;
 use crate::wal::wal_sst_builder::EncodedWalSsTableBuilder;
 
@@ -61,13 +62,15 @@ impl ReadOnlyBlob for ReadOnlyObject {
 }
 
 /// Represents the metadata of an SST file in the compacted directory.
-pub(crate) struct SstFileMetadata {
-    pub(crate) id: SsTableId,
-    #[allow(dead_code)]
-    pub(crate) location: Path,
-    pub(crate) last_modified: chrono::DateTime<Utc>,
-    #[allow(dead_code)]
-    pub(crate) size: u64,
+pub struct SstFileMetadata {
+    /// The SST identifier (WAL or Compacted).
+    pub id: SsTableId,
+    /// The object store path for this SST file.
+    pub location: Path,
+    /// The time this SST file was last modified.
+    pub last_modified: chrono::DateTime<Utc>,
+    /// The size of this SST file in bytes.
+    pub size: u64,
 }
 
 impl TableStore {
@@ -226,7 +229,11 @@ impl TableStore {
         }
         self.cache_filter(*id, encoded_sst.info.filter_offset, encoded_sst.filter)
             .await;
-        Ok(SsTableHandle::new(*id, encoded_sst.info))
+        Ok(SsTableHandle::new(
+            *id,
+            encoded_sst.format_version,
+            encoded_sst.info,
+        ))
     }
 
     async fn cache_filter(&self, sst: SsTableId, id: u64, filter: Option<Arc<BloomFilter>>) {
@@ -246,6 +253,31 @@ impl TableStore {
         let path = self.path(id);
         debug!("deleting SST [path={}]", path);
         object_store.delete(&path).await.map_err(SlateDBError::from)
+    }
+
+    /// Reads metadata for a specific SST object (WAL or compacted).
+    ///
+    /// ## Arguments
+    /// - `id`: The SST identifier to fetch metadata for.
+    ///
+    /// ## Returns
+    /// - `Ok(SstFileMetadata)` containing the table id, path, creation time,
+    ///   last-modified time, and size in bytes.
+    ///
+    /// ## Errors
+    /// - Returns [`SlateDBError`] if the underlying object store `head` request
+    ///   fails (for example, if the object does not exist or storage access
+    ///   fails).
+    pub(crate) async fn metadata(&self, id: &SsTableId) -> Result<SstFileMetadata, SlateDBError> {
+        let object_store = self.object_stores.store_for(id);
+        let path = self.path(id);
+        let metadata = object_store.head(&path).await?;
+        Ok(SstFileMetadata {
+            id: *id,
+            location: path,
+            last_modified: metadata.last_modified,
+            size: metadata.size,
+        })
     }
 
     /// List all SSTables in the compacted directory.
@@ -301,18 +333,17 @@ impl TableStore {
         let object_store = self.object_stores.store_for(id);
         let path = self.path(id);
         let obj = ReadOnlyObject { object_store, path };
-        let info = self.sst_format.read_info(&obj).await?;
-        Ok(SsTableHandle::new(*id, info))
+        let (info, version) = self.sst_format.read_info_and_version(&obj).await?;
+        Ok(SsTableHandle::new(*id, version, info))
     }
 
-    pub(crate) async fn read_sst_version(
-        &self,
-        handle: &SsTableHandle,
-    ) -> Result<u16, SlateDBError> {
-        let object_store = self.object_stores.store_for(&handle.id);
-        let path = self.path(&handle.id);
+    #[cfg(test)]
+    pub(crate) async fn read_sst_version(&self, id: &SsTableId) -> Result<u16, SlateDBError> {
+        let object_store = self.object_stores.store_for(id);
+        let path = self.path(id);
         let obj = ReadOnlyObject { object_store, path };
-        self.sst_format.read_version(&obj).await
+        let (_, version) = self.sst_format.read_info_and_version(&obj).await?;
+        Ok(version)
     }
 
     /// Reads the Bloom filter of an SSTable.
@@ -352,6 +383,44 @@ impl TableStore {
             }
         }
         Ok(filter)
+    }
+
+    /// Reads the stats block of an SSTable.
+    ///
+    /// ## Arguments
+    /// - `handle`: The handle of the SSTable to read the stats from.
+    pub(crate) async fn read_stats(
+        &self,
+        handle: &SsTableHandle,
+        cache_blocks: bool,
+    ) -> Result<Option<SstStats>, SlateDBError> {
+        if let Some(ref cache) = self.cache {
+            if let Some(stats) = cache
+                .get_stats(&(handle.id, handle.info.stats_offset).into())
+                .await
+                .unwrap_or(None)
+                .and_then(|e| e.sst_stats())
+            {
+                return Ok(Some(stats.as_ref().clone()));
+            }
+        }
+        let object_store = self.object_stores.store_for(&handle.id);
+        let path = self.path(&handle.id);
+        let obj = ReadOnlyObject { object_store, path };
+        let stats = self.sst_format.read_stats(&handle.info, &obj).await?;
+        if cache_blocks {
+            if let Some(ref cache) = self.cache {
+                if let Some(ref stats) = stats {
+                    cache
+                        .insert(
+                            (handle.id, handle.info.stats_offset).into(),
+                            CachedEntry::with_sst_stats(Arc::new(stats.clone())),
+                        )
+                        .await;
+                }
+            }
+        }
+        Ok(stats)
     }
 
     /// Reads the index of an SSTable.
@@ -598,7 +667,11 @@ impl EncodedSsTableWriter<'_> {
         self.table_store
             .cache_filter(self.id, encoded_sst.info.filter_offset, encoded_sst.filter)
             .await;
-        Ok(SsTableHandle::new(self.id, encoded_sst.info))
+        Ok(SsTableHandle::new(
+            self.id,
+            encoded_sst.format_version,
+            encoded_sst.info,
+        ))
     }
 
     async fn drain_blocks(&mut self) -> Result<(), SlateDBError> {
@@ -629,6 +702,7 @@ fn slatedb_io_error() -> SlateDBError {
 
 #[cfg(test)]
 mod tests {
+    use crate::types::KeyValue;
     use bytes::Bytes;
     use futures::future;
     use futures::StreamExt;
@@ -645,16 +719,16 @@ mod tests {
     use crate::error;
     use crate::format::block::Block;
     use crate::format::sst::SsTableFormat;
+    use crate::manifest::SsTableView;
     use crate::object_stores::ObjectStores;
     use crate::rand::DbRand;
     use crate::retrying_object_store::RetryingObjectStore;
     use crate::sst_iter::{SstIterator, SstIteratorOptions};
-    use crate::stats::StatRegistry;
     use crate::tablestore::TableStore;
     use crate::test_utils::FlakyObjectStore;
     use crate::test_utils::{assert_iterator, build_test_sst};
     use crate::types::{RowEntry, ValueDeletable};
-    use crate::{block_iterator::BlockIterator, db_state::SsTableId, iter::KeyValueIterator};
+    use crate::{block_iterator::BlockIteratorLatest, db_state::SsTableId, iter::RowEntryIterator};
     use slatedb_common::clock::DefaultSystemClock;
 
     const ROOT: &str = "/root";
@@ -728,10 +802,15 @@ mod tests {
             ..SstIteratorOptions::default()
         };
         // then:
-        let mut iter = SstIterator::new_owned_initialized(.., sst, ts.clone(), sst_iter_options)
-            .await
-            .unwrap()
-            .expect("Expected Some(iter) but got None");
+        let mut iter = SstIterator::new_owned_initialized(
+            ..,
+            SsTableView::identity(sst),
+            ts.clone(),
+            sst_iter_options,
+        )
+        .await
+        .unwrap()
+        .expect("Expected Some(iter) but got None");
         assert_iterator(
             &mut iter,
             vec![
@@ -796,10 +875,15 @@ mod tests {
             ..SstIteratorOptions::default()
         };
         // then:
-        let mut iter = SstIterator::new_owned_initialized(.., sst, ts.clone(), sst_iter_options)
-            .await
-            .unwrap()
-            .expect("Expected Some(iter) but got None");
+        let mut iter = SstIterator::new_owned_initialized(
+            ..,
+            SsTableView::identity(sst),
+            ts.clone(),
+            sst_iter_options,
+        )
+        .await
+        .unwrap()
+        .expect("Expected Some(iter) but got None");
         assert_iterator(
             &mut iter,
             vec![
@@ -866,7 +950,7 @@ mod tests {
             ..SsTableFormat::default()
         };
 
-        let stat_registry = StatRegistry::new();
+        let db_metrics = crate::db_metrics::DbMetrics::new(None);
         let block_cache = Arc::new(MokaCache::new());
         let meta_cache = Arc::new(MokaCache::new());
 
@@ -879,7 +963,7 @@ mod tests {
 
         let wrapper = Arc::new(DbCacheWrapper::new(
             split_cache,
-            &stat_registry,
+            &db_metrics,
             Arc::new(DefaultSystemClock::default()),
         ));
         let ts = Arc::new(TableStore::new(
@@ -1122,7 +1206,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_sst_should_write_cache() {
         let os = Arc::new(InMemory::new());
-        let stat_registry = StatRegistry::new();
+        let db_metrics = crate::db_metrics::DbMetrics::new(None);
 
         let block_cache = Arc::new(TestCache::new());
         let meta_cache = Arc::new(TestCache::new());
@@ -1135,7 +1219,7 @@ mod tests {
 
         let wrapper = Arc::new(DbCacheWrapper::new(
             split_cache,
-            &stat_registry,
+            &db_metrics,
             Arc::new(DefaultSystemClock::default()),
         ));
         let ts = Arc::new(TableStore::new(
@@ -1176,11 +1260,11 @@ mod tests {
     #[tokio::test]
     async fn test_write_sst_should_not_write_cache() {
         let os = Arc::new(InMemory::new());
-        let stat_registry = StatRegistry::new();
+        let db_metrics = crate::db_metrics::DbMetrics::new(None);
         let cache = Arc::new(TestCache::new());
         let wrapper = Arc::new(DbCacheWrapper::new(
             cache.clone(),
-            &stat_registry,
+            &db_metrics,
             Arc::new(DefaultSystemClock::default()),
         ));
         let ts = Arc::new(TableStore::new(
@@ -1218,8 +1302,8 @@ mod tests {
         let mut expected_iter = expected.iter();
 
         while let (Some(block), Some(expected_item)) = (block_iter.next(), expected_iter.next()) {
-            let mut iter = BlockIterator::new_ascending(block.clone());
-            let kv = iter.next().await.unwrap().unwrap();
+            let mut iter = BlockIteratorLatest::new_ascending(block.clone());
+            let kv: KeyValue = iter.next().await.unwrap().unwrap().into();
             assert_eq!(kv.key, expected_item.0);
             assert_eq!(ValueDeletable::Value(kv.value), expected_item.1);
         }
@@ -1513,6 +1597,58 @@ mod tests {
         } else {
             assert_eq!(count_ssts_in(&main_store).await, 1);
         }
+    }
+
+    #[rstest]
+    #[case::main_only(make_store(), None)]
+    #[case::main_and_wal(make_store(), Some(make_store()))]
+    #[tokio::test]
+    async fn test_metadata_for_compacted_sst(
+        #[case] main_store: Arc<dyn ObjectStore>,
+        #[case] wal_store: Option<Arc<dyn ObjectStore>>,
+    ) {
+        let ts = Arc::new(TableStore::new(
+            ObjectStores::new(main_store.clone(), wal_store),
+            SsTableFormat::default(),
+            Path::from(ROOT),
+            None,
+        ));
+        let id = SsTableId::Compacted(ulid::Ulid::new());
+        let path = ts.path(&id);
+        let bytes = Bytes::from_static(b"compacted");
+        main_store.put(&path, bytes.clone().into()).await.unwrap();
+
+        let metadata = ts.metadata(&id).await.unwrap();
+        assert_eq!(metadata.size, bytes.len() as u64);
+        assert_eq!(metadata.location, path);
+    }
+
+    #[rstest]
+    #[case::main_only(make_store(), None)]
+    #[case::main_and_wal(make_store(), Some(make_store()))]
+    #[tokio::test]
+    async fn test_metadata_for_wal_sst(
+        #[case] main_store: Arc<dyn ObjectStore>,
+        #[case] wal_store: Option<Arc<dyn ObjectStore>>,
+    ) {
+        let ts = Arc::new(TableStore::new(
+            ObjectStores::new(main_store.clone(), wal_store.clone()),
+            SsTableFormat::default(),
+            Path::from(ROOT),
+            None,
+        ));
+        let id = SsTableId::Wal(42);
+        let path = ts.path(&id);
+        let bytes = Bytes::from_static(b"wal");
+        wal_store
+            .unwrap_or(main_store)
+            .put(&path, bytes.clone().into())
+            .await
+            .unwrap();
+
+        let metadata = ts.metadata(&id).await.unwrap();
+        assert_eq!(metadata.size, bytes.len() as u64);
+        assert_eq!(metadata.location, path);
     }
 
     proptest! {

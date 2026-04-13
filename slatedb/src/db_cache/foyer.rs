@@ -23,7 +23,7 @@
 //! async fn main() -> Result<(), Error> {
 //!     let object_store = Arc::new(InMemory::new());
 //!     let db = Db::builder("test_db", object_store)
-//!         .with_memory_cache(Arc::new(FoyerCache::new()))
+//!         .with_db_cache(Arc::new(FoyerCache::new()))
 //!         .build()
 //!         .await?;
 //!     Ok(())
@@ -47,7 +47,7 @@ impl Default for FoyerCacheOptions {
         Self {
             max_capacity: DEFAULT_MAX_CAPACITY,
             shards: {
-                let mut sys = System::new_all();
+                let mut sys = System::new();
                 sys.refresh_cpu_specifics(CpuRefreshKind::nothing());
                 sys.cpus().len()
             },
@@ -106,6 +106,10 @@ impl DbCache for FoyerCache {
     }
 
     async fn get_filter(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        Ok(self.inner.get(key).map(|entry| entry.value().clone()))
+    }
+
+    async fn get_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
         Ok(self.inner.get(key).map(|entry| entry.value().clone()))
     }
 

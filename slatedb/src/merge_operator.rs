@@ -6,9 +6,9 @@ use thiserror::Error;
 
 use crate::{
     error::SlateDBError,
-    iter::{KeyValueIterator, TrackedKeyValueIterator},
+    iter::{RowEntryIterator, TrackedRowEntryIterator},
     types::{RowEntry, ValueDeletable},
-    utils::{is_not_expired, merge_options},
+    utils::merge_options,
 };
 
 #[non_exhaustive]
@@ -16,6 +16,9 @@ use crate::{
 pub enum MergeOperatorError {
     #[error("merge_batch called with empty operands and no existing value")]
     EmptyBatch,
+
+    #[error("{message}")]
+    Callback { message: String },
 }
 
 /// A trait for implementing custom merge operations in SlateDB.
@@ -132,25 +135,25 @@ pub(crate) type MergeOperatorType = Arc<dyn MergeOperator + Send + Sync>;
 const MERGE_BATCH_SIZE: usize = 100;
 
 /// An iterator that ensures merge operands are not returned when no merge operator is configured.
-pub(crate) struct MergeOperatorRequiredIterator<T: KeyValueIterator> {
+pub(crate) struct MergeOperatorRequiredIterator<T: RowEntryIterator> {
     delegate: T,
 }
 
-impl<T: KeyValueIterator> MergeOperatorRequiredIterator<T> {
+impl<T: RowEntryIterator> MergeOperatorRequiredIterator<T> {
     pub(crate) fn new(delegate: T) -> Self {
         Self { delegate }
     }
 }
 
 #[async_trait]
-impl<T: KeyValueIterator> KeyValueIterator for MergeOperatorRequiredIterator<T> {
+impl<T: RowEntryIterator> RowEntryIterator for MergeOperatorRequiredIterator<T> {
     async fn init(&mut self) -> Result<(), SlateDBError> {
         self.delegate.init().await
     }
 
-    async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
-        let next_entry = self.delegate.next_entry().await?;
-        if let Some(entry) = next_entry {
+    async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        let next = self.delegate.next().await?;
+        if let Some(entry) = next {
             match &entry.value {
                 ValueDeletable::Merge(_) => {
                     return Err(SlateDBError::MergeOperatorMissing);
@@ -166,7 +169,7 @@ impl<T: KeyValueIterator> KeyValueIterator for MergeOperatorRequiredIterator<T> 
     }
 }
 
-impl<T: TrackedKeyValueIterator> TrackedKeyValueIterator for MergeOperatorRequiredIterator<T> {
+impl<T: TrackedRowEntryIterator> TrackedRowEntryIterator for MergeOperatorRequiredIterator<T> {
     fn bytes_processed(&self) -> u64 {
         self.delegate.bytes_processed()
     }
@@ -177,14 +180,13 @@ impl<T: TrackedKeyValueIterator> TrackedKeyValueIterator for MergeOperatorRequir
 /// It is expected that this is the top level iterator in a merge scan, and therefore
 /// return a ValueDeletable::Value entry (instead of a Merge even if the resolved value
 /// is a merge operand).
-pub(crate) struct MergeOperatorIterator<T: KeyValueIterator> {
+pub(crate) struct MergeOperatorIterator<T: RowEntryIterator> {
     merge_operator: MergeOperatorType,
     delegate: T,
     /// Entry from the delegate that we've peeked ahead and buffered.
     buffered_entry: Option<RowEntry>,
     /// Whether to merge entries with different expire timestamps.
     merge_different_expire_ts: bool,
-    now: i64,
     /// A barrier sequence number that supports snapshot reads using this iterator. If not None,
     /// the iterator will not merge entries with sequence number greater than this value.
     snapshot_barrier_seq: Option<u64>,
@@ -243,12 +245,11 @@ impl MergeTracker {
 }
 
 #[allow(unused)]
-impl<T: KeyValueIterator> MergeOperatorIterator<T> {
+impl<T: RowEntryIterator> MergeOperatorIterator<T> {
     pub(crate) fn new(
         merge_operator: MergeOperatorType,
         delegate: T,
         merge_different_expire_ts: bool,
-        now: i64,
         snapshot_barrier_seq: Option<u64>,
     ) -> Self {
         Self {
@@ -256,13 +257,12 @@ impl<T: KeyValueIterator> MergeOperatorIterator<T> {
             delegate,
             buffered_entry: None,
             merge_different_expire_ts,
-            now,
             snapshot_barrier_seq,
         }
     }
 }
 
-impl<T: KeyValueIterator> MergeOperatorIterator<T> {
+impl<T: RowEntryIterator> MergeOperatorIterator<T> {
     /// Checks if an entry matches the current key and expiration timestamp.
     /// Returns true if keys match and either `merge_different_expire_ts` is enabled
     /// or the expire_ts matches.
@@ -334,7 +334,7 @@ impl<T: KeyValueIterator> MergeOperatorIterator<T> {
                 } else if !matches!(entry.value, ValueDeletable::Merge(_)) {
                     // found a Value or Tombstone, this is the base value
                     break Some(entry);
-                } else if is_not_expired(&entry, self.now) {
+                } else {
                     batch.push(entry);
                 }
 
@@ -343,7 +343,7 @@ impl<T: KeyValueIterator> MergeOperatorIterator<T> {
                     results.push(self.process_batch(&key, &mut batch, &mut merge_tracker)?);
                 }
 
-                next = self.delegate.next_entry().await?;
+                next = self.delegate.next().await?;
             } else {
                 break None;
             }
@@ -356,6 +356,12 @@ impl<T: KeyValueIterator> MergeOperatorIterator<T> {
 
         let base_value = base.as_ref().and_then(|b| b.value.as_bytes());
         let found_base = base.is_some();
+
+        // Fold the base entry's metadata into the tracker so that its
+        // create_ts and expire_ts are reflected in the merged result.
+        if let Some(ref base_entry) = base {
+            merge_tracker.update(base_entry)?;
+        }
 
         // If we have no results and either no base or a tombstone base, return None
         if results.is_empty() && base_value.is_none() {
@@ -382,17 +388,17 @@ impl<T: KeyValueIterator> MergeOperatorIterator<T> {
 }
 
 #[async_trait]
-impl<T: KeyValueIterator> KeyValueIterator for MergeOperatorIterator<T> {
+impl<T: RowEntryIterator> RowEntryIterator for MergeOperatorIterator<T> {
     async fn init(&mut self) -> Result<(), SlateDBError> {
         self.delegate.init().await
     }
 
-    async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
-        let next_entry = match self.buffered_entry.take() {
+    async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        let next = match self.buffered_entry.take() {
             Some(entry) => Some(entry),
-            None => self.delegate.next_entry().await?,
+            None => self.delegate.next().await?,
         };
-        if let Some(entry) = next_entry {
+        if let Some(entry) = next {
             match &entry.value {
                 ValueDeletable::Merge(_) => {
                     if let Some(snapshot_barrier_seq) = self.snapshot_barrier_seq {
@@ -412,11 +418,12 @@ impl<T: KeyValueIterator> KeyValueIterator for MergeOperatorIterator<T> {
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
+        self.buffered_entry = None;
         self.delegate.seek(next_key).await
     }
 }
 
-impl<T: TrackedKeyValueIterator> TrackedKeyValueIterator for MergeOperatorIterator<T> {
+impl<T: TrackedRowEntryIterator> TrackedRowEntryIterator for MergeOperatorIterator<T> {
     fn bytes_processed(&self) -> u64 {
         self.delegate.bytes_processed()
     }
@@ -519,11 +526,10 @@ mod tests {
             RowEntry::new_merge(b"key3", b"2", 7),
             RowEntry::new_merge(b"key3", b"3", 8),
         ];
-        let mut iterator = MergeOperatorIterator::<MockKeyValueIterator>::new(
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
             merge_operator,
             data.into(),
             true,
-            0,
             None,
         );
         assert_iterator(
@@ -535,6 +541,33 @@ mod tests {
             ],
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_seek_clears_buffered_entry() {
+        let merge_operator = Arc::new(MockMergeOperator {});
+        let data = vec![
+            RowEntry::new_merge(b"key1", b"1", 1),
+            RowEntry::new_merge(b"key1", b"2", 2),
+            RowEntry::new_value(b"key2", b"v", 3),
+        ];
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
+            merge_operator,
+            data.into(),
+            true,
+            None,
+        );
+
+        iterator.init().await.unwrap();
+        let first = iterator.next().await.unwrap().unwrap();
+        assert_eq!(first.key.as_ref(), b"key1");
+        assert_eq!(first.value.as_bytes().unwrap().as_ref(), b"12");
+
+        iterator.seek(b"key3").await.unwrap();
+        assert!(
+            iterator.next().await.unwrap().is_none(),
+            "seek should not return a stale buffered entry"
+        );
     }
 
     #[derive(Debug)]
@@ -643,27 +676,26 @@ mod tests {
     #[tokio::test]
     async fn test(#[case] test_case: TestCase) {
         let merge_operator = Arc::new(MockMergeOperator {});
-        let mut iterator = MergeOperatorIterator::<MockKeyValueIterator>::new(
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
             merge_operator,
             test_case.unsorted_data.into(),
             test_case.merge_different_expire_ts,
-            0,
             test_case.snapshot_barrier_seq,
         );
         assert_iterator(&mut iterator, test_case.expected).await;
     }
 
-    struct MockKeyValueIterator {
+    struct MockRowEntryIterator {
         values: VecDeque<RowEntry>,
     }
 
     #[async_trait]
-    impl KeyValueIterator for MockKeyValueIterator {
+    impl RowEntryIterator for MockRowEntryIterator {
         async fn init(&mut self) -> Result<(), SlateDBError> {
             Ok(())
         }
 
-        async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
             Ok(self.values.pop_front())
         }
 
@@ -673,8 +705,8 @@ mod tests {
         }
     }
 
-    impl From<Vec<RowEntry>> for MockKeyValueIterator {
-        /// Converts a vector of RowEntries into a MockKeyValueIterator. The vector is sorted
+    impl From<Vec<RowEntry>> for MockRowEntryIterator {
+        /// Converts a vector of RowEntries into a MockRowEntryIterator. The vector is sorted
         /// by key and reverse sequence number.
         fn from(values: Vec<RowEntry>) -> Self {
             let mut sorted_values = values;
@@ -786,11 +818,10 @@ mod tests {
             RowEntry::new_merge(b"max:score", &3u64.to_le_bytes(), 6),
         ];
 
-        let mut iterator = MergeOperatorIterator::<MockKeyValueIterator>::new(
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
             merge_operator,
             data.into(),
             true,
-            0,
             None,
         );
 
@@ -817,11 +848,10 @@ mod tests {
             data.push(RowEntry::new_merge(b"key1", &[i as u8], i));
         }
 
-        let mut iterator = MergeOperatorIterator::<MockKeyValueIterator>::new(
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
             merge_operator,
             data.into(),
             true,
-            0,
             None,
         );
 
@@ -841,11 +871,10 @@ mod tests {
             data.push(RowEntry::new_merge(b"key1", &[i as u8], i));
         }
 
-        let mut iterator = MergeOperatorIterator::<MockKeyValueIterator>::new(
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
             merge_operator,
             data.into(),
             true,
-            0,
             None,
         );
 
@@ -866,11 +895,10 @@ mod tests {
             data.push(RowEntry::new_merge(b"key1", &[i as u8], i));
         }
 
-        let mut iterator = MergeOperatorIterator::<MockKeyValueIterator>::new(
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
             merge_operator,
             data.into(),
             true,
-            0,
             None,
         );
 
@@ -898,11 +926,10 @@ mod tests {
             data.push(RowEntry::new_merge(b"key1", &[i as u8], i));
         }
 
-        let mut iterator = MergeOperatorIterator::<MockKeyValueIterator>::new(
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
             merge_operator,
             data.into(),
             true,
-            0,
             None,
         );
 
@@ -920,106 +947,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_merge_operator_filters_expired_entries() {
+    async fn test_merge_operator_merges_entries_with_mixed_expire_ts() {
         let merge_operator = Arc::new(MockMergeOperator {});
 
         // Create entries with different expiration times
-        // now = 100, so entries with expire_ts <= 100 are expired
-        // Entries are sorted by reverse seq, so we need the first entry (highest seq) to be non-expired
-        // to properly initialize the tracker
         let data = vec![
-            // Non-expired merge operands (expire_ts > 100) - highest seq first
             RowEntry::new_merge(b"key1", b"4", 4).with_expire_ts(300),
             RowEntry::new_merge(b"key1", b"2", 2).with_expire_ts(150),
             RowEntry::new_merge(b"key1", b"1", 1).with_expire_ts(200),
-            // Expired merge operands (expire_ts <= 100) - should be filtered out
             RowEntry::new_merge(b"key1", b"5", 5).with_expire_ts(100),
             RowEntry::new_merge(b"key1", b"3", 3).with_expire_ts(50),
         ];
 
-        let mut iterator = MergeOperatorIterator::<MockKeyValueIterator>::new(
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
             merge_operator,
             data.into(),
             true,
-            100, // now = 100
             None,
         );
 
-        // Only non-expired entries (4, 2, 1) should be merged
-        // Entries with expire_ts 50 and 100 should be filtered out
-        // Since entries are sorted by reverse seq, first entry is seq=5 (expired)
-        // Tracker initializes with seq=5, but max_create_ts and min_expire_ts are None
-        // Seq=5 is filtered out (expired), then seq=4, 2, 1 are added to batch
-        // process_batch updates tracker: min_expire_ts becomes 150 (min of 300, 150, 200)
-        // Batch is [4, 2, 1], reversed to [1, 2, 4], merged to "124"
-        // Final seq is 5 (from first entry initialization), min_expire_ts is 150
+        // Entries sorted by reverse seq: seq=5, 4, 3, 2, 1
+        // Reversed to seq asc: b"1", b"2", b"3", b"4", b"5" -> merged to "12345"
+        // min_expire_ts = min(200, 150, 50, 300, 100) = 50
         assert_iterator(
             &mut iterator,
-            vec![RowEntry::new_merge(b"key1", b"124", 5).with_expire_ts(150)], // seq=5 from first entry, min_expire_ts=150 from non-expired entries
+            vec![RowEntry::new_merge(b"key1", b"12345", 5).with_expire_ts(50)],
         )
         .await;
     }
 
     #[tokio::test]
-    async fn test_merge_operator_filters_expired_entries_with_base_value() {
+    async fn test_merge_operator_merges_entries_with_base_value_and_mixed_expire_ts() {
         let merge_operator = Arc::new(MockMergeOperator {});
 
-        // Create entries with a base value and mixed expired/non-expired merge operands
-        // Entries are sorted by reverse seq, so base value (seq=0) comes last
-        // We need non-expired merge operands with higher seq to come first
+        // Create entries with a base value and merge operands with different expire_ts
         let data = vec![
-            // Non-expired merge operands (higher seq first)
             RowEntry::new_merge(b"key1", b"4", 4).with_expire_ts(300),
             RowEntry::new_merge(b"key1", b"2", 2).with_expire_ts(250),
             RowEntry::new_merge(b"key1", b"1", 1).with_expire_ts(150),
-            // Expired merge operand - should be filtered out
             RowEntry::new_merge(b"key1", b"3", 3).with_expire_ts(50),
-            // Base value (non-expired) - comes last due to seq=0
             RowEntry::new_value(b"key1", b"BASE", 0).with_expire_ts(200),
         ];
 
-        let mut iterator = MergeOperatorIterator::<MockKeyValueIterator>::new(
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
             merge_operator,
             data.into(),
             true,
-            100, // now = 100,
             None,
         );
 
-        // Base value + non-expired entries (4, 2, 1) should be merged
-        // Entry with expire_ts 50 should be filtered out
-        // First entry is seq=4 (non-expired), tracker starts with seq=4, but max_create_ts and min_expire_ts are None
-        // Seq=4, 2, 1 are added to batch (all non-expired)
-        // process_batch updates tracker: min_expire_ts becomes 150 (min of 300, 250, 150)
-        // Batch is [4, 2, 1], reversed to [1, 2, 4], merged to "124", then merged with BASE to "BASE124"
-        // Final seq is 4 (from first entry initialization), min_expire_ts is 150
+        // Sorted by reverse seq: seq=4, 3, 2, 1, 0(BASE)
+        // Merge operands [4, 3, 2, 1] reversed to [1, 2, 3, 4], merged to "1234", then merged with BASE
+        // min_expire_ts = min(300, 50, 250, 150, 200) = 50
         assert_iterator(
             &mut iterator,
-            vec![RowEntry::new_value(b"key1", b"BASE124", 4).with_expire_ts(150)], // seq=4 from first entry, min_expire_ts=150
+            vec![RowEntry::new_value(b"key1", b"BASE1234", 4).with_expire_ts(50)],
         )
         .await;
     }
 
     #[tokio::test]
-    async fn test_merge_operator_handles_all_expired_entries() {
+    async fn test_merge_operator_merges_all_entries_with_expire_ts() {
         let merge_operator = Arc::new(MockMergeOperator {});
 
-        // All merge operands are expired
+        // All merge operands have expire_ts set
         let data = vec![
             RowEntry::new_merge(b"key1", b"1", 1).with_expire_ts(50),
             RowEntry::new_merge(b"key1", b"2", 2).with_expire_ts(80),
             RowEntry::new_merge(b"key1", b"3", 3).with_expire_ts(90),
         ];
 
-        let mut iterator = MergeOperatorIterator::<MockKeyValueIterator>::new(
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
             merge_operator,
             data.into(),
             true,
-            100, // now = 100, all entries are expired,
             None,
         );
 
-        // All entries are expired, so nothing should be returned
-        assert_iterator(&mut iterator, vec![]).await;
+        // Sorted by reverse seq: seq=3, 2, 1
+        // Reversed to [1, 2, 3], merged to "123"
+        // min_expire_ts = min(50, 80, 90) = 50
+        assert_iterator(
+            &mut iterator,
+            vec![RowEntry::new_merge(b"key1", b"123", 3).with_expire_ts(50)],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn should_use_base_expire_ts_when_it_is_the_earliest() {
+        // given: a base value with the earliest expire_ts
+        let merge_operator = Arc::new(MockMergeOperator {});
+        let data = vec![
+            RowEntry::new_merge(b"key1", b"2", 2).with_expire_ts(300),
+            RowEntry::new_merge(b"key1", b"1", 1).with_expire_ts(200),
+            RowEntry::new_value(b"key1", b"BASE", 0).with_expire_ts(50),
+        ];
+
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
+            merge_operator,
+            data.into(),
+            true,
+            None,
+        );
+
+        // then: min_expire_ts should come from the base value (50)
+        assert_iterator(
+            &mut iterator,
+            vec![RowEntry::new_value(b"key1", b"BASE12", 2).with_expire_ts(50)],
+        )
+        .await;
     }
 }

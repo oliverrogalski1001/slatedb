@@ -16,12 +16,12 @@ use crate::checkpoint::Checkpoint;
 use crate::compactions_store::CompactionsStore;
 use crate::config::GarbageCollectorOptions;
 pub use crate::db::builder::GarbageCollectorBuilder;
+use crate::db_metrics::DbMetrics;
 use crate::dispatcher::{MessageFactory, MessageHandler};
 use crate::error::SlateDBError;
 use crate::garbage_collector::stats::GcStats;
 use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::Manifest;
-use crate::stats::StatRegistry;
 use crate::tablestore::TableStore;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -31,8 +31,8 @@ use futures::stream::BoxStream;
 use log::{debug, error, info};
 use manifest_gc::ManifestGcTask;
 use slatedb_common::clock::SystemClock;
+use slatedb_common::metrics::MetricValue;
 use slatedb_txn_obj::{DirtyObject, SimpleTransactionalObject, TransactionalObject};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
@@ -44,8 +44,8 @@ mod manifest_gc;
 pub mod stats;
 mod wal_gc;
 
-pub(crate) const DEFAULT_MIN_AGE: Duration = Duration::from_secs(1800);
-pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(300);
+pub(crate) const DEFAULT_MIN_AGE: Duration = Duration::from_secs(300);
+pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const GC_TASK_NAME: &str = "garbage_collector";
 
 trait GcTask {
@@ -82,51 +82,78 @@ pub struct GarbageCollector {
     manifest_store: Arc<ManifestStore>,
     options: GarbageCollectorOptions,
     stats: Arc<GcStats>,
+    db_metrics: DbMetrics,
     system_clock: Arc<dyn SystemClock>,
-    manifest_gc_task: ManifestGcTask,
-    wal_gc_task: WalGcTask,
-    compacted_gc_task: CompactedGcTask,
-    compactions_gc_task: CompactionsGcTask,
+    manifest_gc_task: Option<ManifestGcTask>,
+    wal_gc_task: Option<WalGcTask>,
+    compacted_gc_task: Option<CompactedGcTask>,
+    compactions_gc_task: Option<CompactionsGcTask>,
 }
 
 #[async_trait]
 impl MessageHandler<GcMessage> for GarbageCollector {
     fn tickers(&mut self) -> Vec<(Duration, Box<MessageFactory<GcMessage>>)> {
-        let compacted_interval = self
-            .options
-            .compacted_options
-            .and_then(|o| o.interval)
-            .unwrap_or(DEFAULT_INTERVAL);
-        let manifest_interval = self
-            .options
-            .manifest_options
-            .and_then(|o| o.interval)
-            .unwrap_or(DEFAULT_INTERVAL);
-        let wal_interval = self
-            .options
-            .wal_options
-            .and_then(|o| o.interval)
-            .unwrap_or(DEFAULT_INTERVAL);
-        let compactions_interval = self
-            .options
-            .compactions_options
-            .and_then(|o| o.interval)
-            .unwrap_or(DEFAULT_INTERVAL);
-        vec![
-            (manifest_interval, Box::new(|| GcMessage::GcManifest)),
-            (wal_interval, Box::new(|| GcMessage::GcWal)),
-            (compacted_interval, Box::new(|| GcMessage::GcCompacted)),
-            (compactions_interval, Box::new(|| GcMessage::GcCompactions)),
-            (Duration::from_secs(60), Box::new(|| GcMessage::LogStats)),
-        ]
+        let mut tickers: Vec<(Duration, Box<MessageFactory<GcMessage>>)> = Vec::new();
+
+        if let Some(opts) = self.options.manifest_options {
+            tickers.push((
+                opts.interval.unwrap_or(DEFAULT_INTERVAL),
+                Box::new(|| GcMessage::GcManifest),
+            ));
+        }
+        if let Some(opts) = self.options.wal_options {
+            tickers.push((
+                opts.interval.unwrap_or(DEFAULT_INTERVAL),
+                Box::new(|| GcMessage::GcWal),
+            ));
+        }
+        if let Some(opts) = self.options.compacted_options {
+            tickers.push((
+                opts.interval.unwrap_or(DEFAULT_INTERVAL),
+                Box::new(|| GcMessage::GcCompacted),
+            ));
+        }
+        if let Some(opts) = self.options.compactions_options {
+            tickers.push((
+                opts.interval.unwrap_or(DEFAULT_INTERVAL),
+                Box::new(|| GcMessage::GcCompactions),
+            ));
+        }
+
+        tickers.push((Duration::from_secs(60), Box::new(|| GcMessage::LogStats)));
+        tickers
     }
 
     async fn handle(&mut self, message: GcMessage) -> Result<(), SlateDBError> {
         match message {
-            GcMessage::GcManifest => self.run_gc_task(&self.manifest_gc_task).await,
-            GcMessage::GcWal => self.run_gc_task(&self.wal_gc_task).await,
-            GcMessage::GcCompacted => self.run_gc_task(&self.compacted_gc_task).await,
-            GcMessage::GcCompactions => self.run_gc_task(&self.compactions_gc_task).await,
+            GcMessage::GcManifest => {
+                let task = self
+                    .manifest_gc_task
+                    .as_ref()
+                    .expect("got manifest tick with unconfigured manifest task");
+                self.run_gc_task(task).await;
+            }
+            GcMessage::GcWal => {
+                let task = self
+                    .wal_gc_task
+                    .as_ref()
+                    .expect("got wal tick with unconfigured wal task");
+                self.run_gc_task(task).await;
+            }
+            GcMessage::GcCompacted => {
+                let task = self
+                    .compacted_gc_task
+                    .as_ref()
+                    .expect("got compacted tick with unconfigured compacted task");
+                self.run_gc_task(task).await;
+            }
+            GcMessage::GcCompactions => {
+                let task = self
+                    .compactions_gc_task
+                    .as_ref()
+                    .expect("got compactions tick with unconfigured compactions task");
+                self.run_gc_task(task).await;
+            }
             GcMessage::LogStats => self.log_stats(),
         }
         Ok(())
@@ -163,37 +190,42 @@ impl GarbageCollector {
         compactions_store: Arc<CompactionsStore>,
         table_store: Arc<TableStore>,
         options: GarbageCollectorOptions,
-        stat_registry: Arc<StatRegistry>,
+        db_metrics: &DbMetrics,
         system_clock: Arc<dyn SystemClock>,
     ) -> Self {
-        let stats = Arc::new(GcStats::new(stat_registry));
-        let wal_gc_task = WalGcTask::new(
-            manifest_store.clone(),
-            table_store.clone(),
-            stats.clone(),
-            options.wal_options,
-        );
-        let compacted_gc_task = CompactedGcTask::new(
-            manifest_store.clone(),
-            compactions_store.clone(),
-            table_store,
-            stats.clone(),
-            options.compacted_options,
-        );
-        let compactions_gc_task = CompactionsGcTask::new(
-            compactions_store,
-            stats.clone(),
-            options.compactions_options,
-        );
-        let manifest_gc_task = ManifestGcTask::new(
-            manifest_store.clone(),
-            stats.clone(),
-            options.manifest_options,
-        );
+        let stats = Arc::new(GcStats::new(db_metrics));
+        let wal_gc_task = options.wal_options.map(|wal_options| {
+            WalGcTask::new(
+                manifest_store.clone(),
+                table_store.clone(),
+                stats.clone(),
+                wal_options,
+            )
+        });
+        let compacted_gc_task = options.compacted_options.map(|compacted_options| {
+            CompactedGcTask::new(
+                manifest_store.clone(),
+                compactions_store.clone(),
+                table_store.clone(),
+                stats.clone(),
+                compacted_options,
+            )
+        });
+        let compactions_gc_task = options.compactions_options.map(|compactions_options| {
+            CompactionsGcTask::new(
+                compactions_store.clone(),
+                stats.clone(),
+                compactions_options,
+            )
+        });
+        let manifest_gc_task = options.manifest_options.map(|manifest_options| {
+            ManifestGcTask::new(manifest_store.clone(), stats.clone(), manifest_options)
+        });
         Self {
             manifest_store,
             options,
             stats,
+            db_metrics: db_metrics.clone(),
             system_clock,
             manifest_gc_task,
             wal_gc_task,
@@ -204,18 +236,26 @@ impl GarbageCollector {
 
     /// Run the garbage collector once.
     ///
-    /// This method runs all three garbage collection tasks:
+    /// This method runs all configured garbage collection tasks:
     ///
     /// - WAL SST garbage collection
     /// - Compacted SST garbage collection
     /// - Manifest garbage collection
     pub async fn run_gc_once(&self) {
-        self.run_gc_task(&self.manifest_gc_task).await;
-        self.run_gc_task(&self.wal_gc_task).await;
-        self.run_gc_task(&self.compacted_gc_task).await;
-        self.run_gc_task(&self.compactions_gc_task).await;
+        if let Some(task) = &self.manifest_gc_task {
+            self.run_gc_task(task).await;
+        }
+        if let Some(task) = &self.wal_gc_task {
+            self.run_gc_task(task).await;
+        }
+        if let Some(task) = &self.compacted_gc_task {
+            self.run_gc_task(task).await;
+        }
+        if let Some(task) = &self.compactions_gc_task {
+            self.run_gc_task(task).await;
+        }
 
-        self.stats.gc_count.inc();
+        self.stats.gc_count.increment(1);
     }
 
     #[instrument(level = "debug", skip_all, fields(resource = task.resource()))]
@@ -265,12 +305,22 @@ impl GarbageCollector {
     }
 
     fn log_stats(&self) {
+        if !log::log_enabled!(log::Level::Debug) {
+            return;
+        }
+        let snapshot = self.db_metrics.snapshot();
+        let get_value = |name: &str| -> &MetricValue {
+            snapshot
+                .by_name(name)
+                .first()
+                .map_or(&MetricValue::Counter(0), |m| &m.value)
+        };
         debug!(
             "garbage collector stats [manifest_count={}, wals_count={}, compacted_count={}, compactions_count={}]",
-            self.stats.gc_manifest_count.value.load(Ordering::SeqCst),
-            self.stats.gc_wal_count.value.load(Ordering::SeqCst),
-            self.stats.gc_compacted_count.value.load(Ordering::SeqCst),
-            self.stats.gc_compactions_count.value.load(Ordering::SeqCst)
+            get_value("gc/manifest_count"),
+            get_value("gc/wal_count"),
+            get_value("gc/compacted_count"),
+            get_value("gc/compactions_count"),
         );
     }
 }
@@ -299,10 +349,11 @@ mod tests {
     use crate::types::RowEntry;
     use slatedb_common::clock::DefaultSystemClock;
 
+    use crate::db_status::ClosedResultWriter;
     use crate::format::sst::SsTableFormat;
     use crate::utils::WatchableOnceCell;
     use crate::{
-        db_state::{ManifestCore, SortedRun, SsTableHandle, SsTableId},
+        db_state::{ManifestCore, SortedRun, SsTableHandle, SsTableId, SsTableView},
         manifest::store::{ManifestStore, StoredManifest},
         tablestore::TableStore,
     };
@@ -975,13 +1026,20 @@ mod tests {
 
         // Create a manifest
         let mut state = ManifestCore::new();
-        state.l0.push_back(l0_sst_handle.clone());
-        state.l0.push_back(active_expired_l0_sst_handle.clone());
+        state
+            .l0
+            .push_back(SsTableView::identity(l0_sst_handle.clone()));
+        state
+            .l0
+            .push_back(SsTableView::identity(active_expired_l0_sst_handle.clone()));
         // Dont' push inactive_expired_l0_sst_handle
         state.compacted.push(SortedRun {
             id: 1,
             // Don't add inactive_expired_sst_handle
-            ssts: vec![active_sst_handle.clone(), active_expired_sst_handle.clone()],
+            sst_views: vec![
+                SsTableView::identity(active_sst_handle.clone()),
+                SsTableView::identity(active_expired_sst_handle.clone()),
+            ],
         });
         StoredManifest::create_new_db(
             manifest_store.clone(),
@@ -1012,7 +1070,7 @@ mod tests {
         let current_manifest = manifest_store.read_latest_manifest().await.unwrap().1;
         assert_eq!(current_manifest.core.l0.len(), 2);
         assert_eq!(current_manifest.core.compacted.len(), 1);
-        assert_eq!(current_manifest.core.compacted[0].ssts.len(), 2);
+        assert_eq!(current_manifest.core.compacted[0].sst_views.len(), 2);
 
         // Start the garbage collector
         run_gc_once(
@@ -1044,7 +1102,7 @@ mod tests {
         let current_manifest = manifest_store.read_latest_manifest().await.unwrap().1;
         assert_eq!(current_manifest.core.l0.len(), 2);
         assert_eq!(current_manifest.core.compacted.len(), 1);
-        assert_eq!(current_manifest.core.compacted[0].ssts.len(), 2);
+        assert_eq!(current_manifest.core.compacted[0].sst_views.len(), 2);
     }
 
     /// This test creates six compacted SSTs:
@@ -1077,15 +1135,19 @@ mod tests {
 
         // Create an initial manifest with active and active checkpoint tables
         let mut state = ManifestCore::new();
-        state.l0.push_back(active_l0_sst_handle.clone());
-        state.l0.push_back(active_checkpoint_l0_sst_handle.clone());
+        state
+            .l0
+            .push_back(SsTableView::identity(active_l0_sst_handle.clone()));
+        state.l0.push_back(SsTableView::identity(
+            active_checkpoint_l0_sst_handle.clone(),
+        ));
         state.compacted.push(SortedRun {
             id: 1,
-            ssts: vec![active_sst_handle.clone()],
+            sst_views: vec![SsTableView::identity(active_sst_handle.clone())],
         });
         state.compacted.push(SortedRun {
             id: 2,
-            ssts: vec![active_checkpoint_sst_handle.clone()],
+            sst_views: vec![SsTableView::identity(active_checkpoint_sst_handle.clone())],
         });
         let mut stored_manifest = StoredManifest::create_new_db(
             manifest_store.clone(),
@@ -1257,13 +1319,13 @@ mod tests {
                 assert!(wal_ssts.contains(&SsTableId::Wal(wal_sst_id)));
             }
 
-            for sst in &manifest.core.l0 {
-                assert!(compacted_ssts.contains(&sst.id));
+            for view in &manifest.core.l0 {
+                assert!(compacted_ssts.contains(&view.sst.id));
             }
 
             for sr in &manifest.core.compacted {
-                for sst in &sr.ssts {
-                    assert!(compacted_ssts.contains(&sst.id));
+                for view in &sr.sst_views {
+                    assert!(compacted_ssts.contains(&view.sst.id));
                 }
             }
         }
@@ -1276,7 +1338,7 @@ mod tests {
         compaction_low_watermark_dt: Option<DateTime<Utc>>,
     ) {
         // Start the garbage collector
-        let stats = Arc::new(StatRegistry::new());
+        let db_metrics = crate::db_metrics::DbMetrics::new(None);
 
         // Pretend a compaction job has already run with the specified start time
         if let Some(compaction_low_watermark_dt) = compaction_low_watermark_dt {
@@ -1334,7 +1396,7 @@ mod tests {
             compactions_store.clone(),
             table_store.clone(),
             gc_opts,
-            stats.clone(),
+            &db_metrics,
             Arc::new(DefaultSystemClock::default()),
         );
 
@@ -1375,7 +1437,7 @@ mod tests {
         assert_eq!(manifests.len(), 2);
 
         // Build a GC with standard options (1h min_age)
-        let stats = Arc::new(StatRegistry::new());
+        let db_metrics = crate::db_metrics::DbMetrics::new(None);
         let gc_opts = GarbageCollectorOptions {
             manifest_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: std::time::Duration::from_secs(3600),
@@ -1400,7 +1462,7 @@ mod tests {
             compactions_store.clone(),
             table_store.clone(),
             gc_opts,
-            stats.clone(),
+            &db_metrics,
             Arc::new(DefaultSystemClock::default()),
         );
 
@@ -1418,10 +1480,111 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_run_gc_once_skips_disabled_manifest_gc() {
+        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
+
+        let mut stored_manifest = StoredManifest::create_new_db(
+            manifest_store.clone(),
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        stored_manifest
+            .update(stored_manifest.prepare_dirty().unwrap())
+            .await
+            .unwrap();
+
+        set_modified(
+            local_object_store.clone(),
+            &Path::from(format!("manifest/{:020}.{}", 1, "manifest")),
+            86400,
+        );
+
+        let db_metrics = crate::db_metrics::DbMetrics::new(None);
+        let gc_opts = GarbageCollectorOptions {
+            manifest_options: None,
+            wal_options: Some(GarbageCollectorDirectoryOptions {
+                min_age: std::time::Duration::from_secs(3600),
+                interval: None,
+            }),
+            compacted_options: Some(GarbageCollectorDirectoryOptions {
+                min_age: std::time::Duration::from_secs(3600),
+                interval: None,
+            }),
+            compactions_options: Some(GarbageCollectorDirectoryOptions {
+                min_age: std::time::Duration::from_secs(3600),
+                interval: None,
+            }),
+        };
+
+        let gc = GarbageCollector::new(
+            manifest_store.clone(),
+            compactions_store.clone(),
+            table_store.clone(),
+            gc_opts,
+            &db_metrics,
+            Arc::new(DefaultSystemClock::default()),
+        );
+        gc.run_gc_once().await;
+
+        let manifests = manifest_store.list_manifests(..).await.unwrap();
+        assert_eq!(
+            manifests.len(),
+            2,
+            "manifest GC should not run when manifest options are disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tickers_should_skip_disabled_gc_tasks() {
+        use crate::dispatcher::MessageHandler;
+
+        let (manifest_store, compactions_store, table_store, _) = build_objects();
+        let db_metrics = crate::db_metrics::DbMetrics::new(None);
+
+        let gc_opts = GarbageCollectorOptions {
+            manifest_options: None,
+            wal_options: Some(GarbageCollectorDirectoryOptions {
+                min_age: Duration::from_secs(3600),
+                interval: Some(Duration::from_secs(11)),
+            }),
+            compacted_options: None,
+            compactions_options: Some(GarbageCollectorDirectoryOptions {
+                min_age: Duration::from_secs(3600),
+                interval: Some(Duration::from_secs(17)),
+            }),
+        };
+
+        let mut gc = GarbageCollector::new(
+            manifest_store,
+            compactions_store,
+            table_store,
+            gc_opts,
+            &db_metrics,
+            Arc::new(DefaultSystemClock::default()),
+        );
+
+        let intervals: Vec<_> = gc
+            .tickers()
+            .into_iter()
+            .map(|(interval, _)| interval)
+            .collect();
+        assert_eq!(
+            intervals,
+            vec![
+                Duration::from_secs(11),
+                Duration::from_secs(17),
+                Duration::from_secs(60)
+            ]
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn test_gc_shutdown() {
         let (manifest_store, compactions_store, table_store, _) = build_objects();
-        let stats = Arc::new(StatRegistry::new());
+        let db_metrics = crate::db_metrics::DbMetrics::new(None);
 
         let gc_opts = GarbageCollectorOptions {
             manifest_options: Some(GarbageCollectorDirectoryOptions {
@@ -1447,12 +1610,13 @@ mod tests {
             compactions_store.clone(),
             table_store.clone(),
             gc_opts,
-            stats.clone(),
+            &db_metrics,
             Arc::new(DefaultSystemClock::default()),
         );
         let (_, rx) = mpsc::unbounded_channel();
         let clock = Arc::new(DefaultSystemClock::default());
-        let executor = MessageHandlerExecutor::new(WatchableOnceCell::new(), clock);
+        let executor =
+            MessageHandlerExecutor::new(ClosedResultWriter::new(WatchableOnceCell::new()), clock);
         executor
             .add_handler(
                 "garbage_collector".to_string(),

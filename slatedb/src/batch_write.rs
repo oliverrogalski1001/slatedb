@@ -38,17 +38,23 @@ use crate::config::WriteOptions;
 use crate::dispatcher::MessageHandler;
 use crate::types::RowEntry;
 use crate::utils::WatchableOnceCellReader;
-use crate::{batch::WriteBatch, db::DbInner, error::SlateDBError};
+use crate::{batch::WriteBatch, db::DbInner, db::WriteHandle, error::SlateDBError};
 use slatedb_common::clock::SystemClock;
 
 pub(crate) const WRITE_BATCH_TASK_NAME: &str = "writer";
 
+pub(crate) type WriteBatchResult = Result<
+    (
+        WriteHandle,
+        WatchableOnceCellReader<Result<(), SlateDBError>>,
+    ),
+    SlateDBError,
+>;
+
 pub(crate) struct WriteBatchMessage {
     pub(crate) batch: WriteBatch,
     pub(crate) options: WriteOptions,
-    pub(crate) done: tokio::sync::oneshot::Sender<
-        Result<WatchableOnceCellReader<Result<(), SlateDBError>>, SlateDBError>,
-    >,
+    pub(crate) done: tokio::sync::oneshot::Sender<WriteBatchResult>,
 }
 
 impl std::fmt::Debug for WriteBatchMessage {
@@ -87,13 +93,15 @@ impl MessageHandler<WriteBatchMessage> for WriteBatchEventHandler {
         // if this is the first write and the WAL is disabled, make sure users are flushing
         // their memtables in a timely manner.
         if self.is_first_write && !self.db_inner.wal_enabled && options.await_durable {
-            self.is_first_write = false;
-            let this_watcher = result.clone()?;
-            let this_clock = self.db_inner.system_clock.clone();
-            tokio::spawn(async move {
-                monitor_first_write(this_watcher, this_clock).await;
-            });
+            if let Ok((_, this_watcher)) = &result {
+                let this_watcher = this_watcher.clone();
+                let this_clock = self.db_inner.system_clock.clone();
+                tokio::spawn(async move {
+                    monitor_first_write(this_watcher, this_clock).await;
+                });
+            }
         }
+        self.is_first_write = false;
         _ = done.send(result);
         Ok(())
     }
@@ -114,18 +122,14 @@ impl MessageHandler<WriteBatchMessage> for WriteBatchEventHandler {
 impl DbInner {
     #[allow(clippy::panic)]
     #[instrument(level = "trace", skip_all, fields(batch_size = batch.ops.len()))]
-    async fn write_batch(
-        &self,
-        batch: WriteBatch,
-        options: &WriteOptions,
-    ) -> Result<WatchableOnceCellReader<Result<(), SlateDBError>>, SlateDBError> {
+    async fn write_batch(&self, batch: WriteBatch, options: &WriteOptions) -> WriteBatchResult {
         let _options = options;
         #[cfg(not(dst))]
         let now = self.mono_clock.now().await?;
         #[cfg(dst)]
         // Force the current timestamp for DST operations. See #719 for details.
         let now = options.now;
-        let commit_seq = self.oracle.last_seq.next();
+        let commit_seq = self.oracle.next_seq();
 
         // Check for transaction conflicts before proceeding with the write batch
         // if this batch is part of a transaction.
@@ -140,7 +144,7 @@ impl DbInner {
                 commit_seq,
                 now,
                 self.settings.default_ttl,
-                self.settings.merge_operator.clone(),
+                self.reader.merge_operator.clone(),
             )
             .await?;
 
@@ -165,7 +169,7 @@ impl DbInner {
         // and flushed to the remote storage, WAL buffer manager will recycle these WAL entries.
         self.wal_buffer.track_last_applied_seq(commit_seq);
 
-        // insert a fail point for easier to test the case where the last_committed_seq is not updated.
+        // insert a fail point to make it easier to test the case where the last_committed_seq is not updated.
         // this is useful for testing the case where the reader is not able to see the writes.
         fail_point!(
             Arc::clone(&self.fp_registry),
@@ -184,8 +188,16 @@ impl DbInner {
                 .track_recent_committed_write_batch(&write_keys, commit_seq);
         }
 
-        // update the last_committed_seq, so the writes will be visible to the readers.
-        self.oracle.last_committed_seq.store(commit_seq);
+        // insert a fail point to make it easier to test the case where the transaction is committed but
+        // but remaining work hasn't been done. this is useful for testing that transaction commits and
+        // commited seqnums get updated in lock-step. See #1301 for details.
+        fail_point!(
+            Arc::clone(&self.fp_registry),
+            "write-batch-post-commit",
+            |_| { Err(SlateDBError::from(std::io::Error::other("oops"))) }
+        );
+
+        // record the memtable sequence in the memtable's sequence tracker.
         self.record_memtable_sequence(commit_seq);
 
         // maybe freeze the memtable.
@@ -195,7 +207,9 @@ impl DbInner {
             self.maybe_freeze_memtable(&mut guard, last_flushed_wal_id)?;
         }
 
-        Ok(durable_watcher)
+        let write_handle = WriteHandle::new(commit_seq, now);
+
+        Ok((write_handle, durable_watcher))
     }
 
     /// Write entries to the currently active memtable. Returns a durable watcher for the memtable.
@@ -228,5 +242,43 @@ async fn monitor_first_write(
             is reached. If writer is single threaded or has low throughput, the \
             applications must call `flush` to ensure durability in a timely manner.");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object_store::memory::InMemory;
+    use crate::Db;
+
+    #[tokio::test]
+    async fn test_is_first_write_set_false_after_first_write() {
+        let object_store = Arc::new(InMemory::new());
+        let db = Db::open(
+            "/tmp/test_is_first_write_set_false_after_first_write",
+            object_store,
+        )
+        .await
+        .unwrap();
+
+        let mut handler = WriteBatchEventHandler::new(db.inner.clone());
+        assert!(handler.is_first_write);
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"key", b"value");
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        handler
+            .handle(WriteBatchMessage {
+                batch,
+                options: WriteOptions::default(),
+                done: done_tx,
+            })
+            .await
+            .unwrap();
+
+        let result = done_rx.await.unwrap();
+        assert!(result.is_ok());
+        assert!(!handler.is_first_write);
     }
 }

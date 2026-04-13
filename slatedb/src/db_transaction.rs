@@ -9,8 +9,11 @@ use crate::batch::WriteBatch;
 use crate::bytes_range::BytesRange;
 use crate::config::{MergeOptions, PutOptions, ReadOptions, ScanOptions, WriteOptions};
 use crate::db::DbInner;
+use crate::db::WriteHandle;
 use crate::db_iter::{DbIterator, DbIteratorRangeTracker};
+use crate::error::SlateDBError;
 use crate::transaction_manager::{IsolationLevel, TransactionManager};
+use crate::types::KeyValue;
 use crate::DbRead;
 
 /// A database transaction that provides atomic read-write operations with
@@ -73,10 +76,9 @@ impl DbTransaction {
     pub(crate) fn new(
         db_inner: Arc<DbInner>,
         txn_manager: Arc<TransactionManager>,
-        seq: u64,
         isolation_level: IsolationLevel,
     ) -> Self {
-        let txn_id = txn_manager.new_txn(seq, false); // false = not read-only
+        let (txn_id, seq) = txn_manager.new_transaction();
 
         Self {
             txn_id,
@@ -116,6 +118,26 @@ impl DbTransaction {
         key: K,
         options: &ReadOptions,
     ) -> Result<Option<Bytes>, crate::Error> {
+        self.get_key_value_with_options(key, options)
+            .await
+            .map(|kv_opt| kv_opt.map(|kv| kv.value))
+    }
+
+    /// Get a key-value pair from the transaction with default read options.
+    pub async fn get_key_value<K: AsRef<[u8]> + Send>(
+        &self,
+        key: K,
+    ) -> Result<Option<KeyValue>, crate::Error> {
+        self.get_key_value_with_options(key, &ReadOptions::default())
+            .await
+    }
+
+    /// Get a key-value pair from the transaction with custom read options.
+    pub async fn get_key_value_with_options<K: AsRef<[u8]> + Send>(
+        &self,
+        key: K,
+        options: &ReadOptions,
+    ) -> Result<Option<KeyValue>, crate::Error> {
         self.db_inner.status()?;
 
         // Track read key for SSI conflict detection if needed
@@ -132,9 +154,10 @@ impl DbTransaction {
         let write_batch_cloned = self.write_batch.read().clone();
 
         // For now, delegate to the underlying reader
-        self.db_inner
+        let kv = self
+            .db_inner
             .reader
-            .get_with_options(
+            .get_key_value_with_options(
                 key,
                 options,
                 &db_state,
@@ -142,7 +165,8 @@ impl DbTransaction {
                 Some(self.started_seq),
             )
             .await
-            .map_err(Into::into)
+            .map_err(crate::Error::from)?;
+        Ok(kv)
     }
 
     /// Scan a range of keys using the default scan options.
@@ -441,11 +465,15 @@ impl DbTransaction {
     /// immediately without any database interaction. Since it's impossible to have read-write
     /// conflict, neither write-write conflict for an empty write batch.
     ///
+    /// ## Returns
+    /// - `Ok(Some(WriteHandle))` if the commit is successful and there are writes in the batch.
+    /// - `Ok(None)` if the commit is successful but the write batch is empty (no-op).
+    ///
     /// ## Errors
     /// - Returns `Error` if the commit operation fails, which could be due to:
     ///   - Database I/O errors
     ///   - Concurrency conflicts detected during WriteBatch processing
-    pub async fn commit(self) -> Result<(), crate::Error> {
+    pub async fn commit(self) -> Result<Option<WriteHandle>, crate::Error> {
         self.commit_with_options(&WriteOptions::default()).await
     }
 
@@ -457,16 +485,20 @@ impl DbTransaction {
     /// ## Arguments
     /// - `options`: the write options to use for the commit
     ///
+    /// ## Returns
+    /// - `Ok(Some(WriteHandle))` if the commit is successful and there are writes in the batch.
+    /// - `Ok(None)` if the commit is successful but the write batch is empty (no-op).
+    ///
     /// ## Errors
     /// - Returns `Error` if the commit operation fails, which could be due to:
     ///   - Database I/O errors
     ///   - Concurrency conflicts detected during WriteBatch processing
-    pub async fn commit_with_options(self, options: &WriteOptions) -> Result<(), crate::Error> {
-        // If the WriteBatch is empty, it's a no-op. it's impossible to have read-write
-        // conflict, neither write-write conflict.
-        if self.write_batch.read().is_empty() {
-            return Ok(());
-        }
+    pub async fn commit_with_options(
+        self,
+        options: &WriteOptions,
+    ) -> Result<Option<WriteHandle>, crate::Error> {
+        // Take the write_batch for submission to the database.
+        let write_batch = self.write_batch.read().clone();
 
         // Extract actual scanned ranges from trackers for SSI conflict detection
         if self.isolation_level == IsolationLevel::SerializableSnapshot {
@@ -479,8 +511,16 @@ impl DbTransaction {
             }
         }
 
-        // Take the write_batch for submission to the database.
-        let write_batch = self.write_batch.read().clone();
+        // If the WriteBatch is empty, it's a no-op or read-only batch.
+        if write_batch.is_empty() {
+            // Check for read conflicts before returning Ok(None).
+            if let Some(txn_id) = write_batch.txn_id.as_ref() {
+                if self.txn_manager.check_has_conflict(txn_id) {
+                    return Err(SlateDBError::TransactionConflict.into());
+                }
+            }
+            return Ok(None);
+        }
 
         // Track only write keys that were not explicitly unmarked.
         let tracked_write_keys = {
@@ -501,6 +541,7 @@ impl DbTransaction {
         self.db_inner
             .write_with_options(write_batch, options)
             .await
+            .map(Some)
             .map_err(Into::into)
     }
 
@@ -508,6 +549,19 @@ impl DbTransaction {
     /// This is automatically called when the transaction is dropped.
     pub fn rollback(self) {
         // do nothing, trigger the Drop of the transaction
+    }
+
+    /// Get the sequence number this transaction was started at. This is equivalent to
+    /// the snapshot sequence number for this transaction, which determines data visibility
+    /// for reads in this transaction.
+    pub fn seqnum(&self) -> u64 {
+        self.started_seq
+    }
+
+    /// Get the transaction ID. This is a unique identifier for this transaction, generated
+    /// by the transaction manager.
+    pub fn id(&self) -> Uuid {
+        self.txn_id
     }
 }
 
@@ -519,6 +573,14 @@ impl DbRead for DbTransaction {
         options: &ReadOptions,
     ) -> Result<Option<Bytes>, crate::Error> {
         self.get_with_options(key, options).await
+    }
+
+    async fn get_key_value_with_options<K: AsRef<[u8]> + Send>(
+        &self,
+        key: K,
+        options: &ReadOptions,
+    ) -> Result<Option<KeyValue>, crate::Error> {
+        self.get_key_value_with_options(key, options).await
     }
 
     async fn scan_with_options<K, T>(
@@ -986,8 +1048,8 @@ mod tests {
     )]
     #[case::si_concurrent_read_snapshot(
         TransactionTestCase {
-            name: "ssi_concurrent_read_snapshot",
-            isolation_level: IsolationLevel::SerializableSnapshot,
+            name: "si_concurrent_read_snapshot",
+            isolation_level: IsolationLevel::Snapshot,
             initial_data: vec![(Bytes::from("k1"), Bytes::from("v1"))],
             operations: vec![
                 TransactionTestOp::DbPut(Bytes::from("k1"), Bytes::from("v2")),
@@ -1206,6 +1268,65 @@ mod tests {
             ]
         }
     )]
+    #[case::ssi_mark_read_conflict_without_write(
+        TransactionTestCase {
+            name: "ssi_mark_read_conflict_without_write",
+            isolation_level: IsolationLevel::SerializableSnapshot,
+            initial_data: vec![(Bytes::from("k1"), Bytes::from("v1"))],
+            operations: vec![
+                TransactionTestOp::TxnMarkRead(Bytes::from("k1")),
+                TransactionTestOp::DbPut(Bytes::from("k1"), Bytes::from("v2")),
+                TransactionTestOp::TxnCommit,
+            ],
+            expected_results: vec![
+                TransactionTestOpResult::Empty,
+                TransactionTestOpResult::Empty,
+                TransactionTestOpResult::Conflicted,
+            ]
+        }
+    )]
+    #[case::ssi_get_conflict_without_write(
+        TransactionTestCase {
+            name: "ssi_get_conflict_without_write",
+            isolation_level: IsolationLevel::SerializableSnapshot,
+            initial_data: vec![(Bytes::from("k1"), Bytes::from("v1"))],
+            operations: vec![
+                TransactionTestOp::TxnGet(Bytes::from("k1")),
+                TransactionTestOp::DbPut(Bytes::from("k1"), Bytes::from("v2")),
+                TransactionTestOp::TxnCommit,
+            ],
+            expected_results: vec![
+                TransactionTestOpResult::Got(Some(Bytes::from("v1"))),
+                TransactionTestOpResult::Empty,
+                TransactionTestOpResult::Conflicted,
+            ]
+        }
+    )]
+    #[case::ssi_scan_conflict_without_write(
+        TransactionTestCase {
+            name: "ssi_scan_conflict_without_write",
+            isolation_level: IsolationLevel::SerializableSnapshot,
+            initial_data: vec![
+                (Bytes::from("k1"), Bytes::from("v1")),
+                (Bytes::from("k2"), Bytes::from("v2")),
+                (Bytes::from("k3"), Bytes::from("v3")),
+            ],
+            operations: vec![
+                TransactionTestOp::TxnScan(Bytes::from("k1"), Bytes::from("k3")),
+                TransactionTestOp::DbPut(Bytes::from("k2"), Bytes::from("v2_new")),
+                TransactionTestOp::TxnCommit,
+            ],
+            expected_results: vec![
+                TransactionTestOpResult::Scanned(vec![
+                    Bytes::from("k1"),
+                    Bytes::from("k2"),
+                    Bytes::from("k3"),
+                ]),
+                TransactionTestOpResult::Empty,
+                TransactionTestOpResult::Conflicted,
+            ]
+        }
+    )]
     #[case::si_mark_read_conflict(
         TransactionTestCase {
             name: "si_mark_read_conflict",
@@ -1386,33 +1507,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mark_read_no_conflict_without_write_in_ssi() {
-        // This test verifies that mark_read() doesn't cause conflict if the transaction is read-only (no writes).
-        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = crate::Db::open("test_mark_read_no_write", object_store)
-            .await
-            .unwrap();
-
-        db.put(b"k1", b"v1").await.unwrap();
-
-        let txn = db
-            .begin(IsolationLevel::SerializableSnapshot)
-            .await
-            .unwrap();
-        txn.mark_read([b"k1"]).unwrap();
-
-        // Another transaction modifies k1
-        db.put(b"k1", b"v2").await.unwrap();
-
-        // Transaction commits without any writes - should succeed
-        let result = txn.commit().await;
-        assert!(
-            result.is_ok(),
-            "Read-only transaction should not conflict even if read key was modified"
-        );
-    }
-
-    #[tokio::test]
     async fn test_mark_read_multiple_keys_at_once() {
         // This test verifies that mark_read() can track multiple keys in one call
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -1563,5 +1657,108 @@ mod tests {
         let value = db.get(b"counter").await.unwrap().unwrap();
         let total = u64::from_le_bytes(value.as_ref().try_into().unwrap());
         assert_eq!(total, EXPECTED);
+    }
+
+    fn test_db_options(
+        min_filter_keys: u32,
+        l0_sst_size_bytes: usize,
+        compactor_options: Option<crate::config::CompactorOptions>,
+    ) -> crate::config::Settings {
+        crate::config::Settings {
+            flush_interval: None,
+            #[cfg(feature = "wal_disable")]
+            wal_enabled: true,
+            manifest_poll_interval: std::time::Duration::from_secs(3600),
+            manifest_update_timeout: std::time::Duration::from_secs(300),
+            max_unflushed_bytes: 134_217_728,
+            l0_max_ssts: 8,
+            min_filter_keys,
+            filter_bits_per_key: 10,
+            l0_sst_size_bytes,
+            compactor_options,
+            compression_codec: None,
+            object_store_cache_options: crate::config::ObjectStoreCacheOptions::default(),
+            garbage_collector_options: None,
+            default_ttl: None,
+            block_format: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_txn_commit_returns_write_handle() {
+        use slatedb_common::clock::MockSystemClock;
+
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_txn_commit_returns_write_handle";
+        let clock = Arc::new(MockSystemClock::new());
+        let db = crate::Db::builder(path, object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .with_system_clock(clock.clone())
+            .build()
+            .await
+            .unwrap();
+
+        // Basic put
+        clock.set(100);
+        let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        txn.put(b"key1", b"value1").unwrap();
+        let handle = txn
+            .commit_with_options(&WriteOptions {
+                await_durable: false,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle.seqnum(), 1);
+        assert_eq!(handle.create_ts(), 100);
+
+        // Put with options (TTL)
+        clock.set(200);
+        let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let put_opts = PutOptions {
+            ttl: crate::config::Ttl::ExpireAfter(1000),
+        };
+        txn.put_with_options(b"key2", b"value2", &put_opts).unwrap();
+        let handle = txn
+            .commit_with_options(&WriteOptions {
+                await_durable: false,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle.seqnum(), 2);
+        assert_eq!(handle.create_ts(), 200);
+
+        // Delete
+        clock.set(300);
+        let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        txn.delete(b"key1").unwrap();
+        let handle = txn
+            .commit_with_options(&WriteOptions {
+                await_durable: false,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle.seqnum(), 3);
+        assert_eq!(handle.create_ts(), 300);
+    }
+
+    #[tokio::test]
+    async fn test_txn_commit_with_options_empty_batch_returns_none() {
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = crate::Db::open("test_txn_commit_with_options_empty_batch", object_store)
+            .await
+            .unwrap();
+
+        let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let result = txn
+            .commit_with_options(&WriteOptions {
+                await_durable: false,
+            })
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
     }
 }

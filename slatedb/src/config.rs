@@ -185,16 +185,12 @@ use log::warn;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 use std::{str::FromStr, time::Duration};
 use uuid::Uuid;
 
 use crate::error::SlateDBError;
 
-use crate::db_cache::DbCache;
-use crate::format::sst::BlockTransformer;
 use crate::garbage_collector::{DEFAULT_INTERVAL, DEFAULT_MIN_AGE};
-use crate::merge_operator::MergeOperatorType;
 
 /// Enum representing different levels of cache preloading on startup
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
@@ -273,9 +269,6 @@ pub struct ReadOptions {
     pub dirty: bool,
     /// Whether or not fetched blocks should be cached
     pub cache_blocks: bool,
-    #[cfg(dst)]
-    /// Force the current timestamp for DST operations. See #719 for details.
-    pub now: i64,
 }
 
 impl Default for ReadOptions {
@@ -284,8 +277,6 @@ impl Default for ReadOptions {
             durability_filter: DurabilityLevel::default(),
             dirty: false,
             cache_blocks: true,
-            #[cfg(dst)]
-            now: 0,
         }
     }
 }
@@ -331,9 +322,6 @@ pub struct ScanOptions {
     /// The maximum number of concurrent tasks for fetching blocks during scans.
     /// Higher values can improve throughput but use more resources. The default is 1.
     pub max_fetch_tasks: usize,
-    #[cfg(dst)]
-    /// Force the current timestamp for DST operations. See #719 for details.
-    pub now: i64,
 }
 
 impl Default for ScanOptions {
@@ -345,8 +333,6 @@ impl Default for ScanOptions {
             read_ahead_bytes: 1,
             cache_blocks: false,
             max_fetch_tasks: 1,
-            #[cfg(dst)]
-            now: 0,
         }
     }
 }
@@ -460,6 +446,7 @@ impl PutOptions {
             },
             Ttl::NoExpiry => None,
             Ttl::ExpireAfter(ttl) => Self::checked_expire_ts(now, ttl),
+            Ttl::ExpireAt(ts) => Some(ts),
         }
     }
 
@@ -497,6 +484,7 @@ impl MergeOptions {
             },
             Ttl::NoExpiry => None,
             Ttl::ExpireAfter(ttl) => Self::checked_expire_ts(now, ttl),
+            Ttl::ExpireAt(ts) => Some(ts),
         }
     }
 
@@ -521,15 +509,15 @@ pub enum Ttl {
     Default,
     NoExpiry,
     ExpireAfter(u64),
+    ExpireAt(i64),
 }
 
 /// Defines the scope targeted by a given checkpoint. If set to All, then the checkpoint will
-/// include all writes that were issued at the time that create_checkpoint is called. If force_flush
-/// is true, then SlateDB will force the current wal, or memtable if wal_enabled is false, to flush
-/// its data. Otherwise, the database will wait for the current wal or memtable to be flushed due to
-/// flush_interval or reaching l0_sst_size_bytes, respectively. If set to Durable, then the
-/// checkpoint includes only writes that were durable at the time of the call. This will be faster,
-/// but may not include data from recent writes.
+/// include all writes that were issued at the time that create_checkpoint is called. SlateDB will
+/// flush WALs (if enabled) and do a best-effort flush of memtables to L0 SSTs in order to
+/// optimize for readers. The memtable flush will not await if blocked by backpressure. If set
+/// to Durable, then the checkpoint includes only writes that were durable at the time of the
+/// call. This will be faster, but may not include data from recent writes.
 #[non_exhaustive]
 #[derive(Debug, Copy, Clone)]
 pub enum CheckpointScope {
@@ -559,6 +547,9 @@ pub struct CheckpointOptions {
 ///
 /// This is separate from components (like block_cache, clock, etc.) which are responsible
 /// for performing the work in the database.
+///
+/// Note: `compactor_options` is mutually exclusive with `DbBuilder::with_compactor_builder`.
+/// Setting both will result in an error.
 ///
 /// For backward compatibility, DBOptions is a type alias for Settings.
 #[derive(Clone, Deserialize, Serialize)]
@@ -671,13 +662,11 @@ pub struct Settings {
     /// Default: no TTL (insertions will remain until deleted)
     pub default_ttl: Option<u64>,
 
-    /// The merge operator to use for the database. If not set, the database will not support merge operations.
-    ///
-    /// The merge operator allows applications to bypass the traditional read/modify/write cycle
-    /// by expressing partial updates using an associative operator. Merge operands are combined
-    /// during reads and compactions to produce the final result.
+    /// The block format for SST files. This is only available in tests
+    /// to verify backward compatibility between V1 and V2 formats.
+    #[cfg(test)]
     #[serde(skip)]
-    pub merge_operator: Option<MergeOperatorType>,
+    pub block_format: Option<crate::sst_builder::BlockFormat>,
 }
 
 // Implement Debug manually for DbOptions.
@@ -705,15 +694,7 @@ impl std::fmt::Debug for Settings {
             )
             .field("garbage_collector_options", &self.garbage_collector_options)
             .field("filter_bits_per_key", &self.filter_bits_per_key)
-            .field("default_ttl", &self.default_ttl)
-            .field(
-                "merge_operator",
-                &self
-                    .merge_operator
-                    .as_ref()
-                    .map(|_| "Some(merge_operator)")
-                    .unwrap_or("None"),
-            );
+            .field("default_ttl", &self.default_ttl);
         data.finish()
     }
 }
@@ -905,10 +886,11 @@ impl Default for Settings {
             compactor_options: Some(CompactorOptions::default()),
             compression_codec: None,
             object_store_cache_options: ObjectStoreCacheOptions::default(),
-            garbage_collector_options: None,
+            garbage_collector_options: Some(GarbageCollectorOptions::default()),
             filter_bits_per_key: 10,
             default_ttl: None,
-            merge_operator: None,
+            #[cfg(test)]
+            block_format: None,
         }
     }
 }
@@ -931,21 +913,17 @@ pub struct DbReaderOptions {
     /// Defaults to 64MB
     pub max_memtable_bytes: u64,
 
-    #[serde(skip)]
-    pub block_cache: Option<Arc<dyn DbCache>>,
-
-    #[serde(skip)]
-    pub merge_operator: Option<MergeOperatorType>,
-
-    /// An optional block transformer for custom encoding/decoding of blocks.
-    /// Can be used for encryption, custom encoding, etc.
-    #[serde(skip)]
-    pub block_transformer: Option<Arc<dyn BlockTransformer>>,
+    /// Options for the local disk cache. If `root_folder` is set, the reader
+    /// will wrap its object store in a `CachedObjectStore` backed by the
+    /// local filesystem, mirroring the behaviour of `Db`.
+    pub object_store_cache_options: ObjectStoreCacheOptions,
 
     /// When true, skip WAL replay entirely. The reader will only see data that has been
     /// compacted into L0 or lower levels. This is useful for read-heavy workloads that
     /// don't need to see the most recent uncommitted writes and want to minimize the
     /// cost of opening many readers.
+    ///
+    /// WAL replay is also skipped when the reader is opened from a checkpoint.
     ///
     /// When combined with manifest polling (no explicit checkpoint), the reader will
     /// still see newly compacted data as manifests are updated.
@@ -960,60 +938,10 @@ impl Default for DbReaderOptions {
             manifest_poll_interval: Duration::from_secs(10),
             checkpoint_lifetime: Duration::from_secs(10 * 60),
             max_memtable_bytes: 64 * 1024 * 1024,
-            block_cache: default_block_cache(),
-            merge_operator: None,
-            block_transformer: None,
+            object_store_cache_options: ObjectStoreCacheOptions::default(),
             skip_wal_replay: false,
         }
     }
-}
-
-#[allow(unreachable_code)]
-pub(crate) fn default_block_cache() -> Option<Arc<dyn DbCache>> {
-    #[cfg(feature = "moka")]
-    {
-        return Some(Arc::new(crate::db_cache::moka::MokaCache::new_with_opts(
-            crate::db_cache::moka::MokaCacheOptions {
-                max_capacity: crate::db_cache::DEFAULT_BLOCK_CACHE_CAPACITY,
-                time_to_live: None,
-                time_to_idle: None,
-            },
-        )));
-    }
-    #[cfg(feature = "foyer")]
-    {
-        return Some(Arc::new(crate::db_cache::foyer::FoyerCache::new_with_opts(
-            crate::db_cache::foyer::FoyerCacheOptions {
-                max_capacity: crate::db_cache::DEFAULT_BLOCK_CACHE_CAPACITY,
-                ..Default::default()
-            },
-        )));
-    }
-    None
-}
-
-#[allow(unreachable_code)]
-pub(crate) fn default_meta_cache() -> Option<Arc<dyn DbCache>> {
-    #[cfg(feature = "moka")]
-    {
-        return Some(Arc::new(crate::db_cache::moka::MokaCache::new_with_opts(
-            crate::db_cache::moka::MokaCacheOptions {
-                max_capacity: crate::db_cache::DEFAULT_META_CACHE_CAPACITY,
-                time_to_live: None,
-                time_to_idle: None,
-            },
-        )));
-    }
-    #[cfg(feature = "foyer")]
-    {
-        return Some(Arc::new(crate::db_cache::foyer::FoyerCache::new_with_opts(
-            crate::db_cache::foyer::FoyerCacheOptions {
-                max_capacity: crate::db_cache::DEFAULT_META_CACHE_CAPACITY,
-                ..Default::default()
-            },
-        )));
-    }
-    None
 }
 
 /// The compression algorithm to use for SSTables.
@@ -1207,16 +1135,24 @@ impl From<SizeTieredCompactionSchedulerOptions> for HashMap<String, String> {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GarbageCollectorOptions {
     /// Garbage collection options for the manifest directory.
+    ///
+    /// None means garbage collection is disabled for the manifest directory.
     pub manifest_options: Option<GarbageCollectorDirectoryOptions>,
 
     /// Garbage collection options for the WAL directory.
+    ///
+    /// None means garbage collection is disabled for the WAL directory.
     pub wal_options: Option<GarbageCollectorDirectoryOptions>,
 
     /// Garbage collection options for the compacted directory.
+    ///
+    /// None means garbage collection is disabled for the compacted directory.
     pub compacted_options: Option<GarbageCollectorDirectoryOptions>,
 
     /// Garbage collection options for the compactions directory, which
     /// contains compactor job state `.compactions` files.
+    ///
+    /// None means garbage collection is disabled for the compactions directory.
     pub compactions_options: Option<GarbageCollectorDirectoryOptions>,
 }
 
@@ -1229,6 +1165,10 @@ impl GarbageCollectorOptions {
     }
 }
 
+/// Default options for the garbage collector for a directory.
+///
+/// By default, the garbage collector will run every minute and deletes files
+/// that are at least 5 minutes old.
 impl Default for GarbageCollectorDirectoryOptions {
     fn default() -> Self {
         Self {
@@ -1241,8 +1181,12 @@ impl Default for GarbageCollectorDirectoryOptions {
 /// Garbage collector options for a directory.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct GarbageCollectorDirectoryOptions {
-    /// The interval at which the garbage collector will run
-    /// in the background thread.
+    /// The interval at which the garbage collector will run in the background
+    /// thread.
+    ///
+    /// If set to None, recurring garbage collection will be disabled for the
+    /// directory, but one-time garbage collection can still be triggered
+    /// [`crate::garbage_collector::GarbageCollector::run_gc_once`].
     #[serde(deserialize_with = "deserialize_option_duration")]
     #[serde(serialize_with = "serialize_option_duration")]
     pub interval: Option<Duration>,
@@ -1253,18 +1197,21 @@ pub struct GarbageCollectorDirectoryOptions {
     pub min_age: Duration,
 }
 
-/// Default options for the garbage collector. The default options are:
-/// * Manifest options: interval of 60 seconds, min age of 1 day
-/// * WAL options: interval of 60 seconds, min age of 1 minute
-/// * Compacted options: interval of 60 seconds, min age of 1 day
-/// * Compactions options: interval of 60 seconds, min age of 1 day
+/// Default options for the garbage collector.
+///
+/// By default, garbage collection is enabled for all managed directories
+/// (manifest, WAL, compacted SSTs, and compactions) using
+/// [`GarbageCollectorDirectoryOptions::default()`].
+///
+/// To disable garbage collection for a specific file type, set that
+/// directory option to `None`.
 impl Default for GarbageCollectorOptions {
     fn default() -> Self {
         Self {
-            manifest_options: None,
-            wal_options: None,
-            compacted_options: None,
-            compactions_options: None,
+            manifest_options: Some(GarbageCollectorDirectoryOptions::default()),
+            wal_options: Some(GarbageCollectorDirectoryOptions::default()),
+            compacted_options: Some(GarbageCollectorDirectoryOptions::default()),
+            compactions_options: Some(GarbageCollectorDirectoryOptions::default()),
         }
     }
 }
@@ -1542,5 +1489,79 @@ object_store_cache_options:
         assert_eq!(roundtripped.min_compaction_sources, 3);
         assert_eq!(roundtripped.max_compaction_sources, 9);
         assert_eq!(roundtripped.include_size_threshold, 7.0);
+    }
+
+    #[test]
+    fn should_return_exact_timestamp_for_put_expire_at() {
+        // given
+        let opts = PutOptions {
+            ttl: Ttl::ExpireAt(12345),
+        };
+
+        // when
+        let expire_ts = opts.expire_ts_from(None, 100);
+
+        // then
+        assert_eq!(expire_ts, Some(12345));
+    }
+
+    #[test]
+    fn should_ignore_default_ttl_for_put_expire_at() {
+        // given
+        let opts = PutOptions {
+            ttl: Ttl::ExpireAt(12345),
+        };
+
+        // when
+        let expire_ts = opts.expire_ts_from(Some(9999), 100);
+
+        // then
+        assert_eq!(expire_ts, Some(12345));
+    }
+
+    #[test]
+    fn should_allow_past_timestamp_for_put_expire_at() {
+        // given
+        let opts = PutOptions {
+            ttl: Ttl::ExpireAt(50),
+        };
+
+        // when
+        let expire_ts = opts.expire_ts_from(None, 100);
+
+        // then: past timestamp is allowed (entry will expire on next read/compaction)
+        assert_eq!(expire_ts, Some(50));
+    }
+
+    #[test]
+    fn should_return_exact_timestamp_for_merge_expire_at() {
+        // given
+        let opts = MergeOptions {
+            ttl: Ttl::ExpireAt(12345),
+        };
+
+        // when
+        let expire_ts = opts.expire_ts_from(None, 100);
+
+        // then
+        assert_eq!(expire_ts, Some(12345));
+    }
+
+    #[test]
+    fn should_return_deterministic_expire_ts_for_expire_at() {
+        // given: same ExpireAt value used at different times
+        let opts = PutOptions {
+            ttl: Ttl::ExpireAt(99999),
+        };
+
+        // when
+        let ts1 = opts.expire_ts_from(None, 100);
+        let ts2 = opts.expire_ts_from(None, 200);
+        let ts3 = opts.expire_ts_from(None, 300);
+
+        // then: all return the same absolute timestamp regardless of `now`
+        assert_eq!(ts1, Some(99999));
+        assert_eq!(ts2, Some(99999));
+        assert_eq!(ts3, Some(99999));
     }
 }

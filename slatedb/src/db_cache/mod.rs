@@ -20,8 +20,9 @@ use log::{debug, error, trace};
 use parking_lot::Mutex;
 
 use crate::db_cache::stats::DbCacheStats;
+use crate::db_metrics::DbMetrics;
 use crate::format::block::Block;
-use crate::stats::StatRegistry;
+use crate::sst_stats::SstStats;
 use crate::{db_state::SsTableId, filter::BloomFilter, flatbuffer_types::SsTableIndexOwned};
 use slatedb_common::clock::SystemClock;
 
@@ -98,6 +99,11 @@ static NEXT_CACHE_SCOPE_ID: AtomicU64 = AtomicU64::new(0);
 ///         Ok(guard.data.get(key).cloned())
 ///     }
 ///
+///     async fn get_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, Error> {
+///         let guard = self.inner.lock().unwrap();
+///         Ok(guard.data.get(key).cloned())
+///     }
+///
 ///     async fn insert(&self, key: CachedKey, value: CachedEntry) {
 ///         let mut guard = self.inner.lock().unwrap();
 ///         guard.usage += value.size() as u64;
@@ -124,7 +130,7 @@ static NEXT_CACHE_SCOPE_ID: AtomicU64 = AtomicU64::new(0);
 ///     let object_store = Arc::new(InMemory::new());
 ///     let cache = Arc::new(MyCache::new(128u64 * 1024 * 1024));
 ///     let db = Db::builder("/path/to/db", object_store)
-///         .with_memory_cache(cache)
+///         .with_db_cache(cache)
 ///         .build()
 ///         .await;
 /// }
@@ -134,6 +140,7 @@ pub trait DbCache: Send + Sync {
     async fn get_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error>;
     async fn get_index(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error>;
     async fn get_filter(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error>;
+    async fn get_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error>;
     async fn insert(&self, key: CachedKey, value: CachedEntry);
     #[allow(dead_code)]
     async fn remove(&self, key: &CachedKey);
@@ -184,6 +191,7 @@ enum CachedItem {
     Block(Arc<Block>),
     SsTableIndex(Arc<SsTableIndexOwned>),
     BloomFilter(Arc<BloomFilter>),
+    SstStats(Arc<SstStats>),
 }
 
 /// A cached entry stored in the cache.
@@ -218,6 +226,13 @@ impl CachedEntry {
         }
     }
 
+    /// Create a new `CachedEntry` with the given SST stats.
+    pub(crate) fn with_sst_stats(stats: Arc<SstStats>) -> Self {
+        Self {
+            item: CachedItem::SstStats(stats),
+        }
+    }
+
     pub(crate) fn block(&self) -> Option<Arc<Block>> {
         match &self.item {
             CachedItem::Block(block) => Some(block.clone()),
@@ -239,6 +254,13 @@ impl CachedEntry {
         }
     }
 
+    pub(crate) fn sst_stats(&self) -> Option<Arc<SstStats>> {
+        match &self.item {
+            CachedItem::SstStats(stats) => Some(stats.clone()),
+            _ => None,
+        }
+    }
+
     /// Returns the size of the cached entry in bytes.
     ///
     /// This method is public to allow external cache implementations
@@ -248,6 +270,7 @@ impl CachedEntry {
             CachedItem::Block(block) => block.size(),
             CachedItem::SsTableIndex(sst_index) => sst_index.size(),
             CachedItem::BloomFilter(bloom_filter) => bloom_filter.size(),
+            CachedItem::SstStats(stats) => stats.size(),
         }
     }
 
@@ -259,6 +282,9 @@ impl CachedEntry {
             }
             CachedItem::BloomFilter(bloom_filter) => {
                 Self::with_bloom_filter(Arc::new(bloom_filter.clamp_allocated_size()))
+            }
+            CachedItem::SstStats(stats) => {
+                Self::with_sst_stats(Arc::new(stats.clamp_allocated_size()))
             }
         }
     }
@@ -326,6 +352,14 @@ impl DbCache for SplitCache {
         }
     }
 
+    async fn get_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        if let Some(cache) = &self.meta_cache {
+            cache.get_stats(key).await
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn insert(&self, key: CachedKey, value: CachedEntry) {
         match &value.item {
             CachedItem::Block(_) => {
@@ -335,7 +369,7 @@ impl DbCache for SplitCache {
                     trace!("no block cache available for insertion");
                 }
             }
-            CachedItem::SsTableIndex(_) | CachedItem::BloomFilter(_) => {
+            CachedItem::SsTableIndex(_) | CachedItem::BloomFilter(_) | CachedItem::SstStats(_) => {
                 if let Some(ref cache) = self.meta_cache {
                     cache.insert(key, value.clamp_allocated_size()).await;
                 } else {
@@ -386,11 +420,11 @@ pub(crate) struct DbCacheWrapper {
 impl DbCacheWrapper {
     pub(crate) fn new(
         cache: Arc<dyn DbCache>,
-        stats_registry: &StatRegistry,
+        db_metrics: &DbMetrics,
         system_clock: Arc<dyn SystemClock>,
     ) -> Self {
         Self {
-            stats: DbCacheStats::new(stats_registry),
+            stats: DbCacheStats::new(db_metrics),
             cache,
             scope_id: NEXT_CACHE_SCOPE_ID.fetch_add(1, Ordering::Relaxed),
             last_err_log_time: Mutex::new(None),
@@ -434,7 +468,7 @@ impl DbCacheWrapper {
                 block_type, err
             );
         }
-        self.stats.get_error.inc();
+        self.stats.get_error.increment(1);
     }
 }
 
@@ -450,9 +484,9 @@ impl DbCache for DbCacheWrapper {
             }
         };
         if entry.is_some() {
-            self.stats.data_block_hit.inc();
+            self.stats.data_block_hit.increment(1);
         } else {
-            self.stats.data_block_miss.inc();
+            self.stats.data_block_miss.increment(1);
         }
         Ok(entry)
     }
@@ -467,9 +501,9 @@ impl DbCache for DbCacheWrapper {
             }
         };
         if entry.is_some() {
-            self.stats.index_hit.inc();
+            self.stats.index_hit.increment(1);
         } else {
-            self.stats.index_miss.inc();
+            self.stats.index_miss.increment(1);
         }
         Ok(entry)
     }
@@ -484,9 +518,26 @@ impl DbCache for DbCacheWrapper {
             }
         };
         if entry.is_some() {
-            self.stats.filter_hit.inc();
+            self.stats.filter_hit.increment(1);
         } else {
-            self.stats.filter_miss.inc();
+            self.stats.filter_miss.increment(1);
+        }
+        Ok(entry)
+    }
+
+    async fn get_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+        let scoped_key = self.scoped_key(key);
+        let entry = match self.cache.get_stats(&scoped_key).await {
+            Ok(e) => e,
+            Err(err) => {
+                self.record_get_err("stats", &err);
+                return Err(err);
+            }
+        };
+        if entry.is_some() {
+            self.stats.stats_hit.increment(1);
+        } else {
+            self.stats.stats_miss.increment(1);
         }
         Ok(entry)
     }
@@ -508,7 +559,8 @@ impl DbCache for DbCacheWrapper {
 }
 
 pub mod stats {
-    use crate::stats::{Counter, StatRegistry};
+    use crate::db_metrics::DbMetrics;
+    use slatedb_common::metrics::CounterFn;
     use std::sync::Arc;
 
     macro_rules! dbcache_stat_name {
@@ -523,37 +575,35 @@ pub mod stats {
     pub const DB_CACHE_INDEX_MISS: &str = dbcache_stat_name!("index_miss");
     pub const DB_CACHE_DATA_BLOCK_HIT: &str = dbcache_stat_name!("data_block_hit");
     pub const DB_CACHE_DATA_BLOCK_MISS: &str = dbcache_stat_name!("data_block_miss");
+    pub const DB_CACHE_STATS_HIT: &str = dbcache_stat_name!("stats_hit");
+    pub const DB_CACHE_STATS_MISS: &str = dbcache_stat_name!("stats_miss");
     pub const DB_CACHE_GET_ERROR: &str = dbcache_stat_name!("get_error");
 
     pub(super) struct DbCacheStats {
-        pub(super) filter_hit: Arc<Counter>,
-        pub(super) filter_miss: Arc<Counter>,
-        pub(super) index_hit: Arc<Counter>,
-        pub(super) index_miss: Arc<Counter>,
-        pub(super) data_block_hit: Arc<Counter>,
-        pub(super) data_block_miss: Arc<Counter>,
-        pub(super) get_error: Arc<Counter>,
+        pub(super) filter_hit: Arc<dyn CounterFn>,
+        pub(super) filter_miss: Arc<dyn CounterFn>,
+        pub(super) index_hit: Arc<dyn CounterFn>,
+        pub(super) index_miss: Arc<dyn CounterFn>,
+        pub(super) data_block_hit: Arc<dyn CounterFn>,
+        pub(super) data_block_miss: Arc<dyn CounterFn>,
+        pub(super) stats_hit: Arc<dyn CounterFn>,
+        pub(super) stats_miss: Arc<dyn CounterFn>,
+        pub(super) get_error: Arc<dyn CounterFn>,
     }
 
     impl DbCacheStats {
-        pub(super) fn new(registry: &StatRegistry) -> Self {
-            let stats = Self {
-                filter_hit: Arc::new(Counter::default()),
-                filter_miss: Arc::new(Counter::default()),
-                index_hit: Arc::new(Counter::default()),
-                index_miss: Arc::new(Counter::default()),
-                data_block_hit: Arc::new(Counter::default()),
-                data_block_miss: Arc::new(Counter::default()),
-                get_error: Arc::new(Counter::default()),
-            };
-            registry.register(DB_CACHE_FILTER_HIT, stats.filter_hit.clone());
-            registry.register(DB_CACHE_FILTER_MISS, stats.filter_miss.clone());
-            registry.register(DB_CACHE_INDEX_HIT, stats.index_hit.clone());
-            registry.register(DB_CACHE_INDEX_MISS, stats.index_miss.clone());
-            registry.register(DB_CACHE_DATA_BLOCK_HIT, stats.data_block_hit.clone());
-            registry.register(DB_CACHE_DATA_BLOCK_MISS, stats.data_block_miss.clone());
-            registry.register(DB_CACHE_GET_ERROR, stats.get_error.clone());
-            stats
+        pub(super) fn new(recorder: &DbMetrics) -> Self {
+            Self {
+                filter_hit: recorder.counter(DB_CACHE_FILTER_HIT).register(),
+                filter_miss: recorder.counter(DB_CACHE_FILTER_MISS).register(),
+                index_hit: recorder.counter(DB_CACHE_INDEX_HIT).register(),
+                index_miss: recorder.counter(DB_CACHE_INDEX_MISS).register(),
+                data_block_hit: recorder.counter(DB_CACHE_DATA_BLOCK_HIT).register(),
+                data_block_miss: recorder.counter(DB_CACHE_DATA_BLOCK_MISS).register(),
+                stats_hit: recorder.counter(DB_CACHE_STATS_HIT).register(),
+                stats_miss: recorder.counter(DB_CACHE_STATS_MISS).register(),
+                get_error: recorder.counter(DB_CACHE_GET_ERROR).register(),
+            }
         }
     }
 }
@@ -594,6 +644,11 @@ pub(crate) mod test_utils {
             Ok(guard.get(key).cloned())
         }
 
+        async fn get_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, crate::Error> {
+            let guard = self.items.lock().unwrap();
+            Ok(guard.get(key).cloned())
+        }
+
         async fn insert(&self, key: CachedKey, value: CachedEntry) {
             let mut guard = self.items.lock().unwrap();
             guard.insert(key, value);
@@ -624,7 +679,7 @@ mod tests {
 
     use crate::db_cache::test_utils::TestCache;
     use crate::format::sst::{EncodedSsTable, SsTableFormat};
-    use crate::stats::{ReadableStat, StatRegistry};
+    use crate::stats::StatRegistry;
     use crate::test_utils::build_test_sst;
     use crate::types::RowEntry;
     use rstest::{fixture, rstest};
@@ -636,9 +691,10 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_should_count_filter_hits(
-        cache: DbCacheWrapper,
+        cache: (DbCacheWrapper, StatRegistry),
         #[future(awt)] sst: EncodedSsTable,
     ) {
+        let (cache, registry) = cache;
         // given:
         let key = CachedKey::from((SST_ID, 12345u64));
         cache
@@ -653,14 +709,18 @@ mod tests {
             let _ = cache.get_filter(&key).await;
 
             // then:
-            assert_eq!(0, cache.stats.filter_miss.get());
-            assert_eq!(i, cache.stats.filter_hit.get());
+            assert_eq!(0, registry.lookup("dbcache/filter_miss").unwrap().get());
+            assert_eq!(
+                i as i64,
+                registry.lookup("dbcache/filter_hit").unwrap().get()
+            );
         }
     }
 
     #[rstest]
     #[tokio::test]
-    async fn test_should_count_filter_misses(cache: DbCacheWrapper) {
+    async fn test_should_count_filter_misses(cache: (DbCacheWrapper, StatRegistry)) {
+        let (cache, registry) = cache;
         // given:
         let key = CachedKey::from((SST_ID, 12345u64));
 
@@ -669,17 +729,21 @@ mod tests {
             let _ = cache.get_filter(&key).await;
 
             // then:
-            assert_eq!(i, cache.stats.filter_miss.get());
-            assert_eq!(0, cache.stats.filter_hit.get());
+            assert_eq!(
+                i as i64,
+                registry.lookup("dbcache/filter_miss").unwrap().get()
+            );
+            assert_eq!(0, registry.lookup("dbcache/filter_hit").unwrap().get());
         }
     }
 
     #[rstest]
     #[tokio::test]
     async fn test_should_count_index_hits(
-        cache: DbCacheWrapper,
+        cache: (DbCacheWrapper, StatRegistry),
         #[future(awt)] sst: EncodedSsTable,
     ) {
+        let (cache, registry) = cache;
         // given:
         let key = CachedKey::from((SST_ID, 12345u64));
         cache
@@ -694,18 +758,22 @@ mod tests {
             let _ = cache.get_index(&key).await;
 
             // then:
-            assert_eq!(0, cache.stats.index_miss.get());
-            assert_eq!(i, cache.stats.index_hit.get());
+            assert_eq!(0, registry.lookup("dbcache/index_miss").unwrap().get());
+            assert_eq!(
+                i as i64,
+                registry.lookup("dbcache/index_hit").unwrap().get()
+            );
         }
     }
 
     #[rstest]
     #[tokio::test]
     async fn test_should_clamp_entries_to_cache(
-        cache: DbCacheWrapper,
+        cache: (DbCacheWrapper, StatRegistry),
         sst_format: SsTableFormat,
         #[future(awt)] sst: EncodedSsTable,
     ) {
+        let (cache, _registry) = cache;
         // given:
         let bytes = sst.remaining_as_bytes();
         let index = Arc::new(sst_format.read_index_raw(&sst.info, &bytes).await.unwrap());
@@ -723,7 +791,8 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_should_count_index_misses(cache: DbCacheWrapper) {
+    async fn test_should_count_index_misses(cache: (DbCacheWrapper, StatRegistry)) {
+        let (cache, registry) = cache;
         // given:
         let key = CachedKey::from((SST_ID, 12345u64));
 
@@ -732,18 +801,22 @@ mod tests {
             let _ = cache.get_index(&key).await;
 
             // then:
-            assert_eq!(i, cache.stats.index_miss.get());
-            assert_eq!(0, cache.stats.index_hit.get());
+            assert_eq!(
+                i as i64,
+                registry.lookup("dbcache/index_miss").unwrap().get()
+            );
+            assert_eq!(0, registry.lookup("dbcache/index_hit").unwrap().get());
         }
     }
 
     #[rstest]
     #[tokio::test]
     async fn test_should_count_data_block_hits(
-        cache: DbCacheWrapper,
+        cache: (DbCacheWrapper, StatRegistry),
         sst_format: SsTableFormat,
         #[future(awt)] sst: EncodedSsTable,
     ) {
+        let (cache, registry) = cache;
         // given:
         let data = sst.remaining_as_bytes();
         let block = sst_format
@@ -760,14 +833,18 @@ mod tests {
             let _ = cache.get_block(&key).await;
 
             // then:
-            assert_eq!(0, cache.stats.data_block_miss.get());
-            assert_eq!(i, cache.stats.data_block_hit.get());
+            assert_eq!(0, registry.lookup("dbcache/data_block_miss").unwrap().get());
+            assert_eq!(
+                i as i64,
+                registry.lookup("dbcache/data_block_hit").unwrap().get()
+            );
         }
     }
 
     #[rstest]
     #[tokio::test]
-    async fn test_should_count_data_block_misses(cache: DbCacheWrapper) {
+    async fn test_should_count_data_block_misses(cache: (DbCacheWrapper, StatRegistry)) {
+        let (cache, registry) = cache;
         // given:
         let key = CachedKey::from((SST_ID, 12345u64));
 
@@ -776,19 +853,23 @@ mod tests {
             let _ = cache.get_block(&key).await;
 
             // then:
-            assert_eq!(i, cache.stats.data_block_miss.get());
-            assert_eq!(0, cache.stats.data_block_hit.get());
+            assert_eq!(
+                i as i64,
+                registry.lookup("dbcache/data_block_miss").unwrap().get()
+            );
+            assert_eq!(0, registry.lookup("dbcache/data_block_hit").unwrap().get());
         }
     }
 
     #[tokio::test]
     async fn test_cache_wrapper_scopes_keys() {
-        let registry_a = StatRegistry::new();
-        let registry_b = StatRegistry::new();
+        let db_metrics_a = crate::db_metrics::DbMetrics::new(None);
+        let db_metrics_b = crate::db_metrics::DbMetrics::new(None);
         let system_clock = Arc::new(DefaultSystemClock::default());
         let shared_cache: Arc<dyn DbCache> = Arc::new(TestCache::new());
-        let cache_a = DbCacheWrapper::new(shared_cache.clone(), &registry_a, system_clock.clone());
-        let cache_b = DbCacheWrapper::new(shared_cache.clone(), &registry_b, system_clock);
+        let cache_a =
+            DbCacheWrapper::new(shared_cache.clone(), &db_metrics_a, system_clock.clone());
+        let cache_b = DbCacheWrapper::new(shared_cache.clone(), &db_metrics_b, system_clock);
         assert_ne!(cache_a.scope_id, cache_b.scope_id);
 
         let mut builder = BloomFilterBuilder::new(1);
@@ -812,12 +893,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_wrapper_scopes_index_entries() {
-        let registry_a = StatRegistry::new();
-        let registry_b = StatRegistry::new();
+        let db_metrics_a = crate::db_metrics::DbMetrics::new(None);
+        let db_metrics_b = crate::db_metrics::DbMetrics::new(None);
         let system_clock = Arc::new(DefaultSystemClock::default());
         let shared_cache: Arc<dyn DbCache> = Arc::new(TestCache::new());
-        let cache_a = DbCacheWrapper::new(shared_cache.clone(), &registry_a, system_clock.clone());
-        let cache_b = DbCacheWrapper::new(shared_cache.clone(), &registry_b, system_clock);
+        let cache_a =
+            DbCacheWrapper::new(shared_cache.clone(), &db_metrics_a, system_clock.clone());
+        let cache_b = DbCacheWrapper::new(shared_cache.clone(), &db_metrics_b, system_clock);
 
         let sst = build_test_sst(&SsTableFormat::default(), 1).await;
         let index = Arc::new(sst.index);
@@ -839,14 +921,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_wrapper_scopes_block_entries() {
-        let registry_a = StatRegistry::new();
-        let registry_b = StatRegistry::new();
+        let db_metrics_a = crate::db_metrics::DbMetrics::new(None);
+        let db_metrics_b = crate::db_metrics::DbMetrics::new(None);
         let system_clock = Arc::new(DefaultSystemClock::default());
         let shared_cache: Arc<dyn DbCache> = Arc::new(TestCache::new());
-        let cache_a = DbCacheWrapper::new(shared_cache.clone(), &registry_a, system_clock.clone());
-        let cache_b = DbCacheWrapper::new(shared_cache.clone(), &registry_b, system_clock);
+        let cache_a =
+            DbCacheWrapper::new(shared_cache.clone(), &db_metrics_a, system_clock.clone());
+        let cache_b = DbCacheWrapper::new(shared_cache.clone(), &db_metrics_b, system_clock);
 
-        let mut builder = BlockBuilder::new_v1(4096);
+        let mut builder = BlockBuilder::new_latest(4096);
         assert!(builder.add(RowEntry::new_value(b"k1", b"v1", 0)).unwrap());
         let block = Arc::new(builder.build().unwrap());
         let key = CachedKey::from((SST_ID, 3u64));
@@ -866,18 +949,20 @@ mod tests {
     }
 
     #[fixture]
-    fn cache() -> DbCacheWrapper {
-        let registry = StatRegistry::new();
+    fn cache() -> (DbCacheWrapper, StatRegistry) {
+        let db_metrics = crate::db_metrics::DbMetrics::new(None);
         let cache = SplitCache::new()
             .with_block_cache(Some(Arc::new(TestCache::new())))
             .with_meta_cache(Some(Arc::new(TestCache::new())))
             .build();
 
-        DbCacheWrapper::new(
+        let wrapper = DbCacheWrapper::new(
             Arc::new(cache),
-            &registry,
+            &db_metrics,
             Arc::new(DefaultSystemClock::default()),
-        )
+        );
+        let stat_registry = Arc::try_unwrap(db_metrics.stat_registry()).ok().unwrap();
+        (wrapper, stat_registry)
     }
 
     #[fixture]

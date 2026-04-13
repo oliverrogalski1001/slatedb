@@ -1,6 +1,6 @@
 use crate::blob::ReadOnlyBlob;
 use crate::config::CompressionCodec;
-use crate::db_state::{SsTableInfo, SsTableInfoCodec};
+use crate::db_state::{SsTableInfo, SsTableInfoCodec, SstType};
 use crate::error::SlateDBError;
 use crate::filter::BloomFilter;
 use crate::flatbuffer_types::{
@@ -9,6 +9,7 @@ use crate::flatbuffer_types::{
 use crate::format::block::{Block, BlockBuilderV1};
 use crate::format::block_v2::BlockBuilderV2;
 use crate::format::row;
+use crate::sst_stats::{BlockStats, SstStats};
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes};
 use flatbuffers::DefaultAllocator;
@@ -26,6 +27,7 @@ const NUM_FOOTER_BYTES_LONG: u64 = NUM_FOOTER_BYTES as u64;
 const SEQNUM_SIZE: usize = size_of::<u64>();
 pub(crate) const SST_FORMAT_VERSION: u16 = 1;
 pub(crate) const SST_FORMAT_VERSION_V2: u16 = 2;
+pub(crate) const SST_FORMAT_VERSION_LATEST: u16 = SST_FORMAT_VERSION_V2;
 
 fn is_supported_version(version: u16) -> bool {
     matches!(version, SST_FORMAT_VERSION | SST_FORMAT_VERSION_V2)
@@ -44,6 +46,10 @@ impl BlockBuilder {
 
     pub(crate) fn new_v2(block_size: usize) -> Self {
         Self::V2(BlockBuilderV2::new(block_size))
+    }
+
+    pub(crate) fn new_latest(block_size: usize) -> Self {
+        Self::new_v2(block_size)
     }
 
     #[cfg(test)]
@@ -90,14 +96,54 @@ impl BlockBuilder {
         &mut self,
         key: &[u8],
         value: &[u8],
-        attrs: crate::types::RowAttributes,
+        ts: Option<i64>,
+        expire_ts: Option<i64>,
     ) -> bool {
         match self {
-            Self::V1(builder) => builder.add_value(key, value, attrs),
-            Self::V2(builder) => builder.add_value(key, value, attrs),
+            Self::V1(builder) => builder.add_value(key, value, ts, expire_ts),
+            Self::V2(builder) => builder.add_value(key, value, ts, expire_ts),
         }
     }
 }
+
+pub(crate) struct BlockBuilderWithStats {
+    builder: BlockBuilder,
+    stats: BlockStats,
+}
+
+impl BlockBuilderWithStats {
+    pub(crate) fn new(builder: BlockBuilder) -> Self {
+        Self {
+            builder,
+            stats: BlockStats::default(),
+        }
+    }
+
+    pub(crate) fn would_fit(&self, entry: &crate::types::RowEntry) -> bool {
+        self.builder.would_fit(entry)
+    }
+
+    pub(crate) fn add(
+        &mut self,
+        entry: crate::types::RowEntry,
+    ) -> Result<bool, crate::error::SlateDBError> {
+        match &entry.value {
+            crate::types::ValueDeletable::Value(_) => self.stats.num_puts += 1,
+            crate::types::ValueDeletable::Merge(_) => self.stats.num_merges += 1,
+            crate::types::ValueDeletable::Tombstone => self.stats.num_deletes += 1,
+        }
+        self.builder.add(entry)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.builder.is_empty()
+    }
+
+    pub(crate) fn into_parts(self) -> (BlockBuilder, BlockStats) {
+        (self.builder, self.stats)
+    }
+}
+
 pub(crate) const SIZEOF_U16: usize = size_of::<u16>();
 pub(crate) const SIZEOF_U32: usize = size_of::<u32>();
 pub(crate) const SIZEOF_U64: usize = size_of::<u64>();
@@ -242,11 +288,13 @@ impl EncodedSsTableBlockBuilder {
     }
 }
 
-/// The encoded footer of an SSTable, containing filter, index, info, and metadata.
+/// The encoded footer of an SSTable, containing filter, index, stats, info, and metadata.
 pub(crate) struct EncodedSsTableFooter {
     pub(crate) info: SsTableInfo,
     pub(crate) index: SsTableIndexOwned,
     pub(crate) filter: Option<Arc<BloomFilter>>,
+    #[allow(dead_code)]
+    pub(crate) stats: Option<SstStats>,
     pub(crate) encoded_bytes: Bytes,
 }
 
@@ -256,6 +304,8 @@ pub(crate) struct EncodedSsTableFooterBuilder<'a, 'b> {
     blocks_size: u64,
     /// first entry in the SST, key for compacted data, sequence number for WAL
     first_entry: Option<Bytes>,
+    /// last entry (key) in the SST for compacted data, None for WAL SSTs
+    last_entry: Option<Bytes>,
     /// codec for compressing data blocks, index blocks, and filter blocks
     compression_codec: Option<CompressionCodec>,
     /// transformer for transforming data blocks, index blocks, and filter blocks
@@ -268,29 +318,38 @@ pub(crate) struct EncodedSsTableFooterBuilder<'a, 'b> {
     block_meta: Vec<flatbuffers::WIPOffset<BlockMeta<'b>>>,
     /// filter block
     filter: Option<(Arc<BloomFilter>, Bytes)>,
+    /// stats block
+    stats: Option<SstStats>,
     /// SST format version
     sst_format_version: u16,
+    /// type of SST (Compacted or Wal)
+    sst_type: SstType,
 }
 
 impl<'a, 'b> EncodedSsTableFooterBuilder<'a, 'b> {
     pub(crate) fn new(
         blocks_len: u64,
         sst_first_entry: Option<Bytes>,
+        sst_last_entry: Option<Bytes>,
         sst_codec: &'a dyn SsTableInfoCodec,
         index_builder: flatbuffers::FlatBufferBuilder<'b, DefaultAllocator>,
         block_meta: Vec<flatbuffers::WIPOffset<BlockMeta<'b>>>,
         sst_format_version: u16,
+        sst_type: SstType,
     ) -> Self {
         Self {
             blocks_size: blocks_len,
             first_entry: sst_first_entry,
+            last_entry: sst_last_entry,
             compression_codec: None,
             block_transformer: None,
             sst_info_codec: sst_codec,
             index_builder,
             block_meta,
             filter: None,
+            stats: None,
             sst_format_version,
+            sst_type,
         }
     }
 
@@ -306,13 +365,19 @@ impl<'a, 'b> EncodedSsTableFooterBuilder<'a, 'b> {
         self
     }
 
+    /// Adds stats to the footer.
+    pub(crate) fn with_stats(mut self, stats: SstStats) -> Self {
+        self.stats = Some(stats);
+        self
+    }
+
     /// Adds a bloom filter to the footer.
     pub(crate) fn with_filter(mut self, filter: Arc<BloomFilter>, encoded_filter: Bytes) -> Self {
         self.filter = Some((filter, encoded_filter));
         self
     }
 
-    /// Builds the footer with the index and optional filter.
+    /// Builds the footer with the index, optional filter and optional stats.
     pub(crate) async fn build(mut self) -> Result<EncodedSsTableFooter, SlateDBError> {
         let mut buf = Vec::new();
 
@@ -351,14 +416,35 @@ impl<'a, 'b> EncodedSsTableFooterBuilder<'a, 'b> {
         )
         .await? as u64;
 
+        // Write stats block if present
+        let maybe_stats = self.stats.take();
+        let (stats_offset, stats_len) = match &maybe_stats {
+            Some(stats) => {
+                let offset = self.blocks_size + buf.len() as u64;
+                let len = compress_and_transform(
+                    &mut buf,
+                    stats.encode(),
+                    self.compression_codec,
+                    self.block_transformer.as_ref(),
+                )
+                .await? as u64;
+                (offset, len)
+            }
+            None => (0u64, 0u64),
+        };
+
         let meta_offset = self.blocks_size + buf.len() as u64;
         let info = SsTableInfo {
             first_entry: self.first_entry,
+            last_entry: self.last_entry,
             index_offset,
             index_len,
             filter_offset,
             filter_len,
             compression_codec: self.compression_codec,
+            sst_type: self.sst_type,
+            stats_offset,
+            stats_len,
         };
         SsTableInfo::encode(&info, &mut buf, self.sst_info_codec);
 
@@ -369,15 +455,19 @@ impl<'a, 'b> EncodedSsTableFooterBuilder<'a, 'b> {
             info,
             index,
             filter: maybe_filter,
+            stats: maybe_stats,
             encoded_bytes: Bytes::from(buf),
         })
     }
 }
 
 pub(crate) struct EncodedSsTable {
+    pub(crate) format_version: u16,
     pub(crate) info: SsTableInfo,
     pub(crate) index: SsTableIndexOwned,
     pub(crate) filter: Option<Arc<BloomFilter>>,
+    #[allow(dead_code)]
+    pub(crate) stats: Option<SstStats>,
     pub(crate) unconsumed_blocks: VecDeque<EncodedSsTableBlock>,
     pub(crate) footer: Bytes,
 }
@@ -478,6 +568,10 @@ pub(crate) async fn transform(
     Ok(transformed)
 }
 
+pub(crate) type LengthOffsetAndVersion = (u64, u64, u16);
+
+pub(crate) type TableInfoAndVersion = (SsTableInfo, u16);
+
 #[derive(Clone)]
 pub(crate) struct SsTableFormat {
     pub(crate) block_size: usize,
@@ -486,6 +580,7 @@ pub(crate) struct SsTableFormat {
     pub(crate) filter_bits_per_key: u32,
     pub(crate) compression_codec: Option<CompressionCodec>,
     pub(crate) block_transformer: Option<Arc<dyn BlockTransformer>>,
+    pub(crate) block_format: Option<crate::sst_builder::BlockFormat>,
 }
 
 impl Default for SsTableFormat {
@@ -497,15 +592,16 @@ impl Default for SsTableFormat {
             filter_bits_per_key: 10,
             compression_codec: None,
             block_transformer: None,
+            block_format: None,
         }
     }
 }
 
 impl SsTableFormat {
-    async fn read_footer_header(
+    async fn read_length_and_metadata_offset_and_version(
         &self,
         obj: &impl ReadOnlyBlob,
-    ) -> Result<(u64, u16), SlateDBError> {
+    ) -> Result<LengthOffsetAndVersion, SlateDBError> {
         let obj_len = obj.len().await?;
         if obj_len <= NUM_FOOTER_BYTES_LONG {
             return Err(SlateDBError::EmptySSTable);
@@ -513,11 +609,11 @@ impl SsTableFormat {
         let header = obj
             .read_range((obj_len - NUM_FOOTER_BYTES_LONG)..obj_len)
             .await?;
-        assert!(header.len() == NUM_FOOTER_BYTES);
+        assert_eq!(header.len(), NUM_FOOTER_BYTES);
 
         let version = header.slice(8..NUM_FOOTER_BYTES).get_u16();
         let sst_metadata_offset = header.slice(0..8).get_u64();
-        Ok((sst_metadata_offset, version))
+        Ok((obj_len, sst_metadata_offset, version))
     }
 
     fn validate_version(&self, version: u16) -> Result<(), SlateDBError> {
@@ -531,23 +627,18 @@ impl SsTableFormat {
         Ok(())
     }
 
-    pub(crate) async fn read_version(&self, obj: &impl ReadOnlyBlob) -> Result<u16, SlateDBError> {
-        let (_, version) = self.read_footer_header(obj).await?;
-        self.validate_version(version)?;
-        Ok(version)
-    }
-
-    pub(crate) async fn read_info(
+    pub(crate) async fn read_info_and_version(
         &self,
         obj: &impl ReadOnlyBlob,
-    ) -> Result<SsTableInfo, SlateDBError> {
-        let (sst_metadata_offset, version) = self.read_footer_header(obj).await?;
+    ) -> Result<TableInfoAndVersion, SlateDBError> {
+        let (obj_len, sst_metadata_offset, version) = self
+            .read_length_and_metadata_offset_and_version(obj)
+            .await?;
         self.validate_version(version)?;
-        let obj_len = obj.len().await?;
         let sst_metadata_bytes = obj
             .read_range(sst_metadata_offset..obj_len - NUM_FOOTER_BYTES_LONG)
             .await?;
-        SsTableInfo::decode(sst_metadata_bytes, &*self.sst_codec)
+        SsTableInfo::decode(sst_metadata_bytes, &*self.sst_codec).map(|info| (info, version))
     }
 
     pub(crate) async fn read_filter(
@@ -653,6 +744,43 @@ impl SsTableFormat {
         };
 
         Ok(SsTableIndexOwned::new(decompressed_bytes)?)
+    }
+
+    pub(crate) async fn read_stats(
+        &self,
+        info: &SsTableInfo,
+        obj: &impl ReadOnlyBlob,
+    ) -> Result<Option<SstStats>, SlateDBError> {
+        if info.stats_len == 0 {
+            return Ok(None);
+        }
+        let stats_end = info.stats_offset + info.stats_len;
+        let stats_bytes = obj.read_range(info.stats_offset..stats_end).await?;
+        let compression_codec = info.compression_codec;
+        Ok(Some(
+            self.decode_stats(stats_bytes, compression_codec).await?,
+        ))
+    }
+
+    #[allow(dead_code)]
+    async fn decode_stats(
+        &self,
+        bytes: Bytes,
+        compression_codec: Option<CompressionCodec>,
+    ) -> Result<SstStats, SlateDBError> {
+        let stats_bytes = self.validate_checksum(bytes)?;
+        let untransformed_bytes = match &self.block_transformer {
+            Some(t) => t
+                .decode(stats_bytes)
+                .await
+                .map_err(|_| SlateDBError::BlockTransformError)?,
+            None => stats_bytes,
+        };
+        let decompressed_bytes = match compression_codec {
+            Some(c) => Self::decompress(untransformed_bytes, c)?,
+            None => untransformed_bytes,
+        };
+        SstStats::decode(decompressed_bytes)
     }
 
     /// Decompresses the compressed data using the specified compression codec.
@@ -822,6 +950,8 @@ impl SsTableFormat {
             guess_at_average_first_key_size_bytes,
         );
         ans += self.estimate_encoded_size_filter(entry_num);
+        // estimate sum of Stats
+        ans += 5 * SIZEOF_U64 + CHECKSUM_SIZE;
         ans
     }
 

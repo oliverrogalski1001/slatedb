@@ -1,5 +1,5 @@
 use std::cmp::{max, min};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::Bound;
 use std::sync::Arc;
@@ -15,7 +15,9 @@ use uuid::Uuid;
 pub(crate) mod store;
 
 // TODO: should probably move these into manifest/mod.rs (this file)
-pub use crate::db_state::{ManifestCore, SortedRun, SsTableHandle, SsTableId, SsTableInfo};
+pub use crate::db_state::{
+    ManifestCore, SortedRun, SsTableHandle, SsTableId, SsTableInfo, SsTableView,
+};
 
 #[derive(Clone, Serialize, PartialEq, Debug)]
 pub(crate) struct Manifest {
@@ -63,8 +65,8 @@ impl Manifest {
             .core
             .compacted
             .iter()
-            .flat_map(|sr| sr.ssts.iter().map(|s| s.id))
-            .chain(parent_manifest.core.l0.iter().map(|s| s.id))
+            .flat_map(|sr| sr.sst_views.iter().map(|s| s.sst.id))
+            .chain(parent_manifest.core.l0.iter().map(|s| s.sst.id))
             .filter(|id| !parent_external_sst_ids.contains(id))
             .collect();
 
@@ -88,28 +90,31 @@ impl Manifest {
         let mut projected = source_manifest.clone();
         let mut sorter_runs_filtered = vec![];
         for sorter_run in &projected.core.compacted {
-            sorter_runs_filtered.push(SortedRun {
-                id: sorter_run.id,
-                ssts: Self::filter_sst_handles(&sorter_run.ssts, false, &range),
-            });
+            let sst_views = Self::filter_view_handles(&sorter_run.sst_views, false, &range);
+            if !sst_views.is_empty() {
+                sorter_runs_filtered.push(SortedRun {
+                    id: sorter_run.id,
+                    sst_views,
+                });
+            }
         }
-        projected.core.l0 = Self::filter_sst_handles(&projected.core.l0, true, &range).into();
+        projected.core.l0 = Self::filter_view_handles(&projected.core.l0, true, &range).into();
         projected.core.compacted = sorter_runs_filtered;
         projected
     }
 
-    fn filter_sst_handles<'a, T>(
-        handles: T,
-        handles_overlap: bool,
+    fn filter_view_handles<'a, T>(
+        views: T,
+        views_overlap: bool,
         projection_range: &BytesRange,
-    ) -> Vec<SsTableHandle>
+    ) -> Vec<SsTableView>
     where
-        T: IntoIterator<Item = &'a SsTableHandle>,
+        T: IntoIterator<Item = &'a SsTableView>,
     {
-        let mut iter = handles.into_iter().peekable();
+        let mut iter = views.into_iter().peekable();
         let mut filtered_handles = vec![];
         while let Some(current_handle) = iter.next() {
-            let next_handle = if handles_overlap {
+            let next_handle = if views_overlap {
                 None
             } else {
                 iter.peek().copied()
@@ -208,6 +213,17 @@ pub(crate) struct ExternalDb {
 }
 
 impl Manifest {
+    /// Returns a map from SST ID to the external DB path for all external SSTs.
+    pub(crate) fn external_ssts(&self) -> HashMap<SsTableId, object_store::path::Path> {
+        let mut external_ssts = HashMap::new();
+        for external_db in &self.external_dbs {
+            for id in &external_db.sst_ids {
+                external_ssts.insert(*id, external_db.path.clone().into());
+            }
+        }
+        external_ssts
+    }
+
     pub(crate) fn has_wal_sst_reference(&self, wal_sst_id: u64) -> bool {
         wal_sst_id > self.core.replay_after_wal_id && wal_sst_id < self.core.next_wal_sst_id
     }
@@ -219,8 +235,12 @@ mod tests {
     use crate::manifest::store::{ManifestStore, StoredManifest};
     use slatedb_common::clock::{DefaultSystemClock, SystemClock};
 
+    use super::Manifest;
     use crate::config::CheckpointOptions;
-    use crate::db_state::{ManifestCore, SortedRun, SsTableHandle, SsTableId, SsTableInfo};
+    use crate::db_state::{
+        ManifestCore, SortedRun, SsTableHandle, SsTableId, SsTableInfo, SsTableView,
+    };
+    use crate::format::sst::SST_FORMAT_VERSION_LATEST;
     use crate::rand::DbRand;
     use bytes::Bytes;
     use object_store::memory::InMemory;
@@ -231,8 +251,6 @@ mod tests {
     use std::ops::{Bound, Range, RangeBounds};
     use std::sync::Arc;
     use ulid::Ulid;
-
-    use super::Manifest;
 
     #[tokio::test]
     async fn test_init_clone_manifest() {
@@ -416,6 +434,39 @@ mod tests {
             sorted_runs: vec![],
         },
     })]
+    #[case::empty_sorted_run_excluded(ProjectionTestCase {
+        visible_range: "a".."c",
+        existing_manifest: SimpleManifest {
+            l0: vec![],
+            sorted_runs: vec![
+                vec![
+                    SstEntry::regular("sr0_first", "a"),
+                    SstEntry::regular("sr0_second", "b"),
+                ],
+                vec![
+                    SstEntry::regular("sr1_first", "a"),
+                    SstEntry::regular("sr1_second", "e"),
+                ],
+                // sr2 is entirely outside "a".."c", so it should be excluded
+                vec![
+                    SstEntry::regular("sr2_first", "d"),
+                    SstEntry::regular("sr2_second", "f"),
+                ],
+            ],
+        },
+        expected_manifest: SimpleManifest {
+            l0: vec![],
+            sorted_runs: vec![
+                vec![
+                    SstEntry::projected("sr0_first", "a", "a".."b"),
+                    SstEntry::projected("sr0_second", "b", "b".."c"),
+                ],
+                vec![
+                    SstEntry::projected("sr1_first", "a", "a".."c"),
+                ],
+            ],
+        },
+    })]
     fn test_projected(#[case] test_case: ProjectionTestCase) {
         let mut sst_ids = HashMap::new();
         let initial_manifest = build_manifest(&test_case.existing_manifest, |alias| {
@@ -543,27 +594,39 @@ mod tests {
     {
         let mut core = ManifestCore::new();
         for entry in &manifest.l0 {
-            core.l0.push_back(SsTableHandle::new_compacted(
-                sst_id_fn(entry.sst_alias),
-                SsTableInfo {
-                    first_entry: Some(entry.first_entry.clone()),
-                    ..SsTableInfo::default()
-                },
+            let sst_id = sst_id_fn(entry.sst_alias);
+            let view_id = sst_id.unwrap_compacted_id();
+            core.l0.push_back(SsTableView::new_projected(
+                view_id,
+                SsTableHandle::new(
+                    sst_id,
+                    SST_FORMAT_VERSION_LATEST,
+                    SsTableInfo {
+                        first_entry: Some(entry.first_entry.clone()),
+                        ..SsTableInfo::default()
+                    },
+                ),
                 entry.visible_range.clone(),
             ));
         }
         for (idx, sorted_run) in manifest.sorted_runs.iter().enumerate() {
             core.compacted.push(SortedRun {
                 id: idx as u32,
-                ssts: sorted_run
+                sst_views: sorted_run
                     .iter()
                     .map(|entry| {
-                        SsTableHandle::new_compacted(
-                            sst_id_fn(entry.sst_alias),
-                            SsTableInfo {
-                                first_entry: Some(entry.first_entry.clone()),
-                                ..SsTableInfo::default()
-                            },
+                        let sst_id = sst_id_fn(entry.sst_alias);
+                        let view_id = sst_id.unwrap_compacted_id();
+                        SsTableView::new_projected(
+                            view_id,
+                            SsTableHandle::new(
+                                sst_id,
+                                SST_FORMAT_VERSION_LATEST,
+                                SsTableInfo {
+                                    first_entry: Some(entry.first_entry.clone()),
+                                    ..SsTableInfo::default()
+                                },
+                            ),
                             entry.visible_range.clone(),
                         )
                     })
@@ -587,11 +650,12 @@ mod tests {
             // Format actual L0 entries
             for (idx, handle) in actual.core.l0.iter().enumerate() {
                 let id_str = sst_aliases
-                    .get(&handle.id)
+                    .get(&handle.sst.id)
                     .map(|a| a.as_str())
                     .unwrap_or("UNKNOWN");
 
                 let first_entry = handle
+                    .sst
                     .info
                     .first_entry
                     .as_ref()
@@ -624,9 +688,10 @@ mod tests {
 
             // Format expected L0 entries
             for (idx, handle) in expected.core.l0.iter().enumerate() {
-                let id_str = sst_aliases.get(&handle.id).unwrap();
+                let id_str = sst_aliases.get(&handle.sst.id).unwrap();
 
                 let first_entry = handle
+                    .sst
                     .info
                     .first_entry
                     .as_ref()

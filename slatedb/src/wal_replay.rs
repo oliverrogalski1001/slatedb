@@ -1,6 +1,7 @@
 use crate::db_state::{ManifestCore, SsTableId};
 use crate::error::SlateDBError;
-use crate::iter::KeyValueIterator;
+use crate::iter::RowEntryIterator;
+use crate::manifest::SsTableView;
 use crate::mem_table::WritableKVTable;
 use crate::sst_iter::{SstIterator, SstIteratorOptions};
 use crate::tablestore::TableStore;
@@ -26,6 +27,10 @@ pub(crate) struct WalReplayOptions {
 
     /// Options to pass through to underlying SST iterators
     pub(crate) sst_iter_options: SstIteratorOptions,
+
+    /// The minimum seq number to replay. If unset, will replay all
+    /// entries after `last_l0_seq` in the manifest.
+    pub(crate) min_seq: Option<u64>,
 }
 
 impl Default for WalReplayOptions {
@@ -35,6 +40,7 @@ impl Default for WalReplayOptions {
             min_memtable_bytes: 64 * 1024 * 1024,
             max_memtable_bytes: 128 * 1024 * 1024,
             sst_iter_options: SstIteratorOptions::default(),
+            min_seq: None,
         }
     }
 }
@@ -103,7 +109,7 @@ impl WalReplayIterator<'_> {
         // replaying the entries that are already in the L0 SST. while replaying the WALs, we'll
         // update the last seq number to the max seq number, and this final `last_seq` will be passed
         // to the db_state for the further writes.
-        let min_seq = db_state.last_l0_seq;
+        let min_seq = options.min_seq.unwrap_or(db_state.last_l0_seq);
         let last_seq = db_state.last_l0_seq;
         let last_tick = db_state.last_l0_clock_tick;
         let next_wal_id = wal_id_range.start;
@@ -157,8 +163,13 @@ impl WalReplayIterator<'_> {
             table_store: Arc<TableStore>,
         ) -> Result<Option<SstIterator<'a>>, SlateDBError> {
             let sst = table_store.open_sst(&SsTableId::Wal(wal_id)).await?;
-            SstIterator::new_owned_initialized(.., sst, Arc::clone(&table_store), sst_iter_options)
-                .await
+            SstIterator::new_owned_initialized(
+                ..,
+                SsTableView::identity(sst),
+                Arc::clone(&table_store),
+                sst_iter_options,
+            )
+            .await
         }
 
         let handle = task::spawn(load_iter(
@@ -222,7 +233,7 @@ impl WalReplayIterator<'_> {
         while !self.current_iter.is_finished() {
             if let Some(sst_iter) = &mut self.current_iter.current_iter {
                 let wal_id = sst_iter.table_id().unwrap_wal_id();
-                while let Some(row_entry) = sst_iter.next_entry().await? {
+                while let Some(row_entry) = sst_iter.next().await? {
                     // skip the entries that are already in the L0 SST.
                     if row_entry.seq <= self.min_seq {
                         continue;
@@ -285,7 +296,7 @@ mod tests {
     use crate::bytes_range::BytesRange;
     use crate::db_state::{ManifestCore, SsTableId};
     use crate::format::sst::SsTableFormat;
-    use crate::iter::{IterationOrder, KeyValueIterator};
+    use crate::iter::{IterationOrder, RowEntryIterator};
     use crate::mem_table::WritableKVTable;
     use crate::object_stores::ObjectStores;
     use crate::proptest_util::{rng, sample};
@@ -395,8 +406,8 @@ mod tests {
             }
 
             let mut iter = replayed_table.table.table().iter();
-            while let Some(next_entry) = iter.next_entry().await.unwrap() {
-                full_replayed_table.put(next_entry);
+            while let Some(next) = iter.next().await.unwrap() {
+                full_replayed_table.put(next);
             }
         }
         assert_eq!(last_wal_id + 1, next_wal_id);
@@ -442,8 +453,8 @@ mod tests {
             assert!(replayed_table.table.metadata().entries_size_in_bytes <= max_memtable_bytes);
 
             let mut iter = replayed_table.table.table().iter();
-            while let Some(next_entry) = iter.next_entry().await.unwrap() {
-                full_replayed_table.put(next_entry);
+            while let Some(next) = iter.next().await.unwrap() {
+                full_replayed_table.put(next);
             }
         }
         assert_eq!(last_wal_id + 1, next_wal_id);
@@ -547,7 +558,7 @@ mod tests {
         let mut imm_table_iter = replayed_table.table.table().iter();
         let mut replayed_entries = BTreeMap::new();
         let mut total = 0;
-        while let Some(entry) = imm_table_iter.next_entry().await.unwrap() {
+        while let Some(entry) = imm_table_iter.next().await.unwrap() {
             assert!(entry.seq > min_seq);
             replayed_entries.insert(entry.key.clone(), entry.value);
             total += 1;

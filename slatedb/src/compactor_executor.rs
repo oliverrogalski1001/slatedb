@@ -16,9 +16,9 @@ use crate::compaction_filter_iterator::CompactionFilterIterator;
 use crate::compactor::CompactorMessage;
 use crate::compactor::CompactorMessage::CompactionJobFinished;
 use crate::config::CompactorOptions;
-use crate::db_state::{SortedRun, SsTableHandle, SsTableId};
+use crate::db_state::{SortedRun, SsTableHandle, SsTableId, SsTableView};
 use crate::error::SlateDBError;
-use crate::iter::{KeyValueIterator, TrackedKeyValueIterator};
+use crate::iter::{IterationOrder, RowEntryIterator, TrackedRowEntryIterator};
 use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::merge_iterator::MergeIterator;
 use crate::merge_operator::{
@@ -59,7 +59,7 @@ pub(crate) struct StartCompactionJobArgs {
     /// Destination sorted run id to be produced by this job.
     pub(crate) destination: u32,
     /// Input L0 SSTs for this job.
-    pub(crate) ssts: Vec<SsTableHandle>,
+    pub(crate) sst_views: Vec<SsTableView>,
     /// Input existing sorted runs for this job.
     pub(crate) sorted_runs: Vec<SortedRun>,
     /// Output SSTs already written for this compaction when resuming.
@@ -79,7 +79,7 @@ impl std::fmt::Debug for StartCompactionJobArgs {
             .field("id", &self.id)
             .field("job_id", &self.compaction_id)
             .field("destination", &self.destination)
-            .field("ssts", &self.ssts)
+            .field("ssts", &self.sst_views)
             .field("sorted_runs", &self.sorted_runs)
             .field("output_ssts", &self.output_ssts)
             .field("compaction_clock_tick", &self.compaction_clock_tick)
@@ -90,12 +90,12 @@ impl std::fmt::Debug for StartCompactionJobArgs {
 }
 
 /// Iterator adapter that can resume after a persisted compaction output SST.
-struct ResumingIterator<T: KeyValueIterator> {
+struct ResumingIterator<T: RowEntryIterator> {
     iterator: PeekingIterator<T>,
     start: Option<(Bytes, u64)>,
 }
 
-impl<T: KeyValueIterator> ResumingIterator<T> {
+impl<T: RowEntryIterator> ResumingIterator<T> {
     /// Create a new resuming iterator that wraps the provided iterator. The iterator
     /// must be initialized prior to calling this method.
     ///
@@ -133,7 +133,7 @@ impl<T: KeyValueIterator> ResumingIterator<T> {
                 if entry.seq < seq {
                     break;
                 }
-                resuming_iter.iterator.next_entry().await?;
+                resuming_iter.iterator.next().await?;
             }
         }
         Ok(resuming_iter)
@@ -144,16 +144,21 @@ impl<T: KeyValueIterator> ResumingIterator<T> {
     fn start(&self) -> Option<&(Bytes, u64)> {
         self.start.as_ref()
     }
+
+    /// Peeks at the next row without advancing the iterator.
+    async fn peek(&mut self) -> Result<Option<&crate::types::RowEntry>, SlateDBError> {
+        self.iterator.peek().await
+    }
 }
 
 #[async_trait::async_trait]
-impl<T: KeyValueIterator> KeyValueIterator for ResumingIterator<T> {
+impl<T: RowEntryIterator> RowEntryIterator for ResumingIterator<T> {
     async fn init(&mut self) -> Result<(), SlateDBError> {
         self.iterator.init().await
     }
 
-    async fn next_entry(&mut self) -> Result<Option<crate::types::RowEntry>, SlateDBError> {
-        self.iterator.next_entry().await
+    async fn next(&mut self) -> Result<Option<crate::types::RowEntry>, SlateDBError> {
+        self.iterator.next().await
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
@@ -161,7 +166,7 @@ impl<T: KeyValueIterator> KeyValueIterator for ResumingIterator<T> {
     }
 }
 
-impl<T: TrackedKeyValueIterator> TrackedKeyValueIterator for ResumingIterator<T> {
+impl<T: TrackedRowEntryIterator> TrackedRowEntryIterator for ResumingIterator<T> {
     fn bytes_processed(&self) -> u64 {
         self.iterator.bytes_processed()
     }
@@ -260,7 +265,7 @@ impl TokioCompactionExecutorInner {
     async fn load_iterators<'a>(
         &self,
         job_args: &'a StartCompactionJobArgs,
-    ) -> Result<ResumingIterator<Box<dyn TrackedKeyValueIterator + 'a>>, SlateDBError> {
+    ) -> Result<ResumingIterator<Box<dyn TrackedRowEntryIterator + 'a>>, SlateDBError> {
         let resume_cursor = match job_args.output_ssts.last() {
             Some(output_sst) => {
                 last_written_key_and_seq(self.table_store.clone(), output_sst).await?
@@ -272,11 +277,12 @@ impl TokioCompactionExecutorInner {
             blocks_to_fetch: 256,
             cache_blocks: false, // don't clobber the cache
             eager_spawn: true,
+            order: IterationOrder::Ascending,
         };
 
-        let max_parallel = compute_max_parallel(job_args.ssts.len(), &job_args.sorted_runs, 4);
+        let max_parallel = compute_max_parallel(job_args.sst_views.len(), &job_args.sorted_runs, 4);
         // L0 (borrowed)
-        let l0_iters_futures = build_concurrent(job_args.ssts.iter(), max_parallel, |h| {
+        let l0_iters_futures = build_concurrent(job_args.sst_views.iter(), max_parallel, |h| {
             SstIterator::new_borrowed_initialized(.., h, self.table_store.clone(), sst_iter_options)
         });
 
@@ -296,13 +302,12 @@ impl TokioCompactionExecutorInner {
         let sr_merge_iter = MergeIterator::new(sr_iters)?.with_dedup(false);
 
         let merge_iter = MergeIterator::new([l0_merge_iter, sr_merge_iter])?.with_dedup(false);
-        let merge_iter: Box<dyn TrackedKeyValueIterator> =
+        let merge_iter: Box<dyn TrackedRowEntryIterator> =
             if let Some(merge_operator) = self.merge_operator.clone() {
                 Box::new(MergeOperatorIterator::new(
                     merge_operator,
                     merge_iter,
                     false,
-                    job_args.compaction_clock_tick,
                     job_args.retention_min_seq,
                 ))
             } else {
@@ -335,12 +340,12 @@ impl TokioCompactionExecutorInner {
             };
             let filter = supplier.create_compaction_filter(&context).await?;
             let filter_iter = CompactionFilterIterator::new(retention_iter, filter);
-            let boxed: Box<dyn TrackedKeyValueIterator> = Box::new(filter_iter);
+            let boxed: Box<dyn TrackedRowEntryIterator> = Box::new(filter_iter);
             let resuming_iter = ResumingIterator::new(boxed, resume_cursor).await?;
             return Ok(resuming_iter);
         }
 
-        let boxed: Box<dyn TrackedKeyValueIterator> = Box::new(retention_iter);
+        let boxed: Box<dyn TrackedRowEntryIterator> = Box::new(retention_iter);
         let resuming_iter = ResumingIterator::new(boxed, resume_cursor).await?;
         Ok(resuming_iter)
     }
@@ -397,7 +402,7 @@ impl TokioCompactionExecutorInner {
             estimate_bytes_before_key(args.sorted_runs.as_slice(), k)
         });
 
-        while let Some(kv) = all_iter.next_entry().await? {
+        while let Some(kv) = all_iter.next().await? {
             let duration_since_last_report =
                 self.clock.now().signed_duration_since(last_progress_report);
             if duration_since_last_report > TimeDelta::seconds(1) {
@@ -406,38 +411,55 @@ impl TokioCompactionExecutorInner {
                 last_progress_report = self.clock.now();
             }
 
+            let current_key = kv.key.clone();
             if let Some(block_size) = current_writer.add(kv).await? {
                 bytes_written += block_size;
             }
 
             if bytes_written > self.options.max_sst_size {
-                let finished_writer = mem::replace(
-                    &mut current_writer,
-                    self.table_store.table_writer(SsTableId::Compacted(
-                        self.rand.rng().gen_ulid(self.clock.as_ref()),
-                    )),
-                );
-                let sst = finished_writer.close().await?;
+                // Prevent a single key from spanning multiple SSTs in an SR.
+                // The current read logic expects this. See #1367.
+                // This is a temporary fix until we implement #1371.
+                let should_rollover = match all_iter.peek().await? {
+                    Some(next_kv) => next_kv.key != current_key,
+                    None => true,
+                };
 
-                self.stats.bytes_compacted.add(sst.info.filter_offset);
-                output_ssts.push(sst);
-                bytes_written = 0;
-                let total_bytes = start_bytes_processed + all_iter.bytes_processed();
-                self.send_compaction_progress(args.id, total_bytes, &output_ssts);
-                last_progress_report = self.clock.now();
+                if should_rollover {
+                    let finished_writer = mem::replace(
+                        &mut current_writer,
+                        self.table_store.table_writer(SsTableId::Compacted(
+                            self.rand.rng().gen_ulid(self.clock.as_ref()),
+                        )),
+                    );
+                    let sst = finished_writer.close().await?;
+
+                    self.stats.bytes_compacted.increment(sst.info.filter_offset);
+                    output_ssts.push(sst);
+                    bytes_written = 0;
+                    let total_bytes = start_bytes_processed + all_iter.bytes_processed();
+                    self.send_compaction_progress(args.id, total_bytes, &output_ssts);
+                    last_progress_report = self.clock.now();
+                }
             }
         }
 
         if !current_writer.is_drained() {
             let sst = current_writer.close().await?;
 
-            self.stats.bytes_compacted.add(sst.info.filter_offset);
+            self.stats.bytes_compacted.increment(sst.info.filter_offset);
             output_ssts.push(sst);
         }
 
         Ok(SortedRun {
             id: args.destination,
-            ssts: output_ssts,
+            sst_views: output_ssts
+                .into_iter()
+                .map(|sst| {
+                    let id = self.rand.rng().gen_ulid(self.clock.as_ref());
+                    SsTableView::new(id, sst)
+                })
+                .collect(),
         })
     }
 
@@ -448,7 +470,7 @@ impl TokioCompactionExecutorInner {
             return;
         }
         let dst = args.destination;
-        self.stats.running_compactions.inc();
+        self.stats.running_compactions.increment(1);
         assert!(!tasks.contains_key(&dst));
 
         let id = args.id;
@@ -479,7 +501,7 @@ impl TokioCompactionExecutorInner {
                         e
                     );
                 }
-                this_cleanup.stats.running_compactions.dec();
+                this_cleanup.stats.running_compactions.increment(-1);
             },
             async move { this.execute_compaction_job(args).await },
         );
@@ -529,7 +551,6 @@ mod tests {
     use crate::object_stores::ObjectStores;
     use crate::proptest_util::arbitrary;
     use crate::sst_iter::SstView;
-    use crate::stats::StatRegistry;
     use crate::test_utils::StringConcatMergeOperator;
     use crate::test_utils::{build_row_entries, build_sorted_runs, write_ssts};
     use crate::types::{RowEntry, ValueDeletable};
@@ -985,7 +1006,10 @@ mod tests {
             worker_tx: tx,
             table_store: table_store.clone(),
             rand: Arc::new(DbRand::new(100u64)),
-            stats: Arc::new(CompactionStats::new(Arc::new(StatRegistry::new()))),
+            stats: {
+                let db_metrics = crate::db_metrics::DbMetrics::new(None);
+                Arc::new(CompactionStats::new(&db_metrics))
+            },
             clock,
             manifest_store,
             merge_operator,
@@ -995,13 +1019,13 @@ mod tests {
 
         // Materialize L0 SSTs from the provided entry sets. Use a huge max size so
         // each entry set stays in a single SST, keeping the inputs predictable.
-        let mut l0_ssts = Vec::new();
+        let mut l0_sst_views = Vec::new();
         let mut sorted_runs = Vec::new();
         let mut all_entries = Vec::new();
 
         for entries in &l0_entry_sets {
             let ssts = write_sst(&table_store, entries, usize::MAX).await;
-            l0_ssts.extend(ssts);
+            l0_sst_views.extend(ssts.into_iter().map(SsTableView::identity));
             all_entries.extend(entries.iter().cloned());
         }
 
@@ -1017,7 +1041,7 @@ mod tests {
                 }
                 sorted_runs.push(SortedRun {
                     id: sr_id as u32,
-                    ssts: sr_ssts,
+                    sst_views: sr_ssts.into_iter().map(SsTableView::identity).collect(),
                 });
             }
         }
@@ -1047,7 +1071,7 @@ mod tests {
             id: Ulid::new(),
             compaction_id: Ulid::new(),
             destination: 0,
-            ssts: l0_ssts,
+            sst_views: l0_sst_views,
             sorted_runs,
             output_ssts,
             compaction_clock_tick: 0,
@@ -1059,7 +1083,7 @@ mod tests {
         // after the persisted prefix and continuing in sorted order.
         let mut iter = executor.inner.load_iterators(&job_args).await.unwrap();
         let mut resumed_entries = Vec::new();
-        while let Some(entry) = iter.next_entry().await.unwrap() {
+        while let Some(entry) = iter.next().await.unwrap() {
             resumed_entries.push(entry);
         }
         assert_eq!(resumed_entries, expected_rows);
@@ -1189,7 +1213,10 @@ mod tests {
                     worker_tx: tx,
                     table_store: table_store.clone(),
                     rand: Arc::new(DbRand::new(100u64)),
-                    stats: Arc::new(CompactionStats::new(Arc::new(StatRegistry::new()))),
+                    stats: {
+                        let db_metrics = crate::db_metrics::DbMetrics::new(None);
+                        Arc::new(CompactionStats::new(&db_metrics))
+                    },
                     clock,
                     manifest_store,
                     merge_operator,
@@ -1200,7 +1227,7 @@ mod tests {
                 let mut l0_ssts = Vec::new();
                 for entries in &l0_entry_sets {
                     let ssts = write_ssts(&table_store, entries, usize::MAX).await;
-                    l0_ssts.extend(ssts);
+                    l0_ssts.extend(ssts.into_iter().map(SsTableView::identity));
                 }
 
                 let sorted_runs = build_sorted_runs(&table_store, &sr_entry_sets, usize::MAX).await;
@@ -1211,7 +1238,7 @@ mod tests {
                         id: Ulid::new(),
                         compaction_id: Ulid::new(),
                         destination: 0,
-                        ssts: l0_ssts.clone(),
+                        sst_views: l0_ssts.clone(),
                         sorted_runs: sorted_runs.clone(),
                         output_ssts: Vec::new(),
                         compaction_clock_tick: 0,
@@ -1222,7 +1249,7 @@ mod tests {
                     .unwrap();
 
                 let mut expected_entries = Vec::new();
-                for sst in &full_run.ssts {
+                for sst in &full_run.sst_views {
                     let mut iter = SstIterator::new(
                         SstView::Borrowed(sst, BytesRange::from(..)),
                         table_store.clone(),
@@ -1230,7 +1257,7 @@ mod tests {
                     )
                     .unwrap();
                     iter.init().await.unwrap();
-                    while let Some(entry) = iter.next_entry().await.unwrap() {
+                    while let Some(entry) = iter.next().await.unwrap() {
                         expected_entries.push(entry);
                     }
                 }
@@ -1256,7 +1283,7 @@ mod tests {
                             id: Ulid::new(),
                             compaction_id: Ulid::new(),
                             destination: 0,
-                            ssts: l0_ssts.clone(),
+                            sst_views: l0_ssts.clone(),
                             sorted_runs: sorted_runs.clone(),
                             output_ssts,
                             compaction_clock_tick: 0,
@@ -1267,7 +1294,7 @@ mod tests {
                         .unwrap();
 
                     let mut resumed_entries = Vec::new();
-                    for sst in &resumed_run.ssts {
+                    for sst in &resumed_run.sst_views {
                         let mut iter = SstIterator::new(
                             SstView::Borrowed(sst, BytesRange::from(..)),
                             table_store.clone(),
@@ -1275,7 +1302,7 @@ mod tests {
                         )
                         .unwrap();
                         iter.init().await.unwrap();
-                        while let Some(entry) = iter.next_entry().await.unwrap() {
+                        while let Some(entry) = iter.next().await.unwrap() {
                             resumed_entries.push(entry);
                         }
                     }
@@ -1349,7 +1376,10 @@ mod tests {
                 worker_tx: tx,
                 table_store: table_store.clone(),
                 rand: Arc::new(DbRand::new(100u64)),
-                stats: Arc::new(CompactionStats::new(Arc::new(StatRegistry::new()))),
+                stats: {
+                    let db_metrics = crate::db_metrics::DbMetrics::new(None);
+                    Arc::new(CompactionStats::new(&db_metrics))
+                },
                 clock,
                 manifest_store,
                 merge_operator: self.merge_operator,
@@ -1377,7 +1407,7 @@ mod tests {
                 id: Ulid::new(),
                 compaction_id: Ulid::new(),
                 destination: 0,
-                ssts,
+                sst_views: ssts.into_iter().map(SsTableView::identity).collect(),
                 sorted_runs: vec![],
                 output_ssts: vec![],
                 compaction_clock_tick: 0,
@@ -1438,8 +1468,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(1, result.ssts.len());
-        let sst = result.ssts[0].clone();
+        assert_eq!(1, result.sst_views.len());
+        let sst = result.sst_views[0].clone();
         let mut iter = SstIterator::new(
             SstView::Borrowed(&sst, BytesRange::from(..)),
             table_store.clone(),
@@ -1447,28 +1477,28 @@ mod tests {
         )
         .unwrap();
         iter.init().await.unwrap();
-        let next = iter.next_entry().await.unwrap().unwrap();
+        let next = iter.next().await.unwrap().unwrap();
         assert_eq!(next.key, Bytes::from(b"foo".as_slice()));
         assert_eq!(
             next.value,
             ValueDeletable::Merge(Bytes::from(b"3".as_slice()))
         );
         assert_eq!(next.seq, retention_min_seq_num + 2);
-        let next = iter.next_entry().await.unwrap().unwrap();
+        let next = iter.next().await.unwrap().unwrap();
         assert_eq!(next.key, Bytes::from(b"foo".as_slice()));
         assert_eq!(
             next.value,
             ValueDeletable::Merge(Bytes::from(b"2".as_slice()))
         );
         assert_eq!(next.seq, retention_min_seq_num + 1);
-        let next = iter.next_entry().await.unwrap().unwrap();
+        let next = iter.next().await.unwrap().unwrap();
         assert_eq!(next.key, Bytes::from(b"foo".as_slice()));
         assert_eq!(
             next.value,
             ValueDeletable::Merge(Bytes::from(b"01".as_slice()))
         );
         assert_eq!(next.seq, retention_min_seq_num);
-        assert!(iter.next_entry().await.unwrap().is_none());
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[cfg(feature = "compaction_filters")]
@@ -1580,8 +1610,8 @@ mod tests {
         let result = ctx.run_compaction(vec![l0], true, None).await.unwrap();
 
         // Verify the output SST
-        assert_eq!(1, result.ssts.len());
-        let sst = result.ssts[0].clone();
+        assert_eq!(1, result.sst_views.len());
+        let sst = result.sst_views[0].clone();
         let mut iter = SstIterator::new(
             SstView::Borrowed(&sst, BytesRange::from(..)),
             table_store.clone(),
@@ -1593,7 +1623,7 @@ mod tests {
         // drop:key1 and drop:key2 should be DROPPED (not present)
 
         // keep:key3 - unchanged (Keep decision)
-        let next = iter.next_entry().await.unwrap().unwrap();
+        let next = iter.next().await.unwrap().unwrap();
         assert_eq!(next.key, Bytes::from(b"keep:key3".as_slice()));
         assert_eq!(
             next.value,
@@ -1601,7 +1631,7 @@ mod tests {
         );
 
         // keep:key4 - unchanged (Keep decision)
-        let next = iter.next_entry().await.unwrap().unwrap();
+        let next = iter.next().await.unwrap().unwrap();
         assert_eq!(next.key, Bytes::from(b"keep:key4".as_slice()));
         assert_eq!(
             next.value,
@@ -1609,7 +1639,7 @@ mod tests {
         );
 
         // modify:key5 - value modified (Modify decision)
-        let next = iter.next_entry().await.unwrap().unwrap();
+        let next = iter.next().await.unwrap().unwrap();
         assert_eq!(next.key, Bytes::from(b"modify:key5".as_slice()));
         assert_eq!(
             next.value,
@@ -1617,7 +1647,7 @@ mod tests {
         );
 
         // modify:key6 - value modified (Modify decision)
-        let next = iter.next_entry().await.unwrap().unwrap();
+        let next = iter.next().await.unwrap().unwrap();
         assert_eq!(next.key, Bytes::from(b"modify:key6".as_slice()));
         assert_eq!(
             next.value,
@@ -1625,17 +1655,17 @@ mod tests {
         );
 
         // tombstone:key7 - converted to tombstone (Modify to Tombstone decision)
-        let next = iter.next_entry().await.unwrap().unwrap();
+        let next = iter.next().await.unwrap().unwrap();
         assert_eq!(next.key, Bytes::from(b"tombstone:key7".as_slice()));
         assert!(next.value.is_tombstone());
 
         // tombstone:key8 - converted to tombstone (Modify to Tombstone decision)
-        let next = iter.next_entry().await.unwrap().unwrap();
+        let next = iter.next().await.unwrap().unwrap();
         assert_eq!(next.key, Bytes::from(b"tombstone:key8".as_slice()));
         assert!(next.value.is_tombstone());
 
         // No more entries
-        assert!(iter.next_entry().await.unwrap().is_none());
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[cfg(feature = "compaction_filters")]

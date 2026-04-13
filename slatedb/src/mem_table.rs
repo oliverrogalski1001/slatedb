@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 
 use crate::error::SlateDBError;
-use crate::iter::{IterationOrder, KeyValueIterator};
+use crate::iter::{IterationOrder, RowEntryIterator};
 use crate::seq_tracker::{SequenceTracker, TrackedSeq};
 use crate::types::RowEntry;
 use crate::utils::{WatchableOnceCell, WatchableOnceCellReader};
@@ -97,6 +97,8 @@ pub(crate) struct KVTable {
     last_tick: AtomicI64,
     /// the sequence number of the most recent operation on this KVTable
     last_seq: AtomicU64,
+    /// the sequence number of the oldest entry in this KVTable
+    first_seq: AtomicU64,
     /// A sequence tracker that correlates sequence numbers with system clock ticks.
     /// The tracker is limited to 8192 entries and downsamples data when it gets full.
     sequence_tracker: Mutex<SequenceTracker>,
@@ -110,8 +112,9 @@ pub(crate) struct KVTableMetadata {
     #[allow(dead_code)]
     pub(crate) last_tick: i64,
     /// the sequence number of the most recent operation on this KVTable
-    #[allow(dead_code)]
     pub(crate) last_seq: u64,
+    /// the sequence number of the oldest entry in this KVTable
+    pub(crate) first_seq: u64,
 }
 
 pub(crate) struct WritableKVTable {
@@ -177,20 +180,20 @@ pub(crate) struct MemTableIteratorInner<T: RangeBounds<SequencedKey>> {
 pub(crate) type MemTableIterator = MemTableIteratorInner<KVTableInternalKeyRange>;
 
 #[async_trait]
-impl KeyValueIterator for MemTableIterator {
+impl RowEntryIterator for MemTableIterator {
     async fn init(&mut self) -> Result<(), SlateDBError> {
         Ok(())
     }
 
-    async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
-        Ok(self.next_entry_sync())
+    async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        Ok(self.next_sync())
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
         loop {
             let front = self.borrow_item().clone();
             if front.is_some_and(|record| record.key < next_key) {
-                self.next_entry_sync();
+                self.next_sync();
             } else {
                 return Ok(());
             }
@@ -199,15 +202,15 @@ impl KeyValueIterator for MemTableIterator {
 }
 
 impl MemTableIterator {
-    pub(crate) fn next_entry_sync(&mut self) -> Option<RowEntry> {
+    pub(crate) fn next_sync(&mut self) -> Option<RowEntry> {
         let ans = self.borrow_item().clone();
         let next_entry = match self.borrow_ordering() {
             IterationOrder::Ascending => self.with_inner_mut(|inner| inner.next()),
             IterationOrder::Descending => self.with_inner_mut(|inner| inner.next_back()),
         };
 
-        let cloned_entry = next_entry.map(|entry| entry.value().clone());
-        self.with_item_mut(|item| *item = cloned_entry);
+        let cloned_next = next_entry.map(|entry| entry.value().clone());
+        self.with_item_mut(|item| *item = cloned_next);
 
         ans
     }
@@ -243,6 +246,20 @@ impl ImmutableMemtable {
     pub(crate) fn sequence_tracker(&self) -> &SequenceTracker {
         &self.sequence_tracker
     }
+
+    /// Returns a new [`ImmutableMemtable`] that only contains entries with sequence
+    /// number greater than the given `seq`. [`ImmutableMemtable::recent_flushed_wal_id`]
+    /// remains the same.
+    pub(crate) fn filter_after_seq(&self, seq: u64) -> Self {
+        let new_table = WritableKVTable::new();
+        let mut table_iter = self.table.iter();
+        while let Some(entry) = table_iter.next_sync() {
+            if entry.seq > seq {
+                new_table.put(entry);
+            }
+        }
+        Self::new(new_table, self.recent_flushed_wal_id)
+    }
 }
 
 impl KVTable {
@@ -253,6 +270,7 @@ impl KVTable {
             durable: WatchableOnceCell::new(),
             last_tick: AtomicI64::new(i64::MIN),
             last_seq: AtomicU64::new(0),
+            first_seq: AtomicU64::new(u64::MAX),
             sequence_tracker: Mutex::new(SequenceTracker::new()),
         }
     }
@@ -261,12 +279,14 @@ impl KVTable {
         let entry_num = self.map.len();
         let entries_size_in_bytes = self.entries_size_in_bytes.load(Ordering::Relaxed);
         let last_tick = self.last_tick.load(SeqCst);
-        let last_seq = self.last_seq.load(SeqCst);
+        let last_seq = self.last_seq().unwrap_or(0);
+        let first_seq = self.first_seq().unwrap_or(0);
         KVTableMetadata {
             entry_num,
             entries_size_in_bytes,
             last_tick,
             last_seq,
+            first_seq,
         }
     }
 
@@ -284,6 +304,15 @@ impl KVTable {
         } else {
             let last_seq = self.last_seq.load(SeqCst);
             Some(last_seq)
+        }
+    }
+
+    pub(crate) fn first_seq(&self) -> Option<u64> {
+        if self.is_empty() {
+            None
+        } else {
+            let first_seq = self.first_seq.load(SeqCst);
+            Some(first_seq)
         }
     }
 
@@ -308,7 +337,7 @@ impl KVTable {
             item: None,
         }
         .build();
-        iterator.next_entry_sync();
+        iterator.next_sync();
         iterator
     }
 
@@ -325,6 +354,8 @@ impl KVTable {
         }
         // update the last seq number if it is greater than the current last seq
         self.last_seq.fetch_max(row.seq, atomic::Ordering::SeqCst);
+        // update the first seq number if it is smaller than the current first seq
+        self.first_seq.fetch_min(row.seq, atomic::Ordering::SeqCst);
 
         let row_size = row.estimated_size();
         self.map.compare_insert(internal_key, row, |previous_row| {
@@ -386,6 +417,7 @@ mod tests {
         table.put(RowEntry::new_value(b"abc444", b"value4", 4));
         table.put(RowEntry::new_value(b"abc222", b"value2", 5));
         assert_eq!(table.table().last_seq(), Some(5));
+        assert_eq!(table.table().first_seq(), Some(1));
 
         let mut iter = table.table().iter();
         assert_iterator(
@@ -522,34 +554,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_memtable_track_last_seq() {
+    async fn test_memtable_track_seqs() {
         let table = WritableKVTable::new();
         let mut metadata = table.table().metadata();
 
         assert_eq!(metadata.last_seq, 0);
+        assert_eq!(metadata.first_seq, 0);
         table.put(RowEntry::new_value(b"first", b"foo", 1));
         metadata = table.table().metadata();
         assert_eq!(metadata.last_seq, 1);
+        assert_eq!(metadata.first_seq, 1);
 
         table.put(RowEntry::new_tombstone(b"first", 2));
         metadata = table.table().metadata();
         assert_eq!(metadata.last_seq, 2);
+        assert_eq!(metadata.first_seq, 1);
 
         table.put(RowEntry::new_value(b"abc333", b"val1", 1));
         metadata = table.table().metadata();
         assert_eq!(metadata.last_seq, 2);
+        assert_eq!(metadata.first_seq, 1);
 
         table.put(RowEntry::new_value(b"def456", b"blablabla", 2));
         metadata = table.table().metadata();
         assert_eq!(metadata.last_seq, 2);
+        assert_eq!(metadata.first_seq, 1);
 
         table.put(RowEntry::new_value(b"def456", b"blabla", 3));
         metadata = table.table().metadata();
         assert_eq!(metadata.last_seq, 3);
+        assert_eq!(metadata.first_seq, 1);
 
         table.put(RowEntry::new_tombstone(b"abc333", 4));
         metadata = table.table().metadata();
         assert_eq!(metadata.last_seq, 4);
+        assert_eq!(metadata.first_seq, 1);
     }
 
     #[rstest]

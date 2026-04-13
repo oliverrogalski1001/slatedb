@@ -55,7 +55,7 @@
 //! async fn main() -> Result<(), Error> {
 //!     let object_store = Arc::new(InMemory::new());
 //!     let db = Db::builder("test_db", object_store)
-//!         .with_memory_cache(Arc::new(FoyerCache::new()))
+//!         .with_db_cache(Arc::new(FoyerCache::new()))
 //!         .build()
 //!         .await?;
 //!     Ok(())
@@ -106,36 +106,39 @@ use std::sync::Arc;
 
 use fail_parallel::FailPointRegistry;
 use log::info;
+use log::warn;
 use object_store::path::Path;
 use object_store::ObjectStore;
+use rand::RngCore;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 use crate::admin::Admin;
 use crate::batch_write::WriteBatchEventHandler;
 use crate::batch_write::WRITE_BATCH_TASK_NAME;
-use crate::cached_object_store::stats::CachedObjectStoreStats;
 use crate::cached_object_store::CachedObjectStore;
-use crate::cached_object_store::FsCacheStorage;
 #[cfg(feature = "compaction_filters")]
 use crate::compaction_filter::CompactionFilterSupplier;
 use crate::compactions_store::CompactionsStore;
 use crate::compactor::stats::CompactionStats;
 use crate::compactor::CompactorEventHandler;
+use crate::compactor::CompactorMessage;
 use crate::compactor::SizeTieredCompactionSchedulerSupplier;
 use crate::compactor::COMPACTOR_TASK_NAME;
 use crate::compactor::{CompactionSchedulerSupplier, Compactor};
 use crate::compactor_executor::{TokioCompactionExecutor, TokioCompactionExecutorOptions};
-use crate::config::default_block_cache;
-use crate::config::default_meta_cache;
 use crate::config::CompactorOptions;
+use crate::config::DbReaderOptions;
 use crate::config::GarbageCollectorOptions;
 use crate::config::{Settings, SstBlockSize};
 use crate::db::Db;
 use crate::db::DbInner;
 use crate::db_cache::SplitCache;
 use crate::db_cache::{DbCache, DbCacheWrapper};
+use crate::db_metrics::DbMetrics;
+use crate::db_reader::DbReader;
 use crate::db_state::ManifestCore;
+use crate::db_status::ClosedResultWriter;
 use crate::dispatcher::MessageHandlerExecutor;
 use crate::error::SlateDBError;
 use crate::format::sst::{BlockTransformer, SsTableFormat};
@@ -149,11 +152,12 @@ use crate::object_stores::ObjectStores;
 use crate::paths::PathResolver;
 use crate::rand::DbRand;
 use crate::retrying_object_store::RetryingObjectStore;
-use crate::stats::StatRegistry;
+use crate::store_provider::DefaultStoreProvider;
 use crate::tablestore::TableStore;
 use crate::utils::WatchableOnceCell;
 use slatedb_common::clock::DefaultSystemClock;
 use slatedb_common::clock::SystemClock;
+use slatedb_common::metrics::MetricsRecorder;
 
 /// A builder for creating a new Db instance.
 ///
@@ -164,18 +168,16 @@ pub struct DbBuilder<P: Into<Path>> {
     settings: Settings,
     main_object_store: Arc<dyn ObjectStore>,
     wal_object_store: Option<Arc<dyn ObjectStore>>,
-    memory_cache: Option<Arc<dyn DbCache>>,
+    db_cache: Option<Arc<dyn DbCache>>,
     system_clock: Option<Arc<dyn SystemClock>>,
     gc_runtime: Option<Handle>,
-    compaction_runtime: Option<Handle>,
-    compaction_scheduler_supplier: Option<Arc<dyn CompactionSchedulerSupplier>>,
+    compactor_builder: Option<CompactorBuilder<Path>>,
     fp_registry: Arc<FailPointRegistry>,
     seed: Option<u64>,
     sst_block_size: Option<SstBlockSize>,
     merge_operator: Option<MergeOperatorType>,
     block_transformer: Option<Arc<dyn BlockTransformer>>,
-    #[cfg(feature = "compaction_filters")]
-    compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
+    metrics_recorder: Option<Arc<dyn MetricsRecorder>>,
 }
 
 impl<P: Into<Path>> DbBuilder<P> {
@@ -186,23 +188,24 @@ impl<P: Into<Path>> DbBuilder<P> {
             main_object_store,
             settings: Settings::default(),
             wal_object_store: None,
-            memory_cache: None,
+            db_cache: default_db_cache(),
             system_clock: None,
             gc_runtime: None,
-            compaction_runtime: None,
-            compaction_scheduler_supplier: None,
+            compactor_builder: None,
             fp_registry: Arc::new(FailPointRegistry::new()),
             seed: None,
             sst_block_size: None,
             merge_operator: None,
             block_transformer: None,
-            #[cfg(feature = "compaction_filters")]
-            compaction_filter_supplier: None,
+            metrics_recorder: None,
         }
     }
 
     /// Sets the database settings.
     pub fn with_settings(mut self, settings: Settings) -> Self {
+        if self.compactor_builder.is_some() && settings.compactor_options.is_some() {
+            warn!("compactor_builder and settings.compactor_options both set; compactor_builder will take precedence");
+        }
         self.settings = settings;
         self
     }
@@ -217,12 +220,18 @@ impl<P: Into<Path>> DbBuilder<P> {
         self
     }
 
-    /// Sets the memory cache to use for the database.
+    /// Sets the cache to use for the database for caching sst blocks
     ///
     /// SlateDB uses a cache to efficiently store and retrieve blocks and SST metadata locally.
     /// [`slatedb::db_cache::SplitCache`] is used by default.
-    pub fn with_memory_cache(mut self, memory_cache: Arc<dyn DbCache>) -> Self {
-        self.memory_cache = Some(memory_cache);
+    pub fn with_db_cache(mut self, db_cache: Arc<dyn DbCache>) -> Self {
+        self.db_cache = Some(db_cache);
+        self
+    }
+
+    /// Disables the sst block/metadata cache
+    pub fn with_db_cache_disabled(mut self) -> Self {
+        self.db_cache = None;
         self
     }
 
@@ -239,17 +248,21 @@ impl<P: Into<Path>> DbBuilder<P> {
         self
     }
 
-    /// Sets the compaction runtime to use for the database.
-    pub fn with_compaction_runtime(mut self, compaction_runtime: Handle) -> Self {
-        self.compaction_runtime = Some(compaction_runtime);
+    /// Sets a custom CompactorBuilder for compaction orchestration.
+    ///
+    /// Setting a [`CompactorBuilder`] will ignore any previous
+    /// [`Settings::compactor_options`] configuration passed in through
+    /// [`DbBuilder::with_settings`] since the [`CompactorBuilder`] provides its own
+    /// configuration.
+    pub fn with_compactor_builder(mut self, compactor_builder: CompactorBuilder<P>) -> Self {
+        self.compactor_builder = Some(compactor_builder.into_path_builder());
         self
     }
 
-    pub fn with_compaction_scheduler_supplier(
-        mut self,
-        compaction_scheduler_supplier: Arc<dyn CompactionSchedulerSupplier>,
-    ) -> Self {
-        self.compaction_scheduler_supplier = Some(compaction_scheduler_supplier);
+    /// Sets a user-provided metrics recorder. The recorder will receive all
+    /// metric events alongside the built-in default recorder.
+    pub fn with_metrics_recorder(mut self, recorder: Arc<dyn MetricsRecorder>) -> Self {
+        self.metrics_recorder = Some(recorder);
         self
     }
 
@@ -324,32 +337,6 @@ impl<P: Into<Path>> DbBuilder<P> {
         self
     }
 
-    /// Sets the compaction filter supplier for the database. The filter supplier
-    /// creates filter instances that can inspect, drop, or modify entries during
-    /// compaction.
-    ///
-    /// **Warning:** Enabling compaction filters may affect snapshot consistency.
-    /// Use compaction filters only if you know the consequences of using them.
-    ///
-    /// See [`crate::CompactionFilter`] for detailed documentation, examples, and the
-    /// filter API.
-    ///
-    /// # Arguments
-    ///
-    /// * `supplier` - An Arc-wrapped compaction filter supplier implementation.
-    ///
-    /// # Returns
-    ///
-    /// The builder instance for chaining.
-    #[cfg(feature = "compaction_filters")]
-    pub fn with_compaction_filter_supplier(
-        mut self,
-        supplier: Arc<dyn CompactionFilterSupplier>,
-    ) -> Self {
-        self.compaction_filter_supplier = Some(supplier);
-        self
-    }
-
     /// Builds and opens the database.
     pub async fn build(self) -> Result<Db, crate::Error> {
         let path = self.path.into();
@@ -388,59 +375,38 @@ impl<P: Into<Path>> DbBuilder<P> {
             );
         }
 
-        let memory_cache = self.memory_cache.or_else(|| {
-            let block_cache = default_block_cache();
-            let meta_cache = default_meta_cache();
-            Some(Arc::new(
-                SplitCache::new()
-                    .with_block_cache(block_cache)
-                    .with_meta_cache(meta_cache)
-                    .build(),
-            ))
-        });
-
-        let merge_operator = self.merge_operator.or(self.settings.merge_operator.clone());
-        #[cfg(feature = "compaction_filters")]
-        let compaction_filter_supplier = self.compaction_filter_supplier.clone();
-
         // Setup the components
-        let stat_registry = Arc::new(StatRegistry::new());
+        // Setup metrics recorder
+        let db_metrics = DbMetrics::new(self.metrics_recorder);
+        let block_format = {
+            #[cfg(test)]
+            {
+                self.settings.block_format
+            }
+            #[cfg(not(test))]
+            {
+                None
+            }
+        };
         let sst_format = SsTableFormat {
             min_filter_keys: self.settings.min_filter_keys,
             filter_bits_per_key: self.settings.filter_bits_per_key,
             compression_codec: self.settings.compression_codec,
             block_size: self.sst_block_size.unwrap_or_default().as_bytes(),
             block_transformer: self.block_transformer.clone(),
+            block_format,
             ..SsTableFormat::default()
         };
 
         // Setup object store with optional caching
-        let cached_object_store = match &self.settings.object_store_cache_options.root_folder {
-            None => None,
-            Some(cache_root_folder) => {
-                let stats = Arc::new(CachedObjectStoreStats::new(stat_registry.as_ref()));
-                let cache_storage = Arc::new(FsCacheStorage::new(
-                    cache_root_folder.clone(),
-                    self.settings
-                        .object_store_cache_options
-                        .max_cache_size_bytes,
-                    self.settings.object_store_cache_options.scan_interval,
-                    stats.clone(),
-                    system_clock.clone(),
-                    rand.clone(),
-                ));
-
-                let cached_object_store = CachedObjectStore::new(
-                    retrying_main_object_store.clone(),
-                    cache_storage,
-                    self.settings.object_store_cache_options.part_size_bytes,
-                    self.settings.object_store_cache_options.cache_puts,
-                    stats.clone(),
-                )?;
-                cached_object_store.start_evictor().await;
-                Some(cached_object_store)
-            }
-        };
+        let cached_object_store = CachedObjectStore::from_config(
+            retrying_main_object_store.clone(),
+            &self.settings.object_store_cache_options,
+            &db_metrics,
+            system_clock.clone(),
+            rand.clone(),
+        )
+        .await?;
 
         let maybe_cached_main_object_store: Arc<dyn ObjectStore> = match &cached_object_store {
             Some(cached_store) => cached_store.clone(),
@@ -468,15 +434,7 @@ impl<P: Into<Path>> DbBuilder<P> {
 
         // Extract external SSTs from manifest if available
         let external_ssts = match &latest_manifest {
-            Some(latest_stored_manifest) => {
-                let mut external_ssts = HashMap::new();
-                for external_db in &latest_stored_manifest.manifest().external_dbs {
-                    for id in &external_db.sst_ids {
-                        external_ssts.insert(*id, external_db.path.clone().into());
-                    }
-                }
-                external_ssts
-            }
+            Some(latest_stored_manifest) => latest_stored_manifest.manifest().external_ssts(),
             None => HashMap::new(),
         };
 
@@ -490,10 +448,10 @@ impl<P: Into<Path>> DbBuilder<P> {
             sst_format.clone(),
             path_resolver.clone(),
             self.fp_registry.clone(),
-            memory_cache.as_ref().map(|c| {
+            self.db_cache.as_ref().map(|c| {
                 Arc::new(DbCacheWrapper::new(
                     c.clone(),
-                    stat_registry.as_ref(),
+                    &db_metrics,
                     system_clock.clone(),
                 )) as Arc<dyn DbCache>
             }),
@@ -515,6 +473,7 @@ impl<P: Into<Path>> DbBuilder<P> {
                     .await?
             }
         };
+
         let mut manifest = FenceableManifest::init_writer(
             stored_manifest,
             self.settings.manifest_update_timeout,
@@ -527,20 +486,18 @@ impl<P: Into<Path>> DbBuilder<P> {
         let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Create the database inner state
-        let mut settings = self.settings.clone();
-        settings.merge_operator = merge_operator.clone();
         let inner = Arc::new(
             DbInner::new(
-                settings,
+                self.settings.clone(),
                 system_clock.clone(),
                 rand.clone(),
                 table_store.clone(),
                 manifest.prepare_dirty()?,
                 memtable_flush_tx,
                 write_tx,
-                stat_registry,
+                db_metrics.clone(),
                 self.fp_registry.clone(),
-                merge_operator.clone(),
+                self.merge_operator.clone(),
             )
             .await?,
         );
@@ -584,46 +541,30 @@ impl<P: Into<Path>> DbBuilder<P> {
             None,
         ));
 
-        // To keep backwards compatibility, check if the compaction_scheduler_supplier or compactor_options are set.
-        // If either are set, we need to initialize the compactor.
-        if self.compaction_scheduler_supplier.is_some() || self.settings.compactor_options.is_some()
-        {
-            let compactor_options = Arc::new(self.settings.compactor_options.unwrap_or_default());
-            let compaction_handle = self
-                .compaction_runtime
-                .unwrap_or_else(|| tokio_handle.clone());
-            let scheduler_supplier = self
-                .compaction_scheduler_supplier
-                .unwrap_or(Arc::new(SizeTieredCompactionSchedulerSupplier));
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let scheduler = Arc::from(scheduler_supplier.compaction_scheduler(&compactor_options));
-            let stats = Arc::new(CompactionStats::new(inner.stat_registry.clone()));
-            let executor = Arc::new(TokioCompactionExecutor::new(
-                TokioCompactionExecutorOptions {
-                    handle: compaction_handle,
-                    options: compactor_options.clone(),
-                    worker_tx: tx,
-                    table_store: uncached_table_store.clone(),
-                    rand: rand.clone(),
-                    stats: stats.clone(),
-                    clock: system_clock.clone(),
-                    manifest_store: manifest_store.clone(),
-                    merge_operator: merge_operator.clone(),
-                    #[cfg(feature = "compaction_filters")]
-                    compaction_filter_supplier: compaction_filter_supplier.clone(),
-                },
-            ));
-            let handler = CompactorEventHandler::new(
-                manifest_store.clone(),
-                compactions_store.clone(),
-                compactor_options.clone(),
-                scheduler,
-                executor,
-                rand.clone(),
-                stats.clone(),
-                system_clock.clone(),
-            )
-            .await?;
+        let compactor_builder = self.compactor_builder.or_else(|| {
+            self.settings.compactor_options.as_ref().map(|opts| {
+                CompactorBuilder::new(path.clone(), retrying_main_object_store.clone())
+                    .with_options(opts.clone())
+            })
+        });
+
+        if let Some(compactor_builder) = compactor_builder {
+            let mut builder = compactor_builder
+                .with_system_clock(system_clock.clone())
+                .with_db_metrics(db_metrics.clone())
+                .with_seed(rand.rng().next_u64());
+
+            if let Some(operator) = self.merge_operator {
+                builder = builder.with_merge_operator(operator);
+            }
+
+            let (handler, rx) = builder
+                .build_handler(
+                    uncached_table_store.clone(),
+                    manifest_store.clone(),
+                    compactions_store.clone(),
+                )
+                .await?;
             task_executor.add_handler(
                 COMPACTOR_TASK_NAME.to_string(),
                 Box::new(handler),
@@ -632,21 +573,23 @@ impl<P: Into<Path>> DbBuilder<P> {
             )?;
         }
 
-        // To keep backwards compatibility, check if the gc_runtime or garbage_collector_options are set.
-        // If either are set, we need to initialize the garbage collector.
-        if self.settings.garbage_collector_options.is_some() || self.gc_runtime.is_some() {
-            let gc_options = self.settings.garbage_collector_options.unwrap_or_default();
+        if let Some(gc_options) = self
+            .settings
+            .garbage_collector_options
+            .filter(|opts| !opts.is_empty())
+        {
             let gc = GarbageCollector::new(
                 manifest_store.clone(),
                 compactions_store.clone(),
                 uncached_table_store.clone(),
                 gc_options,
-                inner.stat_registry.clone(),
+                &db_metrics,
                 system_clock.clone(),
             );
             // Garbage collector only uses tickers, so pass in a dummy rx channel
             let (_, rx) = mpsc::unbounded_channel();
-            task_executor.add_handler(GC_TASK_NAME.to_string(), Box::new(gc), rx, &tokio_handle)?;
+            let gc_handle = self.gc_runtime.as_ref().unwrap_or(&tokio_handle);
+            task_executor.add_handler(GC_TASK_NAME.to_string(), Box::new(gc), rx, gc_handle)?;
         }
 
         // Monitor background tasks
@@ -679,6 +622,8 @@ pub struct AdminBuilder<P: Into<Path>> {
     wal_object_store: Option<Arc<dyn ObjectStore>>,
     system_clock: Arc<dyn SystemClock>,
     rand: Arc<DbRand>,
+    #[cfg(feature = "compaction_filters")]
+    compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
 
 impl<P: Into<Path>> AdminBuilder<P> {
@@ -690,6 +635,8 @@ impl<P: Into<Path>> AdminBuilder<P> {
             wal_object_store: None,
             system_clock: Arc::new(DefaultSystemClock::new()),
             rand: Arc::new(DbRand::default()),
+            #[cfg(feature = "compaction_filters")]
+            compaction_filter_supplier: None,
         }
     }
 
@@ -715,6 +662,19 @@ impl<P: Into<Path>> AdminBuilder<P> {
         self
     }
 
+    /// Sets the compaction filter supplier for the compactor run by this admin.
+    ///
+    /// When running a standalone compactor via [`Admin::run_compactor`], ensure it is
+    /// configured with the same filter supplier as the `DbBuilder`.
+    #[cfg(feature = "compaction_filters")]
+    pub fn with_compaction_filter_supplier(
+        mut self,
+        supplier: Arc<dyn CompactionFilterSupplier>,
+    ) -> Self {
+        self.compaction_filter_supplier = Some(supplier);
+        self
+    }
+
     /// Builds and returns an Admin instance.
     pub fn build(self) -> Admin {
         // No retrying object stores here, since we don't want to retry admin operations
@@ -723,6 +683,8 @@ impl<P: Into<Path>> AdminBuilder<P> {
             object_stores: ObjectStores::new(self.main_object_store, self.wal_object_store),
             system_clock: self.system_clock,
             rand: self.rand,
+            #[cfg(feature = "compaction_filters")]
+            compaction_filter_supplier: self.compaction_filter_supplier,
         }
     }
 }
@@ -735,7 +697,7 @@ pub struct GarbageCollectorBuilder<P: Into<Path>> {
     main_object_store: Arc<dyn ObjectStore>,
     wal_object_store: Option<Arc<dyn ObjectStore>>,
     options: GarbageCollectorOptions,
-    stat_registry: Arc<StatRegistry>,
+    db_metrics: DbMetrics,
     system_clock: Arc<dyn SystemClock>,
     rand: Arc<DbRand>,
 }
@@ -747,7 +709,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             main_object_store,
             wal_object_store: None,
             options: GarbageCollectorOptions::default(),
-            stat_registry: Arc::new(StatRegistry::new()),
+            db_metrics: DbMetrics::new(None),
             system_clock: Arc::new(DefaultSystemClock::default()),
             rand: Arc::new(DbRand::default()),
         }
@@ -759,10 +721,16 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
         self
     }
 
-    /// Sets the stats registry to use for the garbage collector.
+    /// Sets a user-provided metrics recorder for the garbage collector.
+    pub fn with_metrics_recorder(mut self, recorder: Arc<dyn MetricsRecorder>) -> Self {
+        self.db_metrics = DbMetrics::new(Some(recorder));
+        self
+    }
+
+    /// Sets the internal db metrics (used when GC is created via DbBuilder).
     #[allow(unused)]
-    pub fn with_stat_registry(mut self, stat_registry: Arc<StatRegistry>) -> Self {
-        self.stat_registry = stat_registry;
+    pub(crate) fn with_db_metrics(mut self, db_metrics: DbMetrics) -> Self {
+        self.db_metrics = db_metrics;
         self
     }
 
@@ -822,7 +790,7 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             compactions_store,
             table_store,
             self.options,
-            self.stat_registry,
+            &self.db_metrics,
             self.system_clock,
         )
     }
@@ -838,9 +806,9 @@ pub struct CompactorBuilder<P: Into<Path>> {
     options: CompactorOptions,
     scheduler_supplier: Option<Arc<dyn CompactionSchedulerSupplier>>,
     rand: Arc<DbRand>,
-    stat_registry: Arc<StatRegistry>,
+    db_metrics: DbMetrics,
     system_clock: Arc<dyn SystemClock>,
-    closed_result: WatchableOnceCell<Result<(), SlateDBError>>,
+    closed_result: ClosedResultWriter,
     merge_operator: Option<MergeOperatorType>,
     block_transformer: Option<Arc<dyn BlockTransformer>>,
     #[cfg(feature = "compaction_filters")]
@@ -857,13 +825,31 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             options: CompactorOptions::default(),
             scheduler_supplier: None,
             rand: Arc::new(DbRand::default()),
-            stat_registry: Arc::new(StatRegistry::new()),
+            db_metrics: DbMetrics::new(None),
             system_clock: Arc::new(DefaultSystemClock::default()),
-            closed_result: WatchableOnceCell::new(),
+            closed_result: ClosedResultWriter::new(WatchableOnceCell::new()),
             merge_operator: None,
             block_transformer: None,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
+        }
+    }
+
+    pub fn into_path_builder(self) -> CompactorBuilder<Path> {
+        CompactorBuilder {
+            path: self.path.into(),
+            main_object_store: self.main_object_store,
+            compaction_runtime: self.compaction_runtime,
+            options: self.options,
+            scheduler_supplier: self.scheduler_supplier,
+            rand: self.rand,
+            db_metrics: self.db_metrics,
+            system_clock: self.system_clock,
+            closed_result: self.closed_result,
+            merge_operator: self.merge_operator,
+            block_transformer: self.block_transformer,
+            #[cfg(feature = "compaction_filters")]
+            compaction_filter_supplier: self.compaction_filter_supplier,
         }
     }
 
@@ -880,10 +866,15 @@ impl<P: Into<Path>> CompactorBuilder<P> {
         self
     }
 
-    /// Sets the stats registry to use for the compactor.
-    #[allow(unused)]
-    pub fn with_stat_registry(mut self, stat_registry: Arc<StatRegistry>) -> Self {
-        self.stat_registry = stat_registry;
+    /// Sets a user-provided metrics recorder for the compactor.
+    pub fn with_metrics_recorder(mut self, recorder: Arc<dyn MetricsRecorder>) -> Self {
+        self.db_metrics = DbMetrics::new(Some(recorder));
+        self
+    }
+
+    /// Sets the internal db metrics (used when compactor is created via DbBuilder).
+    pub(crate) fn with_db_metrics(mut self, db_metrics: DbMetrics) -> Self {
+        self.db_metrics = db_metrics;
         self
     }
 
@@ -893,7 +884,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
         self
     }
 
-    /// Sets the random number generator to use for the compactor.
+    /// Creates the random number generator to use for the compactor with given seed.
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.rand = Arc::new(DbRand::new(seed));
         self
@@ -985,12 +976,412 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             scheduler_supplier,
             self.compaction_runtime,
             self.rand,
-            self.stat_registry,
+            &self.db_metrics,
             self.system_clock,
             self.closed_result,
             self.merge_operator,
             #[cfg(feature = "compaction_filters")]
             self.compaction_filter_supplier,
         )
+    }
+
+    /// Build a CompactorEventHandler from this builder's configuration.
+    ///
+    /// Constructs the compaction scheduler, executor, and stats, then
+    /// returns the handler and its message receiver, which are needed
+    /// to register the compactor with the task executor in DbBuilder::build
+    pub(crate) async fn build_handler(
+        self,
+        table_store: Arc<TableStore>,
+        manifest_store: Arc<ManifestStore>,
+        compactions_store: Arc<CompactionsStore>,
+    ) -> Result<
+        (
+            CompactorEventHandler,
+            mpsc::UnboundedReceiver<CompactorMessage>,
+        ),
+        SlateDBError,
+    > {
+        let options = Arc::new(self.options);
+        let handle = self.compaction_runtime;
+        let scheduler_supplier = self
+            .scheduler_supplier
+            .unwrap_or(Arc::new(SizeTieredCompactionSchedulerSupplier));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let scheduler = Arc::from(scheduler_supplier.compaction_scheduler(&options));
+        let stats = Arc::new(CompactionStats::new(&self.db_metrics));
+        let executor = Arc::new(TokioCompactionExecutor::new(
+            TokioCompactionExecutorOptions {
+                handle,
+                options: options.clone(),
+                worker_tx: tx,
+                table_store,
+                rand: self.rand.clone(),
+                stats: stats.clone(),
+                clock: self.system_clock.clone(),
+                manifest_store: manifest_store.clone(),
+                merge_operator: self.merge_operator,
+                #[cfg(feature = "compaction_filters")]
+                compaction_filter_supplier: self.compaction_filter_supplier,
+            },
+        ));
+        let handler = CompactorEventHandler::new(
+            manifest_store,
+            compactions_store,
+            options,
+            scheduler,
+            executor,
+            self.rand,
+            stats,
+            self.system_clock,
+        )
+        .await?;
+        Ok((handler, rx))
+    }
+}
+
+/// Builder for creating new DbReader instances.
+///
+/// This provides a fluent API for configuring a DbReader object.
+/// It separates the concerns of configuration options (DbReaderOptions) and components.
+///
+/// # Examples
+///
+/// Basic usage:
+///
+/// ```
+/// use slatedb::{Db, DbReader, Error};
+/// use slatedb::object_store::{ObjectStore, memory::InMemory};
+/// use std::sync::Arc;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Error> {
+///     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+///     // First create a database
+///     let db = Db::open("test_db", Arc::clone(&object_store)).await?;
+///     db.close().await?;
+///     // Then open a reader
+///     let reader = DbReader::builder("test_db", object_store)
+///         .build()
+///         .await?;
+///     Ok(())
+/// }
+/// ```
+///
+/// With custom options:
+///
+/// ```
+/// use slatedb::{Db, DbReader, config::DbReaderOptions, Error};
+/// use slatedb::object_store::{ObjectStore, memory::InMemory};
+/// use std::sync::Arc;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Error> {
+///     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+///     // First create a database
+///     let db = Db::open("test_db", Arc::clone(&object_store)).await?;
+///     db.close().await?;
+///     // Then open a reader with custom options
+///     let reader = DbReader::builder("test_db", object_store)
+///         .with_options(DbReaderOptions {
+///             manifest_poll_interval: std::time::Duration::from_secs(5),
+///             ..Default::default()
+///         })
+///         .build()
+///         .await?;
+///     Ok(())
+/// }
+/// ```
+pub struct DbReaderBuilder<P: Into<Path>> {
+    path: P,
+    object_store: Arc<dyn ObjectStore>,
+    wal_object_store: Option<Arc<dyn ObjectStore>>,
+    db_cache: Option<Arc<dyn DbCache>>,
+    checkpoint_id: Option<uuid::Uuid>,
+    merge_operator: Option<MergeOperatorType>,
+    block_transformer: Option<Arc<dyn BlockTransformer>>,
+    options: DbReaderOptions,
+    system_clock: Arc<dyn SystemClock>,
+    rand: Arc<DbRand>,
+    db_metrics: DbMetrics,
+}
+
+impl<P: Into<Path>> DbReaderBuilder<P> {
+    /// Creates a new DbReaderBuilder with the given path and object store.
+    pub fn new(path: P, object_store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            path,
+            object_store,
+            wal_object_store: None,
+            db_cache: default_db_cache(),
+            checkpoint_id: None,
+            merge_operator: None,
+            block_transformer: None,
+            options: DbReaderOptions::default(),
+            system_clock: Arc::new(DefaultSystemClock::default()),
+            rand: Arc::new(DbRand::default()),
+            db_metrics: DbMetrics::new(None),
+        }
+    }
+
+    /// Sets the checkpoint ID to use for the reader.
+    /// If not set, the reader will create and manage its own checkpoint.
+    pub fn with_checkpoint_id(mut self, checkpoint_id: uuid::Uuid) -> Self {
+        self.checkpoint_id = Some(checkpoint_id);
+        self
+    }
+
+    /// Sets a separate object store for the WAL.
+    /// Use this when the database was configured with a separate WAL object store.
+    pub fn with_wal_object_store(mut self, wal_object_store: Arc<dyn ObjectStore>) -> Self {
+        self.wal_object_store = Some(wal_object_store);
+        self
+    }
+
+    /// Sets the merge operator to use when reading merge operands.
+    pub fn with_merge_operator(mut self, merge_operator: MergeOperatorType) -> Self {
+        self.merge_operator = Some(merge_operator);
+        self
+    }
+
+    /// Sets the options to use for the reader.
+    pub fn with_options(mut self, options: DbReaderOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Sets the cache to use for the database for caching sst blocks
+    ///
+    /// SlateDB uses a cache to efficiently store and retrieve blocks and SST metadata locally.
+    /// [`slatedb::db_cache::SplitCache`] is used by default.
+    pub fn with_db_cache(mut self, db_cache: Arc<dyn DbCache>) -> Self {
+        self.db_cache = Some(db_cache);
+        self
+    }
+
+    /// Disables the sst block/metadata cache
+    pub fn with_db_cache_disabled(mut self) -> Self {
+        self.db_cache = None;
+        self
+    }
+
+    /// Sets the system clock to use for the reader.
+    pub fn with_system_clock(mut self, system_clock: Arc<dyn SystemClock>) -> Self {
+        self.system_clock = system_clock;
+        self
+    }
+
+    /// Sets the seed to use for the reader's random number generator.
+    /// All random behavior in SlateDB will use random number generators
+    /// based off of this seed.
+    ///
+    /// If not set, SlateDB uses the OS's random number generator to generate a seed.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.rand = Arc::new(DbRand::new(seed));
+        self
+    }
+
+    /// Sets the metrics to use for the reader.
+    #[allow(unused)]
+    pub(crate) fn with_db_metrics(mut self, db_metrics: DbMetrics) -> Self {
+        self.db_metrics = db_metrics;
+        self
+    }
+
+    /// Sets the block transformer to use for the database. The block transformer
+    /// allows custom encoding/decoding of block data before storage and after
+    /// retrieval. This can be used for encryption or other transformations.
+    ///
+    /// The transformer is applied after compression on write and before
+    /// decompression on read. The checksum is calculated on the transformed data.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_transformer` - An Arc-wrapped block transformer implementation.
+    ///
+    /// # Returns
+    ///
+    /// The builder instance for chaining.
+    pub fn with_block_transformer(mut self, block_transformer: Arc<dyn BlockTransformer>) -> Self {
+        self.block_transformer = Some(block_transformer);
+        self
+    }
+
+    /// Builds and returns a DbReader instance.
+    pub async fn build(self) -> Result<DbReader, crate::Error> {
+        let path = self.path.into();
+        // TODO: proper URI generation, for now it works just as a flag
+        let wal_object_store_uri = self.wal_object_store.as_ref().map(|_| String::new());
+        let retrying_object_store = Arc::new(RetryingObjectStore::new(
+            self.object_store,
+            self.rand.clone(),
+            self.system_clock.clone(),
+        ));
+
+        let retrying_wal_object_store: Option<Arc<dyn ObjectStore>> =
+            self.wal_object_store.map(|s| {
+                Arc::new(RetryingObjectStore::new(
+                    s,
+                    self.rand.clone(),
+                    self.system_clock.clone(),
+                )) as Arc<dyn ObjectStore>
+            });
+
+        // Setup object store with optional caching
+        let maybe_cached = CachedObjectStore::from_config(
+            retrying_object_store.clone(),
+            &self.options.object_store_cache_options,
+            &self.db_metrics,
+            self.system_clock.clone(),
+            self.rand.clone(),
+        )
+        .await?;
+
+        let object_store: Arc<dyn ObjectStore> = match &maybe_cached {
+            Some(cached) => Arc::clone(cached) as Arc<dyn ObjectStore>,
+            None => retrying_object_store,
+        };
+
+        // Validate WAL object store configuration.
+        let manifest_store = Arc::new(ManifestStore::new(&path, object_store.clone()));
+        let latest_manifest =
+            StoredManifest::try_load(manifest_store, self.system_clock.clone()).await?;
+        if let Some(latest_manifest) = &latest_manifest {
+            if latest_manifest.db_state().wal_object_store_uri != wal_object_store_uri {
+                return Err(SlateDBError::WalStoreReconfigurationError.into());
+            }
+        }
+
+        let store_provider = DefaultStoreProvider {
+            path: path.clone(),
+            object_store,
+            wal_object_store: retrying_wal_object_store,
+            block_cache: self.db_cache.clone(),
+            block_transformer: self.block_transformer.clone(),
+        };
+
+        let reader = DbReader::open_internal(
+            &store_provider,
+            self.checkpoint_id,
+            self.merge_operator,
+            self.options,
+            self.system_clock,
+            self.rand,
+        )
+        .await
+        .map_err(crate::Error::from)?;
+
+        if let Some(cached) = &maybe_cached {
+            reader.preload_cache(cached, path).await?;
+        }
+
+        Ok(reader)
+    }
+}
+
+fn default_db_cache() -> Option<Arc<dyn DbCache>> {
+    let block_cache = default_block_cache();
+    let meta_cache = default_meta_cache();
+    Some(Arc::new(
+        SplitCache::new()
+            .with_block_cache(block_cache)
+            .with_meta_cache(meta_cache)
+            .build(),
+    ) as Arc<dyn DbCache>)
+}
+
+#[allow(unreachable_code)]
+pub(crate) fn default_block_cache() -> Option<Arc<dyn DbCache>> {
+    #[cfg(feature = "foyer")]
+    {
+        return Some(Arc::new(crate::db_cache::foyer::FoyerCache::new_with_opts(
+            crate::db_cache::foyer::FoyerCacheOptions {
+                max_capacity: crate::db_cache::DEFAULT_BLOCK_CACHE_CAPACITY,
+                ..Default::default()
+            },
+        )));
+    }
+    #[cfg(feature = "moka")]
+    {
+        return Some(Arc::new(crate::db_cache::moka::MokaCache::new_with_opts(
+            crate::db_cache::moka::MokaCacheOptions {
+                max_capacity: crate::db_cache::DEFAULT_BLOCK_CACHE_CAPACITY,
+                time_to_live: None,
+                time_to_idle: None,
+            },
+        )));
+    }
+    None
+}
+
+#[allow(unreachable_code)]
+pub(crate) fn default_meta_cache() -> Option<Arc<dyn DbCache>> {
+    #[cfg(feature = "foyer")]
+    {
+        return Some(Arc::new(crate::db_cache::foyer::FoyerCache::new_with_opts(
+            crate::db_cache::foyer::FoyerCacheOptions {
+                max_capacity: crate::db_cache::DEFAULT_META_CACHE_CAPACITY,
+                ..Default::default()
+            },
+        )));
+    }
+    #[cfg(feature = "moka")]
+    {
+        return Some(Arc::new(crate::db_cache::moka::MokaCache::new_with_opts(
+            crate::db_cache::moka::MokaCacheOptions {
+                max_capacity: crate::db_cache::DEFAULT_META_CACHE_CAPACITY,
+                time_to_live: None,
+                time_to_idle: None,
+            },
+        )));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::Settings;
+    use crate::garbage_collector::stats::GC_COUNT;
+    use object_store::memory::InMemory;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_db_builder_starts_gc_by_default() {
+        let db = crate::Db::builder(
+            "test_db_builder_starts_gc_by_default",
+            Arc::new(InMemory::new()),
+        )
+        .build()
+        .await
+        .expect("failed to build db");
+
+        assert!(
+            db.metrics().lookup(GC_COUNT).is_some(),
+            "GC should be initialized by default"
+        );
+
+        db.close().await.expect("failed to close db");
+    }
+
+    #[tokio::test]
+    async fn test_db_builder_disables_gc_when_gc_options_are_none() {
+        let db = crate::Db::builder(
+            "test_db_builder_disables_gc_when_gc_options_are_none",
+            Arc::new(InMemory::new()),
+        )
+        .with_settings(Settings {
+            garbage_collector_options: None,
+            ..Settings::default()
+        })
+        .build()
+        .await
+        .expect("failed to build db");
+
+        assert!(
+            db.metrics().lookup(GC_COUNT).is_none(),
+            "GC should not be initialized when options are None"
+        );
+
+        db.close().await.expect("failed to close db");
     }
 }
