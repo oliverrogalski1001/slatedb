@@ -10,6 +10,7 @@ members = [
     "slatedb-dst",
     "slatedb-py",
     "slatedb-txn-obj",
+    "slatedb-ycsb",
 ]
 
 [workspace.package]
@@ -46,6 +47,7 @@ flate2 = "1.1.2"
 flatbuffers = "25.2.10"
 foyer = "0.18.0"
 futures = "0.3.30"
+hdrhistogram = "7.5.4"
 humantime = "2.1.0"
 log = "0.4.27"
 lz4_flex = "0.11.5"
