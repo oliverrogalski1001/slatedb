@@ -1,0 +1,26 @@
+# Yahoo! Cloud System Benchmark
+# Workload E: Short ranges
+#   Application example: threaded conversations, where each scan is for the posts in a given thread (assumed to be clustered by thread id)
+#
+#   Scan/insert ratio: 95/5
+#   Default data size: 1 KB records (10 fields, 100 bytes each, plus key)
+#   Request distribution: zipfian
+
+# The insert order for this workload is hashed, not ordered. The "ordered" insert
+# order in YCSB actually refers to inserting records ordered by their record key.
+
+recordcount=1000
+operationcount=1000
+workload=site.ycsb.workloads.CoreWorkload
+
+readallfields=true
+
+readproportion=0
+updateproportion=0
+scanproportion=0.95
+insertproportion=0.05
+
+requestdistribution=zipfian
+
+maxscanlength=100
+scanlengthdistribution=uniform
