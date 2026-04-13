@@ -1,11 +1,11 @@
-use crate::db_state::{ManifestCore, SsTableId};
+use crate::db_state::ManifestCore;
 use crate::error::SlateDBError;
-use crate::iter::KeyValueIterator;
 use crate::mem_table::WritableKVTable;
-use crate::sst_iter::{SstIterator, SstIteratorOptions};
+use crate::sst_iter::SstIteratorOptions;
 use crate::tablestore::TableStore;
 use crate::types::RowEntry;
 use crate::utils::panic_string;
+use crate::wal::wal_store::{DynWalStore, WalEntryReader};
 use log::error;
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -24,7 +24,11 @@ pub(crate) struct WalReplayOptions {
     /// The maximum number of bytes in each returned table
     pub(crate) max_memtable_bytes: usize,
 
-    /// Options to pass through to underlying SST iterators
+    /// Options to pass through to the underlying SST iterators used by the
+    /// default object-store WAL backend. Other backends (e.g. Corfu) ignore
+    /// this field — the struct stays wider than strictly needed so callers
+    /// that already configure it don't have to change.
+    #[allow(dead_code)]
     pub(crate) sst_iter_options: SstIteratorOptions,
 }
 
@@ -74,24 +78,38 @@ struct ReplayedRow {
     wal_id: u64,
 }
 
-pub(crate) struct WalReplayIterator<'a> {
+/// A WAL reader paired with the WAL id it came from. Tracking the id alongside
+/// the reader lets the replay loop tag entries with their source WAL without
+/// relying on a backend-specific handle.
+struct ReaderWithId {
+    wal_id: u64,
+    reader: Box<dyn WalEntryReader>,
+}
+
+pub(crate) struct WalReplayIterator {
     options: WalReplayOptions,
-    wal_id_range: Range<u64>,
+    /// The WAL ids we plan to replay, in ascending order. Drained from the
+    /// front as prefetches are spawned.
+    pending_wal_ids: VecDeque<u64>,
+    /// All pending WAL ids, retained so error messages can reconstruct the
+    /// original replay range for logging.
+    wal_id_range_debug: Range<u64>,
+    wal_store: DynWalStore,
     table_store: Arc<TableStore>,
-    current_iter: IteratorHolder<SstIterator<'a>>,
-    next_iters: VecDeque<JoinHandle<Result<Option<SstIterator<'a>>, SlateDBError>>>,
+    current_iter: IteratorHolder<ReaderWithId>,
+    next_iters: VecDeque<JoinHandle<Result<ReaderWithId, SlateDBError>>>,
     overflow_row: Option<ReplayedRow>,
     last_tick: i64,
     last_seq: u64,
     min_seq: u64,
-    next_wal_id: u64,
 }
 
-impl WalReplayIterator<'_> {
+impl WalReplayIterator {
     pub(crate) async fn range(
         wal_id_range: Range<u64>,
         db_state: &ManifestCore,
         options: WalReplayOptions,
+        wal_store: DynWalStore,
         table_store: Arc<TableStore>,
     ) -> Result<Self, SlateDBError> {
         let sst_batch_size = options.sst_batch_size;
@@ -106,19 +124,28 @@ impl WalReplayIterator<'_> {
         let min_seq = db_state.last_l0_seq;
         let last_seq = db_state.last_l0_seq;
         let last_tick = db_state.last_l0_clock_tick;
-        let next_wal_id = wal_id_range.start;
+
+        // Enumerate the WALs via the store so backends with non-contiguous ids
+        // (e.g. Corfu) can report only the ones that actually exist.
+        let range_start = wal_id_range.start.saturating_sub(1);
+        let all_ids = wal_store.list_wals(range_start).await?;
+        let pending_wal_ids: VecDeque<u64> = all_ids
+            .into_iter()
+            .filter(|id| wal_id_range.contains(id))
+            .collect();
 
         let mut replay_iter = WalReplayIterator {
             options,
-            wal_id_range,
-            table_store: Arc::clone(&table_store),
+            pending_wal_ids,
+            wal_id_range_debug: wal_id_range,
+            wal_store,
+            table_store,
             current_iter: IteratorHolder::new(),
             next_iters: VecDeque::new(),
             overflow_row: None,
             last_tick,
             last_seq,
             min_seq,
-            next_wal_id,
         };
 
         for _ in 0..sst_batch_size {
@@ -133,39 +160,36 @@ impl WalReplayIterator<'_> {
     pub(crate) async fn new(
         db_state: &ManifestCore,
         options: WalReplayOptions,
+        wal_store: DynWalStore,
         table_store: Arc<TableStore>,
     ) -> Result<Self, SlateDBError> {
         let wal_id_start = db_state.replay_after_wal_id + 1;
-        let wal_id_end = table_store.last_seen_wal_id().await?;
+        let wal_id_end = wal_store.tail().await?;
         let wal_id_range = wal_id_start..(wal_id_end + 1);
-        Self::range(wal_id_range, db_state, options, table_store).await
+        Self::range(wal_id_range, db_state, options, wal_store, table_store).await
     }
 
     fn maybe_load_next_iter(&mut self) -> bool {
-        if !self.wal_id_range.contains(&self.next_wal_id)
+        if self.pending_wal_ids.is_empty()
             || self.next_iters.len() >= self.options.sst_batch_size
         {
             return false;
         }
 
-        let next_wal_id = self.next_wal_id;
-        self.next_wal_id += 1;
+        let next_wal_id = self
+            .pending_wal_ids
+            .pop_front()
+            .expect("pending_wal_ids non-empty");
 
-        async fn load_iter<'a>(
+        async fn load_reader(
             wal_id: u64,
-            sst_iter_options: SstIteratorOptions,
-            table_store: Arc<TableStore>,
-        ) -> Result<Option<SstIterator<'a>>, SlateDBError> {
-            let sst = table_store.open_sst(&SsTableId::Wal(wal_id)).await?;
-            SstIterator::new_owned_initialized(.., sst, Arc::clone(&table_store), sst_iter_options)
-                .await
+            wal_store: DynWalStore,
+        ) -> Result<ReaderWithId, SlateDBError> {
+            let reader = wal_store.open_wal(wal_id).await?;
+            Ok(ReaderWithId { wal_id, reader })
         }
 
-        let handle = task::spawn(load_iter(
-            next_wal_id,
-            self.options.sst_iter_options,
-            Arc::clone(&self.table_store),
-        ));
+        let handle = task::spawn(load_reader(next_wal_id, Arc::clone(&self.wal_store)));
         self.next_iters.push_back(handle);
         true
     }
@@ -173,10 +197,10 @@ impl WalReplayIterator<'_> {
     async fn advance_current_iter(&mut self) -> Result<(), SlateDBError> {
         let next_iter = if let Some(join_handle) = self.next_iters.pop_front() {
             match join_handle.await {
-                Ok(Ok(sst_iter)) => sst_iter,
+                Ok(Ok(reader)) => Some(reader),
                 Ok(Err(slate_err)) => return Err(slate_err),
                 Err(join_err) => {
-                    let task_name = format!("wal_replay[{:?}]", self.wal_id_range);
+                    let task_name = format!("wal_replay[{:?}]", self.wal_id_range_debug);
                     if let Ok(panic_err) = join_err.try_into_panic() {
                         error!(
                             "wal_replay task panicked unexpectedly. [task_name={}, panic={}]",
@@ -220,9 +244,9 @@ impl WalReplayIterator<'_> {
         }
 
         while !self.current_iter.is_finished() {
-            if let Some(sst_iter) = &mut self.current_iter.current_iter {
-                let wal_id = sst_iter.table_id().unwrap_wal_id();
-                while let Some(row_entry) = sst_iter.next_entry().await? {
+            if let Some(reader_with_id) = &mut self.current_iter.current_iter {
+                let wal_id = reader_with_id.wal_id;
+                while let Some(row_entry) = reader_with_id.reader.next_entry().await? {
                     // skip the entries that are already in the L0 SST.
                     if row_entry.seq <= self.min_seq {
                         continue;
@@ -291,6 +315,8 @@ mod tests {
     use crate::proptest_util::{rng, sample};
     use crate::tablestore::TableStore;
     use crate::types::RowEntry;
+    use crate::wal::object_store_wal::ObjectStoreWalStore;
+    use crate::wal::wal_store::DynWalStore;
     use crate::{error::SlateDBError, test_utils};
     use bytes::Bytes;
     use object_store::memory::InMemory;
@@ -310,6 +336,7 @@ mod tests {
         let mut replay_iter = WalReplayIterator::new(
             &ManifestCore::new(),
             WalReplayOptions::default(),
+            test_wal_store(&table_store),
             Arc::clone(&table_store),
         )
         .await
@@ -338,6 +365,7 @@ mod tests {
         let mut replay_iter = WalReplayIterator::new(
             &ManifestCore::new(),
             WalReplayOptions::default(),
+            test_wal_store(&table_store),
             Arc::clone(&table_store),
         )
         .await
@@ -376,6 +404,7 @@ mod tests {
                 min_memtable_bytes,
                 ..WalReplayOptions::default()
             },
+            test_wal_store(&table_store),
             Arc::clone(&table_store),
         )
         .await
@@ -429,6 +458,7 @@ mod tests {
                 max_memtable_bytes,
                 ..WalReplayOptions::default()
             },
+            test_wal_store(&table_store),
             Arc::clone(&table_store),
         )
         .await
@@ -494,6 +524,7 @@ mod tests {
         let mut replay_iter = WalReplayIterator::new(
             &db_state,
             WalReplayOptions::default(),
+            test_wal_store(&table_store),
             Arc::clone(&table_store),
         )
         .await
@@ -533,6 +564,7 @@ mod tests {
         let mut replay_iter = WalReplayIterator::new(
             &db_state,
             WalReplayOptions::default(),
+            test_wal_store(&table_store),
             Arc::clone(&table_store),
         )
         .await
@@ -564,6 +596,10 @@ mod tests {
             path,
             None,
         ))
+    }
+
+    fn test_wal_store(table_store: &Arc<TableStore>) -> DynWalStore {
+        Arc::new(ObjectStoreWalStore::new_read_only(Arc::clone(table_store)))
     }
 
     /// Write a sequence of WALs with a random (bounded) number of entries.

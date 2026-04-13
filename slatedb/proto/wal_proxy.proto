@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+package slatedb.wal_proxy.v1;
+
+// gRPC service exposed by the Corfu sidecar (`corfu-wal-proxy`). The proxy
+// holds a CorfuRuntime + IStreamView and forwards SlateDB's WAL operations
+// onto the shared log. The wire format treats every WAL flush batch as one
+// opaque payload — SlateDB serializes the entries on the client side using
+// the same row codec it uses for in-memory KVTable replay, so the proxy
+// never inspects the contents.
+
+service WalProxy {
+  // Append one WAL batch and return the global address the sequencer
+  // assigned to it. SlateDB uses this address as the WAL id.
+  rpc Append(AppendRequest) returns (AppendResponse);
+
+  // Stream every WAL whose address is strictly greater than `after_addr`,
+  // up to the current tail. Each response carries one full WAL payload.
+  rpc Read(ReadRequest) returns (stream ReadEntry);
+
+  // List the addresses of every WAL strictly greater than `after_addr`.
+  // Used by the recovery iterator to enumerate the replay range.
+  rpc List(ListRequest) returns (ListResponse);
+
+  // Return the highest visible WAL address.
+  rpc Tail(TailRequest) returns (TailResponse);
+
+  // Prefix-trim every WAL with address <= `up_to`. Best-effort GC hint.
+  rpc Trim(TrimRequest) returns (TrimResponse);
+}
+
+message AppendRequest {
+  bytes payload = 1;
+}
+
+message AppendResponse {
+  uint64 address = 1;
+}
+
+message ReadRequest {
+  uint64 after_addr = 1;
+}
+
+message ReadEntry {
+  uint64 address = 1;
+  bytes payload = 2;
+}
+
+message ListRequest {
+  uint64 after_addr = 1;
+}
+
+message ListResponse {
+  repeated uint64 addresses = 1;
+}
+
+message TailRequest {}
+
+message TailResponse {
+  uint64 address = 1;
+}
+
+message TrimRequest {
+  uint64 up_to = 1;
+}
+
+message TrimResponse {}

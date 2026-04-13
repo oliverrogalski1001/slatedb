@@ -152,6 +152,7 @@ use crate::retrying_object_store::RetryingObjectStore;
 use crate::stats::StatRegistry;
 use crate::tablestore::TableStore;
 use crate::utils::WatchableOnceCell;
+use crate::wal::wal_store::DynWalStore;
 use slatedb_common::clock::DefaultSystemClock;
 use slatedb_common::clock::SystemClock;
 
@@ -164,6 +165,9 @@ pub struct DbBuilder<P: Into<Path>> {
     settings: Settings,
     main_object_store: Arc<dyn ObjectStore>,
     wal_object_store: Option<Arc<dyn ObjectStore>>,
+    /// Optional pluggable WAL backend. When `None`, the default object-store
+    /// SST WAL is used (the field above selects the backing store).
+    wal_store: Option<DynWalStore>,
     memory_cache: Option<Arc<dyn DbCache>>,
     system_clock: Option<Arc<dyn SystemClock>>,
     gc_runtime: Option<Handle>,
@@ -186,6 +190,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             main_object_store,
             settings: Settings::default(),
             wal_object_store: None,
+            wal_store: None,
             memory_cache: None,
             system_clock: None,
             gc_runtime: None,
@@ -214,6 +219,20 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// durable and available enough for your use case.
     pub fn with_wal_object_store(mut self, wal_object_store: Arc<dyn ObjectStore>) -> Self {
         self.wal_object_store = Some(wal_object_store);
+        self
+    }
+
+    /// Plug in a custom [`WalStore`](crate::wal::wal_store::WalStore) implementation
+    /// in place of the default object-store-backed WAL.
+    ///
+    /// When set, the database will use the provided store for every WAL append,
+    /// listing, read, and trim. The `with_wal_object_store` setting is ignored
+    /// for WAL data flow in this case (it can still be used by tooling that
+    /// reads SST-formatted WALs out-of-band).
+    ///
+    /// Intended for backends like Corfu that don't fit the object store API.
+    pub fn with_wal_store(mut self, wal_store: DynWalStore) -> Self {
+        self.wal_store = Some(wal_store);
         self
     }
 
@@ -529,6 +548,7 @@ impl<P: Into<Path>> DbBuilder<P> {
         // Create the database inner state
         let mut settings = self.settings.clone();
         settings.merge_operator = merge_operator.clone();
+        let wal_store_override = self.wal_store.clone();
         let inner = Arc::new(
             DbInner::new(
                 settings,
@@ -541,6 +561,7 @@ impl<P: Into<Path>> DbBuilder<P> {
                 stat_registry,
                 self.fp_registry.clone(),
                 merge_operator.clone(),
+                wal_store_override,
             )
             .await?,
         );

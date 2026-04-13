@@ -137,7 +137,7 @@ mod transaction_manager;
 mod types;
 mod utils;
 
-mod wal;
+pub mod wal;
 mod wal_buffer;
 mod wal_id;
 mod wal_replay;
