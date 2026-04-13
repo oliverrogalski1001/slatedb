@@ -421,14 +421,10 @@ impl DbReaderInner {
             core.next_wal_sst_id
         };
 
-        let wal_store: crate::wal::wal_store::DynWalStore = Arc::new(
-            crate::wal::object_store_wal::ObjectStoreWalStore::new_read_only(Arc::clone(&table_store)),
-        );
         let mut replay_iter = WalReplayIterator::range(
             wal_id_start..wal_id_end,
             core,
             replay_options,
-            wal_store,
             Arc::clone(&table_store),
         )
         .await?;

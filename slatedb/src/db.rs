@@ -68,8 +68,6 @@ use crate::stats::StatRegistry;
 use crate::tablestore::TableStore;
 use crate::transaction_manager::TransactionManager;
 use crate::utils::{format_bytes_si, MonotonicSeq, SendSafely};
-use crate::wal::object_store_wal::ObjectStoreWalStore;
-use crate::wal::wal_store::DynWalStore;
 use crate::wal_buffer::{WalBufferManager, WAL_BUFFER_TASK_NAME};
 use crate::wal_replay::{WalReplayIterator, WalReplayOptions};
 use slatedb_common::clock::SystemClock;
@@ -105,7 +103,6 @@ pub(crate) struct DbInner {
 }
 
 impl DbInner {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
         settings: Settings,
         system_clock: Arc<dyn SystemClock>,
@@ -117,7 +114,6 @@ impl DbInner {
         stat_registry: Arc<StatRegistry>,
         fp_registry: Arc<FailPointRegistry>,
         merge_operator: Option<crate::merge_operator::MergeOperatorType>,
-        wal_store_override: Option<DynWalStore>,
     ) -> Result<Self, SlateDBError> {
         // both last_seq and last_committed_seq will be updated after WAL replay.
         let last_l0_seq = manifest.value.core.last_l0_seq;
@@ -150,18 +146,13 @@ impl DbInner {
         };
 
         let recent_flushed_wal_id = state.read().state().core().replay_after_wal_id;
-        let wal_store: DynWalStore = wal_store_override.unwrap_or_else(|| {
-            Arc::new(ObjectStoreWalStore::new(
-                table_store.clone(),
-                state.clone(),
-            ))
-        });
         let wal_buffer = Arc::new(WalBufferManager::new(
-            wal_store,
+            state.clone(),
             state.clone(),
             db_stats.clone(),
             recent_flushed_wal_id,
             oracle.clone(),
+            table_store.clone(),
             mono_clock.clone(),
             settings.l0_sst_size_bytes,
             settings.flush_interval,
@@ -508,13 +499,9 @@ impl DbInner {
         };
 
         let db_state = self.state.read().state().core().clone();
-        let mut replay_iter = WalReplayIterator::new(
-            &db_state,
-            replay_options,
-            Arc::clone(self.wal_buffer.backend()),
-            Arc::clone(&self.table_store),
-        )
-        .await?;
+        let mut replay_iter =
+            WalReplayIterator::new(&db_state, replay_options, Arc::clone(&self.table_store))
+                .await?;
 
         while let Some(replayed_table) = replay_iter.next().await? {
             self.maybe_apply_backpressure().await?;
