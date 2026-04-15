@@ -7,7 +7,8 @@ use crate::merge_iterator::MergeIterator;
 use crate::merge_operator::{
     MergeOperatorIterator, MergeOperatorRequiredIterator, MergeOperatorType,
 };
-use crate::types::{KeyValue, RowEntry, ValueDeletable};
+use crate::tablestore::TableStore;
+use crate::types::{BlobRef, KeyValue, RowEntry, ValueDeletable};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -208,6 +209,7 @@ pub struct DbIterator {
     invalidated_error: Option<SlateDBError>,
     last_key: Option<Bytes>,
     range_tracker: Option<Arc<DbIteratorRangeTracker>>,
+    table_store: Option<Arc<TableStore>>,
 }
 
 impl DbIterator {
@@ -220,6 +222,7 @@ impl DbIterator {
         max_seq: Option<u64>,
         range_tracker: Option<Arc<DbIteratorRangeTracker>>,
         merge_operator: Option<MergeOperatorType>,
+        table_store: Option<Arc<TableStore>>,
     ) -> Result<Self, SlateDBError> {
         // The write_batch iterator is provided only when operating within a Transaction. It represents the uncommitted
         // writes made during the transaction. We do not need to apply the max_seq filter to them, because they do
@@ -280,6 +283,39 @@ impl DbIterator {
             invalidated_error: None,
             last_key: None,
             range_tracker,
+            table_store,
+        })
+    }
+
+    async fn read_blob_value(&self, blob_ref: BlobRef) -> Result<Bytes, SlateDBError> {
+        let table_store = self
+            .table_store
+            .as_ref()
+            .ok_or(SlateDBError::InvalidDBState)?;
+        table_store.get_blob(blob_ref.blob_id).await
+    }
+
+    async fn row_entry_to_key_value(&self, entry: RowEntry) -> Result<KeyValue, SlateDBError> {
+        let RowEntry {
+            key,
+            value,
+            seq,
+            create_ts,
+            expire_ts,
+        } = entry;
+
+        let value = match value {
+            ValueDeletable::Value(value) | ValueDeletable::Merge(value) => value,
+            ValueDeletable::BlobRef(blob_ref) => self.read_blob_value(blob_ref).await?,
+            ValueDeletable::Tombstone => return Err(SlateDBError::UnexpectedTombstone),
+        };
+
+        Ok(KeyValue {
+            key,
+            value,
+            seq,
+            create_ts: create_ts.unwrap_or(0),
+            expire_ts,
         })
     }
 
@@ -294,14 +330,7 @@ impl DbIterator {
     pub async fn next(&mut self) -> Result<Option<KeyValue>, crate::Error> {
         let entry_opt = self.next_entry().await?;
         match entry_opt {
-            Some(entry) => {
-                if entry.value.is_tombstone() {
-                    return Err(crate::Error::from(
-                        crate::error::SlateDBError::UnexpectedTombstone,
-                    ));
-                }
-                Ok(Some(KeyValue::from(entry)))
-            }
+            Some(entry) => Ok(Some(self.row_entry_to_key_value(entry).await?)),
             None => Ok(None),
         }
     }
@@ -418,6 +447,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -459,6 +489,7 @@ mod tests {
             Some(100),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -487,6 +518,7 @@ mod tests {
             vec![Box::new(mem_iter) as Box<dyn RowEntryIterator + 'static>],
             VecDeque::new(),
             VecDeque::new(),
+            None,
             None,
             None,
             None,
@@ -536,6 +568,7 @@ mod tests {
             mem_iters,
             VecDeque::new(),
             VecDeque::new(),
+            None,
             None,
             None,
             None,

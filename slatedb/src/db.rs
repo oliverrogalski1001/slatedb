@@ -1794,6 +1794,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_scan_large_flushed_values_from_blob_storage() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut options = test_db_options(0, 1024, None);
+        options.blob_options = Some(BlobOptions::default());
+
+        let db = Db::builder("/tmp/test_scan_blob_backed_value", object_store)
+            .with_settings(options)
+            .build()
+            .await
+            .unwrap();
+
+        let large_value = vec![b'y'; 4096];
+        db.put(b"blob-key", large_value.as_slice()).await.unwrap();
+        db.flush().await.unwrap();
+
+        let mut iter = db.scan(b"blob-key".as_slice()..).await.unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, Bytes::from_static(b"blob-key"));
+        assert_eq!(kv.value, Bytes::from(large_value));
+        assert!(iter.next().await.unwrap().is_none());
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_manifest_returns_current_manifest_core() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let db = Db::builder("/tmp/test_manifest_accessor", object_store)

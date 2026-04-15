@@ -344,6 +344,7 @@ impl Reader {
             max_seq,
             None,
             self.merge_operator.clone(),
+            Some(self.table_store.clone()),
         )
         .await?;
 
@@ -410,6 +411,7 @@ impl Reader {
             max_seq,
             range_tracker,
             self.merge_operator.clone(),
+            Some(self.table_store.clone()),
         )
         .await
     }
