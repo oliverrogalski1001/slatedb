@@ -8,7 +8,9 @@ use crate::merge_operator::{MergeOperatorIterator, MergeOperatorRequiredIterator
 use crate::oracle::Oracle;
 use crate::reader::DbStateReader;
 use crate::retention_iterator::RetentionIterator;
+use crate::types::{BlobRef, RowEntry, ValueDeletable};
 use std::sync::Arc;
+use ulid::Ulid;
 
 impl DbInner {
     pub(crate) async fn flush_imm_table(
@@ -20,6 +22,7 @@ impl DbInner {
         let mut sst_builder = self.table_store.table_builder();
         let mut iter = self.iter_imm_table(imm_table.clone()).await?;
         while let Some(entry) = iter.next().await? {
+            let entry = self.externalize_blob_value_if_needed(entry).await?;
             sst_builder.add(entry).await?;
         }
 
@@ -76,11 +79,48 @@ impl DbInner {
         iter.init().await?;
         Ok(iter)
     }
+
+    async fn externalize_blob_value_if_needed(
+        &self,
+        entry: RowEntry,
+    ) -> Result<RowEntry, SlateDBError> {
+        let Some(blob_options) = self.settings.blob_options.as_ref() else {
+            return Ok(entry);
+        };
+
+        let RowEntry {
+            key,
+            value,
+            seq,
+            create_ts,
+            expire_ts,
+        } = entry;
+
+        match value {
+            ValueDeletable::Value(value) if value.len() >= blob_options.min_value_size => {
+                let blob_id = Ulid::new();
+                self.table_store.put_blob(blob_id, value.clone()).await?;
+
+                Ok(RowEntry::new(
+                    key,
+                    ValueDeletable::BlobRef(BlobRef::new(
+                        blob_id,
+                        u32::try_from(value.len()).expect("blob size > u32"),
+                    )),
+                    seq,
+                    create_ts,
+                    expire_ts,
+                ))
+            }
+            value => Ok(RowEntry::new(key, value, seq, create_ts, expire_ts)),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::block_iterator::BlockIteratorLatest;
+    use crate::config::{BlobOptions, Settings};
     use crate::db::Db;
     use crate::db_state::{SsTableHandle, SsTableId};
     use crate::error::SlateDBError;
@@ -104,8 +144,13 @@ mod tests {
     }
 
     async fn setup_test_db(set_merge_operator: bool) -> Db {
+        setup_test_db_with_settings(set_merge_operator, Settings::default()).await
+    }
+
+    async fn setup_test_db_with_settings(set_merge_operator: bool, settings: Settings) -> Db {
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let builder = Db::builder("/tmp/test_flush_imm_table", object_store);
+        let builder =
+            Db::builder("/tmp/test_flush_imm_table", object_store).with_settings(settings);
         let builder = if set_merge_operator {
             builder.with_merge_operator(Arc::new(StringConcatMergeOperator))
         } else {
@@ -114,11 +159,10 @@ mod tests {
         builder.build().await.unwrap()
     }
 
-    async fn verify_sst(
+    async fn read_sst_entries(
         db: &Db,
         sst_handle: &SsTableHandle,
-        entries: &[(Bytes, u64, ValueDeletable)],
-    ) {
+    ) -> Vec<(Bytes, u64, ValueDeletable)> {
         let index = db
             .inner
             .table_store
@@ -141,6 +185,15 @@ mod tests {
                 found_entries.push((entry.key.clone(), entry.seq, entry.value.clone()));
             }
         }
+        found_entries
+    }
+
+    async fn verify_sst(
+        db: &Db,
+        sst_handle: &SsTableHandle,
+        entries: &[(Bytes, u64, ValueDeletable)],
+    ) {
+        let found_entries = read_sst_entries(db, sst_handle).await;
         assert_eq!(entries.len(), found_entries.len());
         for i in 0..found_entries.len() {
             let (actual_key, actual_seq, actual_value) = &found_entries[i];
@@ -484,6 +537,102 @@ mod tests {
             ],
         )
         .await;
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_externalize_large_values_to_blobs_during_flush() {
+        let db = setup_test_db_with_settings(
+            false,
+            Settings {
+                blob_options: Some(BlobOptions::default()),
+                ..Settings::default()
+            },
+        )
+        .await;
+        db.inner.txn_manager.new_snapshot(Some(0));
+        db.inner.oracle.advance_durable_seq(u64::MAX);
+
+        let small_value = Bytes::from("small-value");
+        let large_value = Bytes::from(vec![b'x'; 4096]);
+
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"blob-key", large_value.as_ref(), 2));
+        table.put(RowEntry::new_value(b"inline-key", small_value.as_ref(), 1));
+        let id = SsTableId::Compacted(Ulid::new());
+
+        let sst_handle = db
+            .inner
+            .flush_imm_table(&id, table.table().clone(), false)
+            .await
+            .unwrap();
+
+        let found_entries = read_sst_entries(&db, &sst_handle).await;
+        assert_eq!(found_entries.len(), 2);
+
+        let blob_entry = found_entries
+            .iter()
+            .find(|(key, _, _)| key.as_ref() == b"blob-key")
+            .expect("blob entry should be present");
+        assert_eq!(blob_entry.1, 2);
+
+        let blob_ref = match &blob_entry.2 {
+            ValueDeletable::BlobRef(blob_ref) => *blob_ref,
+            value => panic!("expected blob ref, found {value:?}"),
+        };
+        assert_eq!(blob_ref.size, large_value.len() as u32);
+        let stored_blob = db
+            .inner
+            .table_store
+            .get_blob(blob_ref.blob_id)
+            .await
+            .unwrap();
+        assert_eq!(stored_blob, large_value);
+
+        let inline_entry = found_entries
+            .iter()
+            .find(|(key, _, _)| key.as_ref() == b"inline-key")
+            .expect("inline entry should be present");
+        assert_eq!(inline_entry.2, ValueDeletable::Value(small_value.clone()),);
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_keep_merge_operands_inline_when_blob_options_are_enabled() {
+        let db = setup_test_db_with_settings(
+            true,
+            Settings {
+                blob_options: Some(BlobOptions::default()),
+                ..Settings::default()
+            },
+        )
+        .await;
+        db.inner.txn_manager.new_snapshot(Some(0));
+        db.inner.oracle.advance_durable_seq(u64::MAX);
+
+        let large_merge = Bytes::from(vec![b'm'; 4096]);
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_merge(b"merge-key", large_merge.as_ref(), 1));
+        let id = SsTableId::Compacted(Ulid::new());
+
+        let sst_handle = db
+            .inner
+            .flush_imm_table(&id, table.table().clone(), false)
+            .await
+            .unwrap();
+
+        let found_entries = read_sst_entries(&db, &sst_handle).await;
+        assert_eq!(found_entries.len(), 1);
+        assert_eq!(
+            found_entries[0],
+            (
+                Bytes::from("merge-key"),
+                1,
+                ValueDeletable::Merge(large_merge),
+            )
+        );
 
         db.close().await.unwrap();
     }
