@@ -159,8 +159,7 @@ impl MultiWriterBench {
         let total_fences = stats.total_fences.load(Ordering::Relaxed);
         let total_fbf = stats.total_fenced_before_flush.load(Ordering::Relaxed);
         let effective_puts = total_puts.saturating_sub(total_fbf);
-        let effective_puts_bytes =
-            total_puts_bytes.saturating_sub(total_fbf * self.val_len as u64);
+        let effective_puts_bytes = total_puts_bytes.saturating_sub(total_fbf * self.val_len as u64);
 
         info!(
             "multi-writer final [elapsed: {:.3}s, put/s: {:.3} ({:.3} MiB/s), effective put/s: {:.3} ({:.3} MiB/s), get/s: {:.3} ({:.3} MiB/s), total: puts={}, effective_puts={}, gets={}, fences={}, fenced-before-flush={}]",
@@ -209,7 +208,7 @@ async fn writer_loop(
         let mut builder =
             Db::builder(path.clone(), object_store.clone()).with_settings(settings.clone());
         if let Some(ref cache) = memory_cache {
-            builder = builder.with_memory_cache(cache.clone());
+            builder = builder.with_db_cache(cache.clone());
         }
 
         let db = match builder.build().await {
@@ -284,10 +283,7 @@ async fn writer_loop(
         if any_fenced {
             let lost = session_unflushed.load(Ordering::Relaxed);
             stats.record_fence(Instant::now(), lost);
-            info!(
-                "writer {} was fenced [unflushed_ops={}]",
-                writer_id, lost
-            );
+            info!("writer {} was fenced [unflushed_ops={}]", writer_id, lost);
 
             if !reopen_on_fence {
                 break;
@@ -450,8 +446,10 @@ impl MultiWriterStatsRecorder {
     fn record_ops(&self, now: Instant, puts: u64, gets: u64, puts_bytes: u64, gets_bytes: u64) {
         self.total_puts.fetch_add(puts, Ordering::Relaxed);
         self.total_gets.fetch_add(gets, Ordering::Relaxed);
-        self.total_puts_bytes.fetch_add(puts_bytes, Ordering::Relaxed);
-        self.total_gets_bytes.fetch_add(gets_bytes, Ordering::Relaxed);
+        self.total_puts_bytes
+            .fetch_add(puts_bytes, Ordering::Relaxed);
+        self.total_gets_bytes
+            .fetch_add(gets_bytes, Ordering::Relaxed);
 
         self.recorder.record(now, |window| {
             window.puts += puts;
@@ -483,7 +481,15 @@ impl MultiWriterStatsRecorder {
             let gets_bytes: u64 = windows.iter().map(|w| w.gets_bytes).sum();
             let fences: u64 = windows.iter().map(|w| w.fences).sum();
             let fenced_before_flush: u64 = windows.iter().map(|w| w.fenced_before_flush).sum();
-            (range, puts, gets, puts_bytes, gets_bytes, fences, fenced_before_flush)
+            (
+                range,
+                puts,
+                gets,
+                puts_bytes,
+                gets_bytes,
+                fences,
+                fenced_before_flush,
+            )
         })
     }
 }

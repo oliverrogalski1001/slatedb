@@ -11,7 +11,7 @@ use tracing::{error, info};
 
 use crate::db_runner::DbRunner;
 use crate::keygen::{build_key, make_chooser, AcknowledgedCounter, KeyChooser};
-use crate::metrics::{Metrics, OpType};
+use crate::metrics::{LocalMetrics, Metrics, OpType, MERGE_EVERY};
 use crate::properties::{Distribution, Workload};
 
 /// Op chooser backed by cumulative thresholds over the five YCSB op types.
@@ -89,9 +89,12 @@ pub(crate) async fn run_load_phase(
         let thread_seed = seed.wrapping_add(tid as u64);
         handles.push(tokio::spawn(async move {
             let mut rng = Xoshiro256PlusPlus::seed_from_u64(thread_seed);
+            let mut local = LocalMetrics::new();
+            let mut since_merge: u64 = 0;
             loop {
                 let keynum = next_key.fetch_add(1, Ordering::Relaxed);
                 if keynum >= end_key {
+                    metrics.merge_local(&mut local);
                     return;
                 }
                 let key = build_key(keynum, insert_order, zero_padding);
@@ -102,7 +105,13 @@ pub(crate) async fn run_load_phase(
                 if let Err(e) = &res {
                     error!("insert error keynum={keynum}: {e}");
                 }
-                metrics.record(OpType::Insert, dt, ok);
+                metrics.record_outcome(OpType::Insert, ok);
+                local.record(OpType::Insert, dt);
+                since_merge += 1;
+                if since_merge >= MERGE_EVERY {
+                    metrics.merge_local(&mut local);
+                    since_merge = 0;
+                }
                 if ok {
                     ack.acknowledge(keynum + 1);
                 }
@@ -163,6 +172,8 @@ pub(crate) async fn run_run_phase(
         let thread_seed = seed.wrapping_add(tid as u64).wrapping_add(0xC0FFEE);
         handles.push(tokio::spawn(async move {
             let mut rng = Xoshiro256PlusPlus::seed_from_u64(thread_seed);
+            let mut local = LocalMetrics::new();
+            let mut since_merge: u64 = 0;
             let insert_start = workload.insert_start;
             let insert_end = workload.insert_start + workload.record_count;
             let mut chooser: Box<dyn KeyChooser> = make_chooser(
@@ -180,11 +191,13 @@ pub(crate) async fn run_run_phase(
             loop {
                 if let Some(d) = deadline {
                     if Instant::now() >= d {
+                        metrics.merge_local(&mut local);
                         return;
                     }
                 }
                 let done = op_counter.fetch_add(1, Ordering::Relaxed);
                 if done >= target_ops && deadline.is_none() {
+                    metrics.merge_local(&mut local);
                     return;
                 }
 
@@ -232,7 +245,13 @@ pub(crate) async fn run_run_phase(
                 if let Err(e) = &res {
                     error!("op error: {e}");
                 }
-                metrics.record(op, dt, ok);
+                metrics.record_outcome(op, ok);
+                local.record(op, dt);
+                since_merge += 1;
+                if since_merge >= MERGE_EVERY {
+                    metrics.merge_local(&mut local);
+                    since_merge = 0;
+                }
             }
         }));
     }

@@ -26,6 +26,16 @@ impl OpType {
         }
     }
 
+    fn index(&self) -> usize {
+        match self {
+            OpType::Read => 0,
+            OpType::Update => 1,
+            OpType::Insert => 2,
+            OpType::Scan => 3,
+            OpType::ReadModifyWrite => 4,
+        }
+    }
+
     pub(crate) const ALL: [OpType; 5] = [
         OpType::Read,
         OpType::Update,
@@ -33,6 +43,33 @@ impl OpType {
         OpType::Scan,
         OpType::ReadModifyWrite,
     ];
+}
+
+/// How often a worker drains its local histograms into the shared `Metrics`.
+/// Higher values reduce mutex contention but make mid-run percentile reports
+/// lag by up to this many ops per worker.
+pub(crate) const MERGE_EVERY: u64 = 1024;
+
+/// Per-task latency collector. Records into owned histograms with no locking
+/// on the hot path; the worker periodically drains it into the shared `Metrics`
+/// via `Metrics::merge_local`.
+pub(crate) struct LocalMetrics {
+    histograms: [Histogram<u64>; 5],
+}
+
+impl LocalMetrics {
+    pub(crate) fn new() -> Self {
+        Self {
+            histograms: std::array::from_fn(|_| {
+                Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).expect("valid histogram")
+            }),
+        }
+    }
+
+    pub(crate) fn record(&mut self, op: OpType, latency: Duration) {
+        let us = latency.as_micros().min(60_000_000) as u64;
+        let _ = self.histograms[op.index()].record(us.max(1));
+    }
 }
 
 struct OpStats {
@@ -83,16 +120,16 @@ impl Metrics {
         }
     }
 
-    pub(crate) fn record(&self, op: OpType, latency: Duration, ok: bool) {
+    /// Bump only the ok/err counters for `op`. Latencies should be recorded
+    /// into a per-task `LocalMetrics` and merged in via `LocalMetrics::merge_into`
+    /// to avoid contending on the shared histogram mutex on the hot path.
+    pub(crate) fn record_outcome(&self, op: OpType, ok: bool) {
         let stats = self.stats_for(op);
         if ok {
             stats.ok_count.fetch_add(1, Ordering::Relaxed);
         } else {
             stats.err_count.fetch_add(1, Ordering::Relaxed);
         }
-        let us = latency.as_micros().min(60_000_000) as u64;
-        let mut h = stats.histogram.lock().expect("histogram mutex poisoned");
-        let _ = h.record(us.max(1));
     }
 
     fn stats_for(&self, op: OpType) -> &OpStats {
@@ -158,6 +195,23 @@ impl Metrics {
                 "[{label}], 999thPercentileLatency(us), {}",
                 h.value_at_quantile(0.999)
             );
+        }
+    }
+
+    /// Drain a per-task `LocalMetrics` into the shared histograms. Acquires the
+    /// global mutex exactly once per non-empty op type — call this from worker
+    /// tasks every `MERGE_EVERY` ops and once more at task exit.
+    pub(crate) fn merge_local(&self, local: &mut LocalMetrics) {
+        for op in OpType::ALL {
+            let h = &mut local.histograms[op.index()];
+            if h.len() == 0 {
+                continue;
+            }
+            let stats = self.stats_for(op);
+            let mut g = stats.histogram.lock().expect("histogram mutex poisoned");
+            g.add(&*h).expect("histogram add");
+            drop(g);
+            h.reset();
         }
     }
 

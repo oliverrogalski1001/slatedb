@@ -230,24 +230,36 @@ impl KeyChooser for ScrambledZipfianChooser {
 }
 
 /// Latest distribution — skewed toward the most recently inserted key.
+///
+/// Matches YCSB Java's `SkewedLatestGenerator`: the `Zipfian` is built once at
+/// construction with `span = max - min` (the keyspace size at load time) and
+/// is never rebuilt. Each call samples an offset from this fixed distribution
+/// and subtracts it from the live `ack` value, so newly inserted keys slide the
+/// sampling window forward without any per-call zeta recomputation.
 pub(crate) struct LatestChooser {
-    min: u64,
     ack: std::sync::Arc<AcknowledgedCounter>,
-    theta: f64,
+    zipf: Zipfian,
 }
 
 impl LatestChooser {
-    pub(crate) fn new(min: u64, ack: std::sync::Arc<AcknowledgedCounter>, theta: f64) -> Self {
-        Self { min, ack, theta }
+    pub(crate) fn new(
+        min: u64,
+        max: u64,
+        ack: std::sync::Arc<AcknowledgedCounter>,
+        theta: f64,
+    ) -> Self {
+        let span = max.saturating_sub(min).max(1);
+        Self {
+            ack,
+            zipf: Zipfian::new(0, span, theta),
+        }
     }
 }
 
 impl KeyChooser for LatestChooser {
     fn next_key(&mut self, rng: &mut dyn RngCore) -> u64 {
         let last = self.ack.get();
-        let span = last.saturating_sub(self.min).max(1);
-        let zipf = Zipfian::new(0, span, self.theta);
-        let offset = zipf.next(rng);
+        let offset = self.zipf.next(rng);
         last.saturating_sub(offset)
     }
 }
@@ -303,7 +315,7 @@ pub(crate) fn make_chooser(
         Distribution::Uniform => Box::new(UniformChooser::new(min, max, ack)),
         Distribution::Sequential => Box::new(SequentialChooser::new(min, max, ack)),
         Distribution::Zipfian => Box::new(ScrambledZipfianChooser::new(min, max, theta)),
-        Distribution::Latest => Box::new(LatestChooser::new(min, ack, theta)),
+        Distribution::Latest => Box::new(LatestChooser::new(min, max, ack, theta)),
         Distribution::Hotspot => Box::new(HotspotChooser::new(
             min,
             max,
@@ -379,7 +391,7 @@ mod tests {
     #[test]
     fn latest_chooser_returns_recent_keys() {
         let ack = std::sync::Arc::new(AcknowledgedCounter::new(1000));
-        let mut c = LatestChooser::new(0, ack, 0.99);
+        let mut c = LatestChooser::new(0, 1000, ack, 0.99);
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(42);
         let mut high_bucket = 0;
         for _ in 0..5_000 {

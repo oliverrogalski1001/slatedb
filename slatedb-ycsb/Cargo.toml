@@ -25,7 +25,7 @@ rand_xoshiro = { workspace = true }
 slatedb = { workspace = true, features = ["aws", "azure", "wal_disable"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "tracing-log"] }
 
 [lints]
 workspace = true
