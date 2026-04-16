@@ -7,6 +7,7 @@ use thiserror::Error;
 use crate::{
     error::SlateDBError,
     iter::{RowEntryIterator, TrackedRowEntryIterator},
+    tablestore::TableStore,
     types::{RowEntry, ValueDeletable},
     utils::merge_options,
 };
@@ -183,6 +184,7 @@ impl<T: TrackedRowEntryIterator> TrackedRowEntryIterator for MergeOperatorRequir
 pub(crate) struct MergeOperatorIterator<T: RowEntryIterator> {
     merge_operator: MergeOperatorType,
     delegate: T,
+    table_store: Option<Arc<TableStore>>,
     /// Entry from the delegate that we've peeked ahead and buffered.
     buffered_entry: Option<RowEntry>,
     /// Whether to merge entries with different expire timestamps.
@@ -251,10 +253,12 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
         delegate: T,
         merge_different_expire_ts: bool,
         snapshot_barrier_seq: Option<u64>,
+        table_store: Option<Arc<TableStore>>,
     ) -> Self {
         Self {
             merge_operator,
             delegate,
+            table_store,
             buffered_entry: None,
             merge_different_expire_ts,
             snapshot_barrier_seq,
@@ -297,6 +301,33 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
         let batch_result = self.merge_operator.merge_batch(key, None, &operands)?;
         batch.clear();
         Ok(batch_result)
+    }
+
+    async fn resolve_base_value(
+        &self,
+        base: Option<&RowEntry>,
+    ) -> Result<Option<Bytes>, SlateDBError> {
+        match base {
+            Some(RowEntry {
+                value: ValueDeletable::Value(value) | ValueDeletable::Merge(value),
+                ..
+            }) => Ok(Some(value.clone())),
+            Some(RowEntry {
+                value: ValueDeletable::BlobRef(blob_ref),
+                ..
+            }) => {
+                let table_store = self
+                    .table_store
+                    .as_ref()
+                    .ok_or(SlateDBError::InvalidDBState)?;
+                Ok(Some(table_store.get_blob(blob_ref.blob_id).await?))
+            }
+            Some(RowEntry {
+                value: ValueDeletable::Tombstone,
+                ..
+            })
+            | None => Ok(None),
+        }
     }
 
     /// Merges a sequence of entries with the same key into a single entry.
@@ -354,7 +385,7 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
             results.push(self.process_batch(&key, &mut batch, &mut merge_tracker)?);
         }
 
-        let base_value = base.as_ref().and_then(|b| b.value.as_bytes());
+        let base_value = self.resolve_base_value(base.as_ref()).await?;
         let found_base = base.is_some();
 
         // Fold the base entry's metadata into the tracker so that its
@@ -531,6 +562,7 @@ mod tests {
             data.into(),
             true,
             None,
+            None,
         );
         assert_iterator(
             &mut iterator,
@@ -555,6 +587,7 @@ mod tests {
             merge_operator,
             data.into(),
             true,
+            None,
             None,
         );
 
@@ -681,6 +714,7 @@ mod tests {
             test_case.unsorted_data.into(),
             test_case.merge_different_expire_ts,
             test_case.snapshot_barrier_seq,
+            None,
         );
         assert_iterator(&mut iterator, test_case.expected).await;
     }
@@ -823,6 +857,7 @@ mod tests {
             data.into(),
             true,
             None,
+            None,
         );
 
         // Expected: max should return 10, sum should return 15
@@ -853,6 +888,7 @@ mod tests {
             data.into(),
             true,
             None,
+            None,
         );
 
         let expected_bytes: Vec<u8> = (1..=250).map(|i| i as u8).collect();
@@ -875,6 +911,7 @@ mod tests {
             merge_operator,
             data.into(),
             true,
+            None,
             None,
         );
 
@@ -899,6 +936,7 @@ mod tests {
             merge_operator,
             data.into(),
             true,
+            None,
             None,
         );
 
@@ -930,6 +968,7 @@ mod tests {
             merge_operator,
             data.into(),
             true,
+            None,
             None,
         );
 
@@ -964,6 +1003,7 @@ mod tests {
             data.into(),
             true,
             None,
+            None,
         );
 
         // Entries sorted by reverse seq: seq=5, 4, 3, 2, 1
@@ -994,6 +1034,7 @@ mod tests {
             data.into(),
             true,
             None,
+            None,
         );
 
         // Sorted by reverse seq: seq=4, 3, 2, 1, 0(BASE)
@@ -1022,6 +1063,7 @@ mod tests {
             data.into(),
             true,
             None,
+            None,
         );
 
         // Sorted by reverse seq: seq=3, 2, 1
@@ -1048,6 +1090,7 @@ mod tests {
             merge_operator,
             data.into(),
             true,
+            None,
             None,
         );
 

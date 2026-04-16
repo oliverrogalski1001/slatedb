@@ -5644,6 +5644,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_merge_with_blob_backed_base_value_on_get() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut options = test_db_options(0, 1024, None);
+        options.blob_options = Some(BlobOptions::default());
+
+        let db = Db::builder("/tmp/test_merge_blob_get", object_store.clone())
+            .with_settings(options)
+            .with_merge_operator(Arc::new(StringConcatMergeOperator))
+            .build()
+            .await
+            .unwrap();
+
+        let mut expected = vec![b'a'; 4096];
+        expected.extend_from_slice(b"tail");
+
+        db.put(b"key1", &expected[..4096]).await.unwrap();
+        db.flush().await.unwrap();
+        db.merge(b"key1", b"tail").await.unwrap();
+
+        let result = db.get(b"key1").await.unwrap();
+        assert_eq!(result, Some(Bytes::from(expected)));
+    }
+
+    #[tokio::test]
+    async fn should_merge_with_blob_backed_base_value_on_scan() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut options = test_db_options(0, 1024, None);
+        options.blob_options = Some(BlobOptions::default());
+
+        let db = Db::builder("/tmp/test_merge_blob_scan", object_store.clone())
+            .with_settings(options)
+            .with_merge_operator(Arc::new(StringConcatMergeOperator))
+            .build()
+            .await
+            .unwrap();
+
+        let mut expected = vec![b'b'; 4096];
+        expected.extend_from_slice(b"tail");
+
+        db.put(b"key1", &expected[..4096]).await.unwrap();
+        db.flush().await.unwrap();
+        db.merge(b"key1", b"tail").await.unwrap();
+
+        let mut iter = db.scan(b"key1".as_slice()..).await.unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, Bytes::from_static(b"key1"));
+        assert_eq!(kv.value, Bytes::from(expected));
+        assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn should_error_when_merging_without_merge_operator() {
         // Given: Database without merge operator configured
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

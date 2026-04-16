@@ -309,6 +309,7 @@ impl TokioCompactionExecutorInner {
                     merge_iter,
                     false,
                     job_args.retention_min_seq,
+                    Some(self.table_store.clone()),
                 ))
             } else {
                 Box::new(MergeOperatorRequiredIterator::new(merge_iter))
