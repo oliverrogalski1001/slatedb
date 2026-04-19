@@ -15,7 +15,7 @@ use crate::compactor_state::{
     Compactions as CompactorCompactions, SourceId,
 };
 use crate::db_state::{self, SsTableInfo, SsTableInfoCodec, SstType};
-use crate::db_state::{ManifestCore, SsTableHandle, SsTableView};
+use crate::db_state::{ManifestCore, OrphanBlob, SsTableHandle, SsTableView};
 
 #[path = "./generated/root_generated.rs"]
 #[allow(warnings, clippy::disallowed_macros, clippy::disallowed_types, clippy::disallowed_methods, unreachable_pub)]
@@ -37,7 +37,8 @@ use crate::flatbuffer_types::root_generated::{
     CompactedSsTableArgs, CompactedSsTableV2, CompactedSsTableV2Args, CompactedSsTableView,
     CompactedSsTableViewArgs, Compaction as FbCompaction, CompactionArgs as FbCompactionArgs,
     CompactionSpec as FbCompactionSpec, CompactionStatus as FbCompactionStatus, CompactionsV1,
-    CompactionsV1Args, CompressionFormat, ManifestV1Args, SortedRun as FbSortedRunV1,
+    CompactionsV1Args, CompressionFormat, ManifestV1Args, OrphanBlob as FbOrphanBlob,
+    OrphanBlobArgs as FbOrphanBlobArgs, SortedRun as FbSortedRunV1,
     SortedRunArgs as FbSortedRunV1Args, SortedRunV2, SortedRunV2Args, SstType as FbSstType,
     TieredCompactionSpec, TieredCompactionSpecArgs, Ulid as FbUlid, UlidArgs as FbUlidArgs, Uuid,
     UuidArgs,
@@ -301,6 +302,7 @@ impl FlatBufferManifestCodec {
             wal_object_store_uri: manifest.wal_object_store_uri().map(|uri| uri.to_string()),
             recent_snapshot_min_seq: manifest.recent_snapshot_min_seq(),
             sequence_tracker,
+            orphan_blobs: vec![],
         };
         let external_dbs = manifest.external_dbs().map(|external_dbs| {
             external_dbs
@@ -400,6 +402,17 @@ impl FlatBufferManifestCodec {
                 .expect("Invalid encoding of sequence tracker in manifest."),
             None => SequenceTracker::new(),
         };
+        let orphan_blobs: Vec<OrphanBlob> = manifest
+            .orphan_blobs()
+            .map(|v| {
+                v.iter()
+                    .map(|o| OrphanBlob {
+                        blob_id: o.blob_id().ulid(),
+                        recorded_at_manifest_id: o.recorded_at_manifest_id(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let core = ManifestCore {
             initialized: manifest.initialized(),
             last_compacted_l0_sst_view_id: l0_last_compacted,
@@ -415,6 +428,7 @@ impl FlatBufferManifestCodec {
             wal_object_store_uri: manifest.wal_object_store_uri().map(|uri| uri.to_string()),
             recent_snapshot_min_seq: manifest.recent_snapshot_min_seq(),
             sequence_tracker,
+            orphan_blobs,
         };
         let external_dbs = manifest.external_dbs().map(|external_dbs| {
             external_dbs
@@ -636,6 +650,26 @@ impl<'b> DbFlatBufferBuilder<'b> {
     {
         let ulids: Vec<WIPOffset<FbUlid>> = ulids.map(|ulid| self.add_ulid(ulid)).collect();
         self.builder.create_vector(ulids.as_ref())
+    }
+
+    fn add_orphan_blobs(
+        &mut self,
+        orphans: &[OrphanBlob],
+    ) -> WIPOffset<Vector<'b, ForwardsUOffset<FbOrphanBlob<'b>>>> {
+        let entries: Vec<WIPOffset<FbOrphanBlob>> = orphans
+            .iter()
+            .map(|o| {
+                let blob_id = self.add_ulid(&o.blob_id);
+                FbOrphanBlob::create(
+                    &mut self.builder,
+                    &FbOrphanBlobArgs {
+                        blob_id: Some(blob_id),
+                        recorded_at_manifest_id: o.recorded_at_manifest_id,
+                    },
+                )
+            })
+            .collect();
+        self.builder.create_vector(entries.as_ref())
     }
 
     fn add_compacted_sst(&mut self, handle: &SsTableHandle) -> WIPOffset<CompactedSsTable<'b>> {
@@ -1006,6 +1040,12 @@ impl<'b> DbFlatBufferBuilder<'b> {
         let sequence_tracker_data = core.sequence_tracker.to_bytes();
         let sequence_tracker = self.builder.create_vector(sequence_tracker_data.as_slice());
 
+        let orphan_blobs = if core.orphan_blobs.is_empty() {
+            None
+        } else {
+            Some(self.add_orphan_blobs(&core.orphan_blobs))
+        };
+
         let manifest = ManifestV2::create(
             &mut self.builder,
             &ManifestV2Args {
@@ -1026,6 +1066,7 @@ impl<'b> DbFlatBufferBuilder<'b> {
                 wal_object_store_uri,
                 recent_snapshot_min_seq: core.recent_snapshot_min_seq,
                 sequence_tracker: Some(sequence_tracker),
+                orphan_blobs,
             },
         );
         self.builder.finish(manifest, None);

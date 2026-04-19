@@ -442,6 +442,13 @@ impl COWDbState {
     }
 }
 
+/// Blob object awaiting deletion after the last SST pointer was dropped in compaction.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Debug)]
+pub struct OrphanBlob {
+    pub blob_id: Ulid,
+    pub recorded_at_manifest_id: u64,
+}
+
 /// Represents an immutable in-memory view of .manifest file that is suitable
 /// to expose to end-users.
 #[derive(Clone, PartialEq, Serialize, Debug)]
@@ -500,6 +507,9 @@ pub struct ManifestCore {
 
     /// The URI of the object store dedicated specifically for WAL, if any.
     pub wal_object_store_uri: Option<String>,
+
+    /// Blob ids waiting for garbage collection (external large values).
+    pub orphan_blobs: Vec<OrphanBlob>,
 }
 
 impl ManifestCore {
@@ -518,6 +528,7 @@ impl ManifestCore {
             wal_object_store_uri: None,
             recent_snapshot_min_seq: 0,
             sequence_tracker: SequenceTracker::new(),
+            orphan_blobs: vec![],
         }
     }
 
@@ -724,6 +735,7 @@ impl<'a> StateModifier<'a> {
             sequence_tracker: my_db_state.sequence_tracker.clone(),
             checkpoints: remote_manifest.value.core.checkpoints,
             wal_object_store_uri: my_db_state.wal_object_store_uri.clone(),
+            orphan_blobs: remote_manifest.value.core.orphan_blobs.clone(),
         };
         self.state.manifest = remote_manifest;
     }

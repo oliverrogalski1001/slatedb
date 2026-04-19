@@ -570,6 +570,7 @@ impl CompactorState {
             wal_object_store_uri: my_db_state.wal_object_store_uri.clone(),
             recent_snapshot_min_seq: remote_manifest.value.core.recent_snapshot_min_seq,
             sequence_tracker: remote_manifest.value.core.sequence_tracker,
+            orphan_blobs: remote_manifest.value.core.orphan_blobs.clone(),
         };
         remote_manifest.value.core = merged;
         self.manifest = remote_manifest;

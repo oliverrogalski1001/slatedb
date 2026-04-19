@@ -16,7 +16,7 @@ pub(crate) mod store;
 
 // TODO: should probably move these into manifest/mod.rs (this file)
 pub use crate::db_state::{
-    ManifestCore, SortedRun, SsTableHandle, SsTableId, SsTableInfo, SsTableView,
+    ManifestCore, OrphanBlob, SortedRun, SsTableHandle, SsTableId, SsTableInfo, SsTableView,
 };
 
 #[derive(Clone, Serialize, PartialEq, Debug)]

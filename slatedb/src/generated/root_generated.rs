@@ -3384,6 +3384,121 @@ impl core::fmt::Debug for ManifestV1<'_> {
       ds.finish()
   }
 }
+pub enum OrphanBlobOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct OrphanBlob<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for OrphanBlob<'a> {
+  type Inner = OrphanBlob<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: flatbuffers::Table::new(buf, loc) }
+  }
+}
+
+impl<'a> OrphanBlob<'a> {
+  pub const VT_BLOB_ID: flatbuffers::VOffsetT = 4;
+  pub const VT_RECORDED_AT_MANIFEST_ID: flatbuffers::VOffsetT = 6;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+    OrphanBlob { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: flatbuffers::Allocator + 'bldr>(
+    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr, A>,
+    args: &'args OrphanBlobArgs<'args>
+  ) -> flatbuffers::WIPOffset<OrphanBlob<'bldr>> {
+    let mut builder = OrphanBlobBuilder::new(_fbb);
+    builder.add_recorded_at_manifest_id(args.recorded_at_manifest_id);
+    if let Some(x) = args.blob_id { builder.add_blob_id(x); }
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn blob_id(&self) -> Ulid<'a> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<Ulid>>(OrphanBlob::VT_BLOB_ID, None).unwrap()}
+  }
+  #[inline]
+  pub fn recorded_at_manifest_id(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(OrphanBlob::VT_RECORDED_AT_MANIFEST_ID, Some(0)).unwrap()}
+  }
+}
+
+impl flatbuffers::Verifiable for OrphanBlob<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.visit_table(pos)?
+     .visit_field::<flatbuffers::ForwardsUOffset<Ulid>>("blob_id", Self::VT_BLOB_ID, true)?
+     .visit_field::<u64>("recorded_at_manifest_id", Self::VT_RECORDED_AT_MANIFEST_ID, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct OrphanBlobArgs<'a> {
+    pub blob_id: Option<flatbuffers::WIPOffset<Ulid<'a>>>,
+    pub recorded_at_manifest_id: u64,
+}
+impl<'a> Default for OrphanBlobArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    OrphanBlobArgs {
+      blob_id: None, // required field
+      recorded_at_manifest_id: 0,
+    }
+  }
+}
+
+pub struct OrphanBlobBuilder<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a, A>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> OrphanBlobBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_blob_id(&mut self, blob_id: flatbuffers::WIPOffset<Ulid<'b >>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<Ulid>>(OrphanBlob::VT_BLOB_ID, blob_id);
+  }
+  #[inline]
+  pub fn add_recorded_at_manifest_id(&mut self, recorded_at_manifest_id: u64) {
+    self.fbb_.push_slot::<u64>(OrphanBlob::VT_RECORDED_AT_MANIFEST_ID, recorded_at_manifest_id, 0);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> OrphanBlobBuilder<'a, 'b, A> {
+    let start = _fbb.start_table();
+    OrphanBlobBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<OrphanBlob<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    self.fbb_.required(o, OrphanBlob::VT_BLOB_ID,"blob_id");
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl core::fmt::Debug for OrphanBlob<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut ds = f.debug_struct("OrphanBlob");
+      ds.field("blob_id", &self.blob_id());
+      ds.field("recorded_at_manifest_id", &self.recorded_at_manifest_id());
+      ds.finish()
+  }
+}
 pub enum ManifestV2Offset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -3417,6 +3532,7 @@ impl<'a> ManifestV2<'a> {
   pub const VT_WAL_OBJECT_STORE_URI: flatbuffers::VOffsetT = 32;
   pub const VT_RECENT_SNAPSHOT_MIN_SEQ: flatbuffers::VOffsetT = 34;
   pub const VT_SEQUENCE_TRACKER: flatbuffers::VOffsetT = 36;
+  pub const VT_ORPHAN_BLOBS: flatbuffers::VOffsetT = 38;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -3436,6 +3552,7 @@ impl<'a> ManifestV2<'a> {
     builder.add_compactor_epoch(args.compactor_epoch);
     builder.add_writer_epoch(args.writer_epoch);
     builder.add_manifest_id(args.manifest_id);
+    if let Some(x) = args.orphan_blobs { builder.add_orphan_blobs(x); }
     if let Some(x) = args.sequence_tracker { builder.add_sequence_tracker(x); }
     if let Some(x) = args.wal_object_store_uri { builder.add_wal_object_store_uri(x); }
     if let Some(x) = args.checkpoints { builder.add_checkpoints(x); }
@@ -3568,6 +3685,13 @@ impl<'a> ManifestV2<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(ManifestV2::VT_SEQUENCE_TRACKER, None)}
   }
+  #[inline]
+  pub fn orphan_blobs(&self) -> Option<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<OrphanBlob<'a>>>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<OrphanBlob>>>>(ManifestV2::VT_ORPHAN_BLOBS, None)}
+  }
 }
 
 impl flatbuffers::Verifiable for ManifestV2<'_> {
@@ -3594,6 +3718,7 @@ impl flatbuffers::Verifiable for ManifestV2<'_> {
      .visit_field::<flatbuffers::ForwardsUOffset<&str>>("wal_object_store_uri", Self::VT_WAL_OBJECT_STORE_URI, false)?
      .visit_field::<u64>("recent_snapshot_min_seq", Self::VT_RECENT_SNAPSHOT_MIN_SEQ, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>("sequence_tracker", Self::VT_SEQUENCE_TRACKER, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<OrphanBlob>>>>("orphan_blobs", Self::VT_ORPHAN_BLOBS, false)?
      .finish();
     Ok(())
   }
@@ -3616,6 +3741,7 @@ pub struct ManifestV2Args<'a> {
     pub wal_object_store_uri: Option<flatbuffers::WIPOffset<&'a str>>,
     pub recent_snapshot_min_seq: u64,
     pub sequence_tracker: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
+    pub orphan_blobs: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<OrphanBlob<'a>>>>>,
 }
 impl<'a> Default for ManifestV2Args<'a> {
   #[inline]
@@ -3638,6 +3764,7 @@ impl<'a> Default for ManifestV2Args<'a> {
       wal_object_store_uri: None,
       recent_snapshot_min_seq: 0,
       sequence_tracker: None,
+      orphan_blobs: None,
     }
   }
 }
@@ -3716,6 +3843,10 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> ManifestV2Builder<'a, 'b, A> {
     self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ManifestV2::VT_SEQUENCE_TRACKER, sequence_tracker);
   }
   #[inline]
+  pub fn add_orphan_blobs(&mut self, orphan_blobs: flatbuffers::WIPOffset<flatbuffers::Vector<'b , flatbuffers::ForwardsUOffset<OrphanBlob<'b >>>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ManifestV2::VT_ORPHAN_BLOBS, orphan_blobs);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> ManifestV2Builder<'a, 'b, A> {
     let start = _fbb.start_table();
     ManifestV2Builder {
@@ -3754,6 +3885,7 @@ impl core::fmt::Debug for ManifestV2<'_> {
       ds.field("wal_object_store_uri", &self.wal_object_store_uri());
       ds.field("recent_snapshot_min_seq", &self.recent_snapshot_min_seq());
       ds.field("sequence_tracker", &self.sequence_tracker());
+      ds.field("orphan_blobs", &self.orphan_blobs());
       ds.finish()
   }
 }

@@ -78,6 +78,13 @@ table ManifestV1 {
     sequence_tracker: [ubyte];
 }
 
+// Blob ids awaiting deletion after compaction dropped the last SST pointer.
+// recorded_at_manifest_id is the manifest id that will be written when this orphan is appended.
+table OrphanBlob {
+    blob_id: Ulid (required);
+    recorded_at_manifest_id: ulong;
+}
+
 // Manifest to persist state of DB, version 2 (CompactedSsTableV2 changed to CompactedSsTableView).
 table ManifestV2 {
     // Id of manifest. Manifest file name will be derived from this id.
@@ -139,6 +146,9 @@ table ManifestV2 {
 
     // Serialized sequence tracker data as defined in RFC-0012.
     sequence_tracker: [ubyte];
+
+    // Orphan blobs awaiting GC (WiscKey-style external values).
+    orphan_blobs: [OrphanBlob];
 }
 
 table WriterCheckpoint {
