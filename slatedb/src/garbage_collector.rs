@@ -244,6 +244,7 @@ impl GarbageCollector {
                 manifest_store.clone(),
                 table_store.clone(),
                 stats.clone(),
+                system_clock.clone(),
                 blob_options,
             )
         });
