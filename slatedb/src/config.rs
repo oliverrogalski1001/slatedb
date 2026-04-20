@@ -1181,6 +1181,11 @@ pub struct GarbageCollectorOptions {
     ///
     /// None means garbage collection is disabled for the compactions directory.
     pub compactions_options: Option<GarbageCollectorDirectoryOptions>,
+
+    /// Garbage collection options for blobs
+    ///
+    /// None means garbage collection is disabled for the compactions directory.
+    pub blob_options: Option<GarbageCollectorDirectoryOptions>,
 }
 
 impl GarbageCollectorOptions {
@@ -1239,6 +1244,7 @@ impl Default for GarbageCollectorOptions {
             wal_options: Some(GarbageCollectorDirectoryOptions::default()),
             compacted_options: Some(GarbageCollectorDirectoryOptions::default()),
             compactions_options: Some(GarbageCollectorDirectoryOptions::default()),
+            blob_options: Some(GarbageCollectorDirectoryOptions::default()),
         }
     }
 }
@@ -1275,13 +1281,6 @@ pub struct BlobOptions {
     ///
     /// Default: None (no compression)
     pub blob_compression_codec: Option<CompressionCodec>,
-
-    /// Garbage collection options for orphaned blob objects. Orphaned blobs
-    /// are created when compaction drops a key that references a blob (due to
-    /// overwrites or tombstones).
-    /// None means garbage collection is disabled for blobs (not recommended
-    /// for production — orphaned blobs will accumulate).
-    pub blob_gc_options: Option<GarbageCollectorDirectoryOptions>,
 }
 
 impl Default for BlobOptions {
@@ -1289,8 +1288,6 @@ impl Default for BlobOptions {
         Self {
             min_value_size: 4096,
             blob_compression_codec: None,
-            // TODO: Implement blob_gc_options
-            blob_gc_options: None,
         }
     }
 }

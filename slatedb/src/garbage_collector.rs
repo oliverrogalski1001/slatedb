@@ -24,6 +24,7 @@ use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::Manifest;
 use crate::tablestore::TableStore;
 use async_trait::async_trait;
+use blob_gc::BlobGcTask;
 use chrono::{DateTime, Utc};
 use compacted_gc::CompactedGcTask;
 use compactions_gc::CompactionsGcTask;
@@ -38,6 +39,7 @@ use std::time::Duration;
 use tracing::instrument;
 use wal_gc::WalGcTask;
 
+mod blob_gc;
 mod compacted_gc;
 mod compactions_gc;
 mod manifest_gc;
@@ -59,6 +61,7 @@ pub(crate) enum GcMessage {
     GcCompacted,
     GcCompactions,
     GcManifest,
+    GcBlob,
     LogStats,
 }
 
@@ -88,6 +91,7 @@ pub struct GarbageCollector {
     wal_gc_task: Option<WalGcTask>,
     compacted_gc_task: Option<CompactedGcTask>,
     compactions_gc_task: Option<CompactionsGcTask>,
+    blob_gc_task: Option<BlobGcTask>,
 }
 
 #[async_trait]
@@ -117,6 +121,13 @@ impl MessageHandler<GcMessage> for GarbageCollector {
             tickers.push((
                 opts.interval.unwrap_or(DEFAULT_INTERVAL),
                 Box::new(|| GcMessage::GcCompactions),
+            ));
+        }
+
+        if let Some(opts) = self.options.blob_options {
+            tickers.push((
+                opts.interval.unwrap_or(DEFAULT_INTERVAL),
+                Box::new(|| GcMessage::GcBlob),
             ));
         }
 
@@ -152,6 +163,13 @@ impl MessageHandler<GcMessage> for GarbageCollector {
                     .compactions_gc_task
                     .as_ref()
                     .expect("got compactions tick with unconfigured compactions task");
+                self.run_gc_task(task).await;
+            }
+            GcMessage::GcBlob => {
+                let task = self
+                    .blob_gc_task
+                    .as_ref()
+                    .expect("got blob tick with unconfigured blob task");
                 self.run_gc_task(task).await;
             }
             GcMessage::LogStats => self.log_stats(),
@@ -221,6 +239,14 @@ impl GarbageCollector {
         let manifest_gc_task = options.manifest_options.map(|manifest_options| {
             ManifestGcTask::new(manifest_store.clone(), stats.clone(), manifest_options)
         });
+        let blob_gc_task = options.blob_options.map(|blob_options| {
+            BlobGcTask::new(
+                manifest_store.clone(),
+                table_store.clone(),
+                stats.clone(),
+                blob_options,
+            )
+        });
         Self {
             manifest_store,
             options,
@@ -231,6 +257,7 @@ impl GarbageCollector {
             wal_gc_task,
             compacted_gc_task,
             compactions_gc_task,
+            blob_gc_task,
         }
     }
 
@@ -252,6 +279,9 @@ impl GarbageCollector {
             self.run_gc_task(task).await;
         }
         if let Some(task) = &self.compactions_gc_task {
+            self.run_gc_task(task).await;
+        }
+        if let Some(task) = &self.blob_gc_task {
             self.run_gc_task(task).await;
         }
 
