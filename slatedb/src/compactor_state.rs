@@ -555,14 +555,22 @@ impl CompactorState {
             }
         }
 
-        // Merge orphan blobs: start from remote (source of truth for blobs recorded by other
-        // writers), then append any locally-added orphans not yet in the remote manifest.
-        // Without this, orphans added by finish_compaction would be silently dropped each
-        // time load_manifest/write_manifest calls merge_remote_manifest.
-        let mut merged_orphan_blobs = remote_manifest.value.core.orphan_blobs.clone();
-        for o in &my_db_state.orphan_blobs {
-            if !merged_orphan_blobs.iter().any(|r| r.blob_id == o.blob_id) {
-                merged_orphan_blobs.push(o.clone());
+        // Local orphans are stamped with remote_manifest.id — the version this compactor is
+        // about to build on top of, i.e. the last id at which the blob was still reachable.
+        // Re-stamping on every merge keeps the tag monotonic across write retries so the GC
+        // watermark invariant (`tag < min_checkpoint_id`) stays correct even when the manifest
+        // advances between finish_compaction and the final update().
+        let mut merged_orphan_blobs = std::mem::take(&mut remote_manifest.value.core.orphan_blobs);
+        if !my_db_state.orphan_blobs.is_empty() {
+            let existing: HashSet<Ulid> = merged_orphan_blobs.iter().map(|o| o.blob_id).collect();
+            let recorded_at_manifest_id: u64 = remote_manifest.id.into();
+            for o in &my_db_state.orphan_blobs {
+                if !existing.contains(&o.blob_id) {
+                    merged_orphan_blobs.push(OrphanBlob {
+                        blob_id: o.blob_id,
+                        recorded_at_manifest_id,
+                    });
+                }
             }
         }
 
@@ -711,12 +719,10 @@ impl CompactorState {
             db_state.compacted = new_compacted;
             if !retention_orphan_blob_ids.is_empty() {
                 let recorded_at_manifest_id: u64 = self.manifest.id.next().into();
+                let mut existing: HashSet<Ulid> =
+                    db_state.orphan_blobs.iter().map(|o| o.blob_id).collect();
                 for blob_id in retention_orphan_blob_ids {
-                    if !db_state
-                        .orphan_blobs
-                        .iter()
-                        .any(|existing| existing.blob_id == blob_id)
-                    {
+                    if existing.insert(blob_id) {
                         db_state.orphan_blobs.push(OrphanBlob {
                             blob_id,
                             recorded_at_manifest_id,
