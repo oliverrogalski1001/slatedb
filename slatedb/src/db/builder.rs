@@ -130,7 +130,7 @@ use crate::compactor_executor::{TokioCompactionExecutor, TokioCompactionExecutor
 use crate::config::CompactorOptions;
 use crate::config::DbReaderOptions;
 use crate::config::GarbageCollectorOptions;
-use crate::config::{Settings, SstBlockSize};
+use crate::config::{BlobOptions, Settings, SstBlockSize};
 use crate::db::Db;
 use crate::db::DbInner;
 use crate::db_cache::SplitCache;
@@ -557,8 +557,8 @@ impl<P: Into<Path>> DbBuilder<P> {
             if let Some(operator) = self.merge_operator {
                 builder = builder.with_merge_operator(operator);
             }
-            if self.settings.blob_options.is_some() {
-                builder = builder.with_skip_merge_when_blob_ref_base(true);
+            if let Some(blob_options) = self.settings.blob_options.as_ref() {
+                builder = builder.with_blob_options(blob_options.clone());
             }
 
             let (handler, rx) = builder
@@ -816,7 +816,7 @@ pub struct CompactorBuilder<P: Into<Path>> {
     block_transformer: Option<Arc<dyn BlockTransformer>>,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
-    skip_merge_when_blob_ref_base: bool,
+    blob_options: Option<BlobOptions>,
 }
 
 #[allow(unused)]
@@ -836,7 +836,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             block_transformer: None,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
-            skip_merge_when_blob_ref_base: false,
+            blob_options: None,
         }
     }
 
@@ -855,7 +855,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             block_transformer: self.block_transformer,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: self.compaction_filter_supplier,
-            skip_merge_when_blob_ref_base: self.skip_merge_when_blob_ref_base,
+            blob_options: self.blob_options,
         }
     }
 
@@ -911,9 +911,15 @@ impl<P: Into<Path>> CompactorBuilder<P> {
         self
     }
 
-    /// When enabled, compaction does not fold merge operands into a `BlobRef` base row.
-    pub fn with_skip_merge_when_blob_ref_base(mut self, enabled: bool) -> Self {
-        self.skip_merge_when_blob_ref_base = enabled;
+    /// Sets the blob options for the compactor. When set, compaction preserves
+    /// `BlobRef` base rows and emits queued merge operands above them rather than
+    /// folding operands into the blob — maintaining the key-value-separation
+    /// invariant that blob-backed values are not re-inlined during compaction.
+    ///
+    /// This must be set to match the `blob_options` in the [`Settings`] used to
+    /// open the database; `DbBuilder` configures it automatically.
+    pub fn with_blob_options(mut self, blob_options: BlobOptions) -> Self {
+        self.blob_options = Some(blob_options);
         self
     }
 
@@ -992,7 +998,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             self.system_clock,
             self.closed_result,
             self.merge_operator,
-            self.skip_merge_when_blob_ref_base,
+            self.blob_options.is_some(),
             #[cfg(feature = "compaction_filters")]
             self.compaction_filter_supplier,
         )
@@ -1034,7 +1040,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
                 clock: self.system_clock.clone(),
                 manifest_store: manifest_store.clone(),
                 merge_operator: self.merge_operator,
-                skip_merge_when_blob_ref_base: self.skip_merge_when_blob_ref_base,
+                skip_merge_when_blob_ref_base: self.blob_options.is_some(),
                 #[cfg(feature = "compaction_filters")]
                 compaction_filter_supplier: self.compaction_filter_supplier,
             },

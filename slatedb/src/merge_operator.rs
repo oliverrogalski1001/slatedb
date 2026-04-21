@@ -338,120 +338,21 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
     ///
     /// Collects merge operands in batches of `MERGE_BATCH_SIZE`, processes each batch
     /// into intermediate results, and continues until a base value (non-merge) is found.
-    /// Finally combines all intermediate results with the base value, unless
-    /// `skip_merge_when_blob_ref_base` is set and the base is `BlobRef` (then merge operands
-    /// are folded into one `Merge` row and the `BlobRef` base is emitted after it, without
-    /// loading blob bytes).
+    /// Finally combines all intermediate results with the base value.
+    ///
+    /// When `skip_merge_when_blob_ref_base` is set and the base is a `BlobRef`, the base is
+    /// queued on `pass_through_queue` instead of being folded in: the returned `Merge`
+    /// carries operand-only metadata and the blob row is emitted as-is on the next `next()`
+    /// call. No blob bytes are loaded.
     ///
     /// Returns `Some(RowEntry)` with merged value and aggregated metadata, or `None` if
     /// only a tombstone with no operands was found.
-    async fn finish_merge_from_merges_and_base(
-        &self,
-        key: Bytes,
-        merges: Vec<RowEntry>,
-        base: Option<RowEntry>,
-    ) -> Result<Option<RowEntry>, SlateDBError> {
-        let mut merge_tracker = MergeTracker {
-            max_create_ts: None,
-            min_expire_ts: None,
-            seq: merges
-                .first()
-                .ok_or(SlateDBError::InvalidDBState)?
-                .seq,
-        };
-
-        let mut results = Vec::new();
-        let mut batch = Vec::with_capacity(MERGE_BATCH_SIZE);
-
-        for entry in merges {
-            batch.push(entry);
-            if batch.len() >= MERGE_BATCH_SIZE {
-                results.push(self.process_batch(&key, &mut batch, &mut merge_tracker)?);
-            }
-        }
-
-        if !batch.is_empty() {
-            results.push(self.process_batch(&key, &mut batch, &mut merge_tracker)?);
-        }
-
-        let base_value = self.resolve_base_value(base.as_ref()).await?;
-        let found_base = base.is_some();
-
-        if let Some(ref base_entry) = base {
-            merge_tracker.update(base_entry)?;
-        }
-
-        if results.is_empty() && base_value.is_none() {
-            return Ok(None);
-        }
-
-        results.reverse();
-        let final_result = self
-            .merge_operator
-            .merge_batch(&key, base_value, &results)?;
-
-        Ok(Some(RowEntry {
-            key: key.clone(),
-            value: if found_base {
-                ValueDeletable::Value(final_result)
-            } else {
-                ValueDeletable::Merge(final_result)
-            },
-            seq: merge_tracker.seq,
-            create_ts: merge_tracker.max_create_ts,
-            expire_ts: merge_tracker.min_expire_ts,
-        }))
-    }
-
     async fn merge_with_older_entries(
         &mut self,
         first_entry: RowEntry,
     ) -> Result<Option<RowEntry>, SlateDBError> {
         let key = first_entry.key.clone();
         let first_expire_ts = first_entry.expire_ts;
-
-        if self.skip_merge_when_blob_ref_base {
-            let mut merges = Vec::new();
-            let mut next = Some(first_entry);
-            let base = loop {
-                if let Some(entry) = next {
-                    if !self.is_matching_entry(&entry, &key, first_expire_ts) {
-                        self.buffered_entry = Some(entry);
-                        break None;
-                    }
-                    if matches!(entry.value, ValueDeletable::Merge(_)) {
-                        merges.push(entry);
-                        next = self.delegate.next().await?;
-                    } else {
-                        break Some(entry);
-                    }
-                } else {
-                    break None;
-                }
-            };
-
-            let base_is_blob = base
-                .as_ref()
-                .is_some_and(|b| matches!(b.value, ValueDeletable::BlobRef(_)));
-
-            if base_is_blob {
-                let folded = self
-                    .finish_merge_from_merges_and_base(key.clone(), merges, None)
-                    .await?;
-                self.pass_through_queue.clear();
-                if let Some(m) = folded {
-                    self.pass_through_queue.push_back(m);
-                }
-                if let Some(b_entry) = base {
-                    self.pass_through_queue.push_back(b_entry);
-                }
-                return Ok(self.pass_through_queue.pop_front());
-            }
-
-            return self
-                .finish_merge_from_merges_and_base(key, merges, base)
-                .await;
-        }
 
         let mut merge_tracker = MergeTracker {
             max_create_ts: None,
@@ -468,6 +369,15 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
             if let Some(entry) = next {
                 if !self.is_matching_entry(&entry, &key, first_expire_ts) {
                     self.buffered_entry = Some(entry);
+                    break None;
+                } else if self.skip_merge_when_blob_ref_base
+                    && matches!(entry.value, ValueDeletable::BlobRef(_))
+                {
+                    // Defer the blob row: queue it and treat the chain as base-less.
+                    // The operand fold below yields a `Merge` with operand-only metadata;
+                    // the queued blob row is returned by the next `next()` call.
+                    debug_assert!(self.pass_through_queue.is_empty());
+                    self.pass_through_queue.push_back(entry);
                     break None;
                 } else if !matches!(entry.value, ValueDeletable::Merge(_)) {
                     break Some(entry);
@@ -1252,5 +1162,227 @@ mod tests {
         assert_eq!(base_row.seq, 1);
         assert_eq!(base_row.value, ValueDeletable::BlobRef(blob));
         assert!(iterator.next().await.unwrap().is_none());
+    }
+
+    fn blob_row(key: &[u8], blob: BlobRef, seq: u64) -> RowEntry {
+        RowEntry::new(
+            Bytes::copy_from_slice(key),
+            ValueDeletable::BlobRef(blob),
+            seq,
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn skip_flag_no_base_emits_merge() {
+        let merge_operator = Arc::new(MockMergeOperator {});
+        let data = vec![
+            RowEntry::new_merge(b"k", b"a", 3),
+            RowEntry::new_merge(b"k", b"b", 2),
+        ];
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
+            merge_operator,
+            data.into(),
+            true,
+            None,
+            None,
+            true,
+        );
+        assert_iterator(&mut iterator, vec![RowEntry::new_merge(b"k", b"ba", 3)]).await;
+    }
+
+    #[tokio::test]
+    async fn skip_flag_key_change_buffers_next_key() {
+        let merge_operator = Arc::new(MockMergeOperator {});
+        let data = vec![
+            RowEntry::new_merge(b"key1", b"a", 3),
+            RowEntry::new_merge(b"key1", b"b", 2),
+            RowEntry::new_value(b"key2", b"v", 5),
+        ];
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
+            merge_operator,
+            data.into(),
+            true,
+            None,
+            None,
+            true,
+        );
+        assert_iterator(
+            &mut iterator,
+            vec![
+                RowEntry::new_merge(b"key1", b"ba", 3),
+                RowEntry::new_value(b"key2", b"v", 5),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn skip_flag_with_value_base_folds_into_value() {
+        let merge_operator = Arc::new(MockMergeOperator {});
+        let data = vec![
+            RowEntry::new_merge(b"k", b"a", 3),
+            RowEntry::new_merge(b"k", b"b", 2),
+            RowEntry::new_value(b"k", b"BASE", 1),
+        ];
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
+            merge_operator,
+            data.into(),
+            true,
+            None,
+            None,
+            true,
+        );
+        assert_iterator(&mut iterator, vec![RowEntry::new_value(b"k", b"BASEba", 3)]).await;
+    }
+
+    #[tokio::test]
+    async fn skip_flag_with_tombstone_base_invalidates_merges() {
+        let merge_operator = Arc::new(MockMergeOperator {});
+        let data = vec![
+            RowEntry::new_merge(b"k", b"a", 3),
+            RowEntry::new_merge(b"k", b"b", 2),
+            RowEntry::new_tombstone(b"k", 1),
+        ];
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
+            merge_operator,
+            data.into(),
+            true,
+            None,
+            None,
+            true,
+        );
+        assert_iterator(&mut iterator, vec![RowEntry::new_value(b"k", b"ba", 3)]).await;
+    }
+
+    #[tokio::test]
+    async fn skip_flag_crosses_merge_batch_size() {
+        let merge_operator = Arc::new(MockMergeOperator {});
+        let blob = BlobRef::new(Ulid::new(), 8);
+        let mut data = Vec::new();
+        for i in 1..=150u8 {
+            data.push(RowEntry::new_merge(b"k", &[i], i as u64));
+        }
+        data.push(blob_row(b"k", blob, 0));
+
+        let expected_bytes: Vec<u8> = (1u8..=150).collect();
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
+            merge_operator,
+            data.into(),
+            true,
+            None,
+            None,
+            true,
+        );
+        assert_iterator(
+            &mut iterator,
+            vec![
+                RowEntry::new_merge(b"k", &expected_bytes, 150),
+                blob_row(b"k", blob, 0),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn skip_flag_folded_merge_metadata_excludes_blob() {
+        let merge_operator = Arc::new(MockMergeOperator {});
+        let blob = BlobRef::new(Ulid::new(), 8);
+        let data = vec![
+            RowEntry::new_merge(b"k", b"a", 3)
+                .with_create_ts(30)
+                .with_expire_ts(300),
+            RowEntry::new_merge(b"k", b"b", 2)
+                .with_create_ts(20)
+                .with_expire_ts(200),
+            RowEntry::new(
+                Bytes::copy_from_slice(b"k"),
+                ValueDeletable::BlobRef(blob),
+                1,
+                Some(1000),
+                Some(1),
+            ),
+        ];
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
+            merge_operator,
+            data.into(),
+            true,
+            None,
+            None,
+            true,
+        );
+
+        let folded_expected = RowEntry::new_merge(b"k", b"ba", 3)
+            .with_create_ts(30)
+            .with_expire_ts(200);
+        let blob_expected = RowEntry::new(
+            Bytes::copy_from_slice(b"k"),
+            ValueDeletable::BlobRef(blob),
+            1,
+            Some(1000),
+            Some(1),
+        );
+        assert_iterator(&mut iterator, vec![folded_expected, blob_expected]).await;
+    }
+
+    #[tokio::test]
+    async fn skip_flag_seek_clears_queued_blob() {
+        let merge_operator = Arc::new(MockMergeOperator {});
+        let blob = BlobRef::new(Ulid::new(), 8);
+        let data = vec![
+            RowEntry::new_merge(b"key1", b"a", 3),
+            RowEntry::new_merge(b"key1", b"b", 2),
+            blob_row(b"key1", blob, 1),
+            RowEntry::new_value(b"key2", b"v", 4),
+        ];
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
+            merge_operator,
+            data.into(),
+            true,
+            None,
+            None,
+            true,
+        );
+        iterator.init().await.unwrap();
+
+        let folded = iterator.next().await.unwrap().unwrap();
+        assert_eq!(folded.key.as_ref(), b"key1");
+        assert!(matches!(folded.value, ValueDeletable::Merge(_)));
+
+        iterator.seek(b"key2").await.unwrap();
+
+        let next = iterator.next().await.unwrap().unwrap();
+        assert_eq!(next.key.as_ref(), b"key2");
+        assert_eq!(next.value.as_bytes().unwrap().as_ref(), b"v");
+        assert!(iterator.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn skip_flag_with_snapshot_barrier_passes_through_high_seq_merge() {
+        let merge_operator = Arc::new(MockMergeOperator {});
+        let blob = BlobRef::new(Ulid::new(), 8);
+        let data = vec![
+            RowEntry::new_merge(b"k", b"5", 5),
+            RowEntry::new_merge(b"k", b"2", 2),
+            blob_row(b"k", blob, 1),
+        ];
+        let mut iterator = MergeOperatorIterator::<MockRowEntryIterator>::new(
+            merge_operator,
+            data.into(),
+            true,
+            Some(3),
+            None,
+            true,
+        );
+        assert_iterator(
+            &mut iterator,
+            vec![
+                RowEntry::new_merge(b"k", b"5", 5),
+                RowEntry::new_merge(b"k", b"2", 2),
+                blob_row(b"k", blob, 1),
+            ],
+        )
+        .await;
     }
 }
