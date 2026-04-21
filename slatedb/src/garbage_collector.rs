@@ -1742,7 +1742,7 @@ mod tests {
         put_blob(&table_store, b2).await;
 
         // Manifest becomes id=2 after update; orphans recorded at id=1 satisfy
-        // recorded_at_manifest_id <= min_checkpoint_id (=2, current manifest id).
+        // recorded_at_manifest_id < min_checkpoint_id (=2, current manifest id).
         seed_manifest_with_orphans(
             manifest_store.clone(),
             vec![
@@ -1780,7 +1780,7 @@ mod tests {
         let pinned = ulid::Ulid::new();
         put_blob(&table_store, pinned).await;
 
-        // Checkpoint pins manifest 1; orphan recorded at 2 is not <= 1 → must stay.
+        // Checkpoint pins manifest 1; orphan recorded at 2 is not < 1 → must stay.
         let checkpoint = Checkpoint {
             id: Uuid::new_v4(),
             manifest_id: 1,
@@ -1817,28 +1817,33 @@ mod tests {
     async fn test_blob_gc_deletes_orphan_recorded_at_watermark() {
         use crate::manifest::OrphanBlob;
 
-        // Boundary case: recorded_at_manifest_id == min_checkpoint_id.
+        // Boundary case: recorded_at_manifest_id == min_checkpoint_id - 1.
         // The checkpoint at manifest N sees a world where the blob is already gone from
-        // SSTs, so <= is the correct operator and the blob must be deleted.
+        // SSTs, so < is the correct operator and the blob must be deleted.
         let (manifest_store, compactions_store, table_store, _) = build_objects();
         let b = ulid::Ulid::new();
         put_blob(&table_store, b).await;
 
         // seed_manifest_with_orphans writes two manifest versions: create_new_db (id=1)
         // then update (id=2). With no checkpoints min_checkpoint_id falls back to the
-        // current manifest id (=2). Recording the orphan at id=2 puts it exactly on the
+        // current manifest id (=2). Recording the orphan at id=1 puts it exactly on the
         // watermark boundary.
         seed_manifest_with_orphans(
             manifest_store.clone(),
             vec![OrphanBlob {
                 blob_id: b,
-                recorded_at_manifest_id: 2,
+                recorded_at_manifest_id: 1,
             }],
             vec![],
         )
         .await;
 
-        run_blob_gc_once(manifest_store.clone(), compactions_store, table_store.clone()).await;
+        run_blob_gc_once(
+            manifest_store.clone(),
+            compactions_store,
+            table_store.clone(),
+        )
+        .await;
 
         assert!(!blob_exists(&table_store, b).await);
         let (_, manifest) = manifest_store.read_latest_manifest().await.unwrap();
@@ -1871,7 +1876,7 @@ mod tests {
                 },
                 OrphanBlob {
                     blob_id: pinned,
-                    recorded_at_manifest_id: 4,
+                    recorded_at_manifest_id: 3,
                 },
             ],
             vec![checkpoint],
@@ -1901,7 +1906,7 @@ mod tests {
         let b2 = ulid::Ulid::new();
 
         // Manifest becomes id=2 after update; orphans recorded at id=1 satisfy
-        // recorded_at_manifest_id <= min_checkpoint_id (=2, current manifest id).
+        // recorded_at_manifest_id < min_checkpoint_id (=2, current manifest id).
         seed_manifest_with_orphans(
             manifest_store.clone(),
             vec![

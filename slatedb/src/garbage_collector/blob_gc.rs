@@ -105,7 +105,7 @@ impl GcTask for BlobGcTask {
             .core
             .orphan_blobs
             .iter()
-            .filter(|blob| blob.recorded_at_manifest_id <= min_checkpoint_id)
+            .filter(|blob| blob.recorded_at_manifest_id < min_checkpoint_id)
             .map(|blob| blob.blob_id)
             .collect();
 
