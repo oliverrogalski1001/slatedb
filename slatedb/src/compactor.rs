@@ -265,6 +265,7 @@ pub struct Compactor {
     stats: Arc<CompactionStats>,
     system_clock: Arc<dyn SystemClock>,
     merge_operator: Option<MergeOperatorType>,
+    skip_merge_when_blob_ref_base: bool,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
@@ -283,6 +284,7 @@ impl Compactor {
         system_clock: Arc<dyn SystemClock>,
         closed_result: ClosedResultWriter,
         merge_operator: Option<MergeOperatorType>,
+        skip_merge_when_blob_ref_base: bool,
         #[cfg(feature = "compaction_filters")] compaction_filter_supplier: Option<
             Arc<dyn CompactionFilterSupplier>,
         >,
@@ -304,6 +306,7 @@ impl Compactor {
             stats,
             system_clock,
             merge_operator,
+            skip_merge_when_blob_ref_base,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier,
         }
@@ -331,6 +334,7 @@ impl Compactor {
                 clock: self.system_clock.clone(),
                 manifest_store: self.manifest_store.clone(),
                 merge_operator: self.merge_operator.clone(),
+                skip_merge_when_blob_ref_base: self.skip_merge_when_blob_ref_base,
                 #[cfg(feature = "compaction_filters")]
                 compaction_filter_supplier: self.compaction_filter_supplier.clone(),
             },
@@ -2957,6 +2961,7 @@ mod tests {
                     clock: Arc::new(DefaultSystemClock::new()),
                     manifest_store: manifest_store.clone(),
                     merge_operator: None,
+                    skip_merge_when_blob_ref_base: false,
                     #[cfg(feature = "compaction_filters")]
                     compaction_filter_supplier: None,
                 },

@@ -557,6 +557,9 @@ impl<P: Into<Path>> DbBuilder<P> {
             if let Some(operator) = self.merge_operator {
                 builder = builder.with_merge_operator(operator);
             }
+            if self.settings.blob_options.is_some() {
+                builder = builder.with_skip_merge_when_blob_ref_base(true);
+            }
 
             let (handler, rx) = builder
                 .build_handler(
@@ -813,6 +816,7 @@ pub struct CompactorBuilder<P: Into<Path>> {
     block_transformer: Option<Arc<dyn BlockTransformer>>,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
+    skip_merge_when_blob_ref_base: bool,
 }
 
 #[allow(unused)]
@@ -832,6 +836,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             block_transformer: None,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
+            skip_merge_when_blob_ref_base: false,
         }
     }
 
@@ -850,6 +855,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             block_transformer: self.block_transformer,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: self.compaction_filter_supplier,
+            skip_merge_when_blob_ref_base: self.skip_merge_when_blob_ref_base,
         }
     }
 
@@ -902,6 +908,12 @@ impl<P: Into<Path>> CompactorBuilder<P> {
     /// Sets the merge operator to use for the compactor.
     pub fn with_merge_operator(mut self, merge_operator: MergeOperatorType) -> Self {
         self.merge_operator = Some(merge_operator);
+        self
+    }
+
+    /// When enabled, compaction does not fold merge operands into a `BlobRef` base row.
+    pub fn with_skip_merge_when_blob_ref_base(mut self, enabled: bool) -> Self {
+        self.skip_merge_when_blob_ref_base = enabled;
         self
     }
 
@@ -980,6 +992,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             self.system_clock,
             self.closed_result,
             self.merge_operator,
+            self.skip_merge_when_blob_ref_base,
             #[cfg(feature = "compaction_filters")]
             self.compaction_filter_supplier,
         )
@@ -1021,6 +1034,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
                 clock: self.system_clock.clone(),
                 manifest_store: manifest_store.clone(),
                 merge_operator: self.merge_operator,
+                skip_merge_when_blob_ref_base: self.skip_merge_when_blob_ref_base,
                 #[cfg(feature = "compaction_filters")]
                 compaction_filter_supplier: self.compaction_filter_supplier,
             },

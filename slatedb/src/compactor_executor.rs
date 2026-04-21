@@ -195,6 +195,8 @@ pub(crate) struct TokioCompactionExecutorOptions {
     pub clock: Arc<dyn SystemClock>,
     pub manifest_store: Arc<ManifestStore>,
     pub merge_operator: Option<MergeOperatorType>,
+    /// When blob externalization is enabled, do not fold merges into a `BlobRef` base.
+    pub skip_merge_when_blob_ref_base: bool,
     #[cfg(feature = "compaction_filters")]
     pub compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
@@ -218,6 +220,7 @@ impl TokioCompactionExecutor {
                 is_stopped: AtomicBool::new(false),
                 manifest_store: opts.manifest_store,
                 merge_operator: opts.merge_operator,
+                skip_merge_when_blob_ref_base: opts.skip_merge_when_blob_ref_base,
                 #[cfg(feature = "compaction_filters")]
                 compaction_filter_supplier: opts.compaction_filter_supplier,
             }),
@@ -255,6 +258,7 @@ pub(crate) struct TokioCompactionExecutorInner {
     is_stopped: AtomicBool,
     manifest_store: Arc<ManifestStore>,
     merge_operator: Option<MergeOperatorType>,
+    skip_merge_when_blob_ref_base: bool,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
@@ -310,6 +314,7 @@ impl TokioCompactionExecutorInner {
                     false,
                     job_args.retention_min_seq,
                     Some(self.table_store.clone()),
+                    self.skip_merge_when_blob_ref_base,
                 ))
             } else {
                 Box::new(MergeOperatorRequiredIterator::new(merge_iter))
@@ -1014,6 +1019,7 @@ mod tests {
             clock,
             manifest_store,
             merge_operator,
+            skip_merge_when_blob_ref_base: false,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
         });
@@ -1221,6 +1227,7 @@ mod tests {
                     clock,
                     manifest_store,
                     merge_operator,
+                    skip_merge_when_blob_ref_base: false,
                     #[cfg(feature = "compaction_filters")]
                     compaction_filter_supplier: None,
                 });
@@ -1384,6 +1391,7 @@ mod tests {
                 clock,
                 manifest_store,
                 merge_operator: self.merge_operator,
+                skip_merge_when_blob_ref_base: false,
                 #[cfg(feature = "compaction_filters")]
                 compaction_filter_supplier: self.compaction_filter_supplier,
             });

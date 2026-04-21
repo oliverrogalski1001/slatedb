@@ -313,6 +313,7 @@ impl WriteBatch {
                 false,
                 None,
                 None,
+                false,
             ));
         }
 

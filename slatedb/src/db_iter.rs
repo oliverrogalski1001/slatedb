@@ -270,6 +270,7 @@ impl DbIterator {
                 // there need to be merged with the entries from the other iterators.
                 None,
                 table_store.clone(),
+                false,
             ));
         } else {
             // When no merge operator is configured, wrap with iterator that errors on merge operands

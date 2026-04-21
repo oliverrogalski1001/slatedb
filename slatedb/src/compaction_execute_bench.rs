@@ -341,6 +341,7 @@ impl CompactionExecuteBench {
             clock: self.system_clock.clone(),
             manifest_store: manifest_store.clone(),
             merge_operator: None,
+            skip_merge_when_blob_ref_base: false,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
         });
