@@ -1420,6 +1420,7 @@ mod tests {
                 min_age: std::time::Duration::from_secs(3600),
                 interval: None,
             }),
+            blob_options: None,
         };
 
         let gc = GarbageCollector::new(
@@ -1486,6 +1487,7 @@ mod tests {
                 min_age: std::time::Duration::from_secs(3600),
                 interval: None,
             }),
+            blob_options: None,
         };
 
         let mut gc = GarbageCollector::new(
@@ -1548,6 +1550,7 @@ mod tests {
                 min_age: std::time::Duration::from_secs(3600),
                 interval: None,
             }),
+            blob_options: None,
         };
 
         let gc = GarbageCollector::new(
@@ -1586,6 +1589,7 @@ mod tests {
                 min_age: Duration::from_secs(3600),
                 interval: Some(Duration::from_secs(17)),
             }),
+            blob_options: None,
         };
 
         let mut gc = GarbageCollector::new(
@@ -1634,6 +1638,7 @@ mod tests {
                 min_age: Duration::from_secs(3600),
                 interval: Some(Duration::from_secs(1)),
             }),
+            blob_options: None,
         };
 
         let gc = GarbageCollector::new(
@@ -1663,5 +1668,214 @@ mod tests {
         let result = executor.join_task(GC_TASK_NAME).await;
         assert!(matches!(result, Ok(())));
         jh.await.expect("failed to join task");
+    }
+
+    // ---- Blob GC tests ----
+
+    async fn put_blob(table_store: &TableStore, id: ulid::Ulid) {
+        table_store
+            .put_blob(id, bytes::Bytes::from_static(b"value"))
+            .await
+            .unwrap();
+    }
+
+    async fn blob_exists(table_store: &TableStore, id: ulid::Ulid) -> bool {
+        table_store.get_blob(id).await.is_ok()
+    }
+
+    fn blob_gc_only_opts() -> GarbageCollectorOptions {
+        GarbageCollectorOptions {
+            manifest_options: None,
+            wal_options: None,
+            compacted_options: None,
+            compactions_options: None,
+            blob_options: Some(GarbageCollectorDirectoryOptions {
+                min_age: Duration::from_secs(0),
+                interval: None,
+            }),
+        }
+    }
+
+    async fn seed_manifest_with_orphans(
+        manifest_store: Arc<ManifestStore>,
+        orphans: Vec<crate::manifest::OrphanBlob>,
+        checkpoints: Vec<Checkpoint>,
+    ) {
+        let mut stored_manifest = StoredManifest::create_new_db(
+            manifest_store,
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let mut dirty = stored_manifest.prepare_dirty().unwrap();
+        dirty.value.core.orphan_blobs = orphans;
+        dirty.value.core.checkpoints = checkpoints;
+        stored_manifest.update(dirty).await.unwrap();
+    }
+
+    async fn run_blob_gc_once(
+        manifest_store: Arc<ManifestStore>,
+        compactions_store: Arc<CompactionsStore>,
+        table_store: Arc<TableStore>,
+    ) {
+        let db_metrics = crate::db_metrics::DbMetrics::new(None);
+        let gc = GarbageCollector::new(
+            manifest_store,
+            compactions_store,
+            table_store,
+            blob_gc_only_opts(),
+            &db_metrics,
+            Arc::new(DefaultSystemClock::default()),
+        );
+        gc.run_gc_once().await;
+    }
+
+    #[tokio::test]
+    async fn test_blob_gc_deletes_orphans_below_watermark_without_checkpoints() {
+        use crate::manifest::OrphanBlob;
+
+        let (manifest_store, compactions_store, table_store, _) = build_objects();
+        let b1 = ulid::Ulid::new();
+        let b2 = ulid::Ulid::new();
+        put_blob(&table_store, b1).await;
+        put_blob(&table_store, b2).await;
+
+        // Manifest becomes id=2 after update; orphans recorded at id=1 satisfy
+        // recorded_at_manifest_id < min_checkpoint_id (=2, current manifest id).
+        seed_manifest_with_orphans(
+            manifest_store.clone(),
+            vec![
+                OrphanBlob {
+                    blob_id: b1,
+                    recorded_at_manifest_id: 1,
+                },
+                OrphanBlob {
+                    blob_id: b2,
+                    recorded_at_manifest_id: 1,
+                },
+            ],
+            vec![],
+        )
+        .await;
+
+        run_blob_gc_once(
+            manifest_store.clone(),
+            compactions_store,
+            table_store.clone(),
+        )
+        .await;
+
+        assert!(!blob_exists(&table_store, b1).await);
+        assert!(!blob_exists(&table_store, b2).await);
+        let (_, manifest) = manifest_store.read_latest_manifest().await.unwrap();
+        assert!(manifest.core.orphan_blobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_blob_gc_preserves_orphans_pinned_by_checkpoint() {
+        use crate::manifest::OrphanBlob;
+
+        let (manifest_store, compactions_store, table_store, _) = build_objects();
+        let pinned = ulid::Ulid::new();
+        put_blob(&table_store, pinned).await;
+
+        // Checkpoint pins manifest 1; orphan recorded at 2 is not < 1 → must stay.
+        let checkpoint = Checkpoint {
+            id: Uuid::new_v4(),
+            manifest_id: 1,
+            expire_time: None,
+            create_time: DefaultSystemClock::default().now(),
+            name: None,
+        };
+        seed_manifest_with_orphans(
+            manifest_store.clone(),
+            vec![OrphanBlob {
+                blob_id: pinned,
+                recorded_at_manifest_id: 2,
+            }],
+            vec![checkpoint],
+        )
+        .await;
+
+        let (_, manifest_before) = manifest_store.read_latest_manifest().await.unwrap();
+        let orphans_before = manifest_before.core.orphan_blobs.clone();
+
+        run_blob_gc_once(
+            manifest_store.clone(),
+            compactions_store,
+            table_store.clone(),
+        )
+        .await;
+
+        assert!(blob_exists(&table_store, pinned).await);
+        let (_, manifest_after) = manifest_store.read_latest_manifest().await.unwrap();
+        assert_eq!(manifest_after.core.orphan_blobs, orphans_before);
+    }
+
+    #[tokio::test]
+    async fn test_blob_gc_partial_delete_respects_watermark() {
+        use crate::manifest::OrphanBlob;
+
+        let (manifest_store, compactions_store, table_store, _) = build_objects();
+        let eligible = ulid::Ulid::new();
+        let pinned = ulid::Ulid::new();
+        put_blob(&table_store, eligible).await;
+        put_blob(&table_store, pinned).await;
+
+        let checkpoint = Checkpoint {
+            id: Uuid::new_v4(),
+            manifest_id: 3,
+            expire_time: None,
+            create_time: DefaultSystemClock::default().now(),
+            name: None,
+        };
+        seed_manifest_with_orphans(
+            manifest_store.clone(),
+            vec![
+                OrphanBlob {
+                    blob_id: eligible,
+                    recorded_at_manifest_id: 2,
+                },
+                OrphanBlob {
+                    blob_id: pinned,
+                    recorded_at_manifest_id: 3,
+                },
+            ],
+            vec![checkpoint],
+        )
+        .await;
+
+        run_blob_gc_once(
+            manifest_store.clone(),
+            compactions_store,
+            table_store.clone(),
+        )
+        .await;
+
+        assert!(!blob_exists(&table_store, eligible).await);
+        assert!(blob_exists(&table_store, pinned).await);
+        let (_, manifest_after) = manifest_store.read_latest_manifest().await.unwrap();
+        assert_eq!(manifest_after.core.orphan_blobs.len(), 1);
+        assert_eq!(manifest_after.core.orphan_blobs[0].blob_id, pinned);
+    }
+
+    #[tokio::test]
+    async fn test_blob_gc_no_orphans_is_noop() {
+        let (manifest_store, compactions_store, table_store, _) = build_objects();
+        seed_manifest_with_orphans(manifest_store.clone(), vec![], vec![]).await;
+        let (id_before, _) = manifest_store.read_latest_manifest().await.unwrap();
+
+        run_blob_gc_once(
+            manifest_store.clone(),
+            compactions_store,
+            table_store.clone(),
+        )
+        .await;
+
+        // No orphans → no manifest write.
+        let (id_after, manifest_after) = manifest_store.read_latest_manifest().await.unwrap();
+        assert_eq!(id_before, id_after);
+        assert!(manifest_after.core.orphan_blobs.is_empty());
     }
 }

@@ -1194,6 +1194,7 @@ impl GarbageCollectorOptions {
             && self.wal_options.is_none()
             && self.compacted_options.is_none()
             && self.compactions_options.is_none()
+            && self.blob_options.is_none()
     }
 }
 

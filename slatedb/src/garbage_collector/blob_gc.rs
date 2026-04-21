@@ -7,7 +7,7 @@ use crate::garbage_collector::StoredManifest;
 use crate::manifest::OrphanBlob;
 use crate::tablestore::TableStore;
 use chrono::{DateTime, Utc};
-use log::error;
+use log::{debug, error};
 use slatedb_common::clock::SystemClock;
 use slatedb_txn_obj::{DirtyObject, SimpleTransactionalObject, TransactionalObject};
 use std::collections::HashSet;
@@ -108,6 +108,8 @@ impl GcTask for BlobGcTask {
             .filter(|blob| blob.recorded_at_manifest_id < min_checkpoint_id)
             .map(|blob| blob.blob_id)
             .collect();
+
+        debug!("garbage collecting {} blobs", to_delete.len());
 
         if to_delete.is_empty() {
             return Ok(());
