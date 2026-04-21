@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use crate::compaction_filter::CompactionFilterSupplier;
 #[cfg(feature = "compaction_filters")]
 use crate::compaction_filter_iterator::CompactionFilterIterator;
-use crate::compactor::CompactorMessage;
+use crate::compactor::{CompactionJobOutput, CompactorMessage};
 use crate::compactor::CompactorMessage::CompactionJobFinished;
 use crate::config::CompactorOptions;
 use crate::db_state::{SortedRun, SsTableHandle, SsTableId, SsTableView};
@@ -243,7 +243,7 @@ impl CompactionExecutor for TokioCompactionExecutor {
 }
 
 struct TokioCompactionTask {
-    task: JoinHandle<Result<SortedRun, SlateDBError>>,
+    task: JoinHandle<Result<CompactionJobOutput, SlateDBError>>,
 }
 
 pub(crate) struct TokioCompactionExecutorInner {
@@ -269,6 +269,7 @@ impl TokioCompactionExecutorInner {
     async fn load_iterators<'a>(
         &self,
         job_args: &'a StartCompactionJobArgs,
+        orphan_blob_sink: Option<Arc<std::sync::Mutex<Vec<Ulid>>>>,
     ) -> Result<ResumingIterator<Box<dyn TrackedRowEntryIterator + 'a>>, SlateDBError> {
         let resume_cursor = match job_args.output_ssts.last() {
             Some(output_sst) => {
@@ -330,6 +331,7 @@ impl TokioCompactionExecutorInner {
             job_args.compaction_clock_tick,
             self.clock.clone(),
             Arc::new(stored_manifest.db_state().sequence_tracker.clone()),
+            orphan_blob_sink,
         )
         .await?;
         retention_iter.init().await?;
@@ -394,9 +396,12 @@ impl TokioCompactionExecutorInner {
     async fn execute_compaction_job(
         &self,
         args: StartCompactionJobArgs,
-    ) -> Result<SortedRun, SlateDBError> {
+    ) -> Result<CompactionJobOutput, SlateDBError> {
         debug!("executing compaction [job_args={:?}]", args);
-        let mut all_iter = self.load_iterators(&args).await?;
+        let orphan_blob_sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut all_iter = self
+            .load_iterators(&args, Some(orphan_blob_sink.clone()))
+            .await?;
         let mut output_ssts = args.output_ssts.clone();
         let mut current_writer = self.table_store.table_writer(SsTableId::Compacted(
             self.rand.rng().gen_ulid(self.clock.as_ref()),
@@ -457,15 +462,22 @@ impl TokioCompactionExecutorInner {
             output_ssts.push(sst);
         }
 
-        Ok(SortedRun {
-            id: args.destination,
-            sst_views: output_ssts
-                .into_iter()
-                .map(|sst| {
-                    let id = self.rand.rng().gen_ulid(self.clock.as_ref());
-                    SsTableView::new(id, sst)
-                })
-                .collect(),
+        let retention_orphan_blob_ids = orphan_blob_sink
+            .lock()
+            .expect("orphan blob sink mutex poisoned")
+            .clone();
+        Ok(CompactionJobOutput {
+            sorted_run: SortedRun {
+                id: args.destination,
+                sst_views: output_ssts
+                    .into_iter()
+                    .map(|sst| {
+                        let id = self.rand.rng().gen_ulid(self.clock.as_ref());
+                        SsTableView::new(id, sst)
+                    })
+                    .collect(),
+            },
+            retention_orphan_blob_ids,
         })
     }
 
@@ -1088,7 +1100,11 @@ mod tests {
 
         // Verify the resumed iterator yields all remaining rows, starting immediately
         // after the persisted prefix and continuing in sorted order.
-        let mut iter = executor.inner.load_iterators(&job_args).await.unwrap();
+        let mut iter = executor
+            .inner
+            .load_iterators(&job_args, None)
+            .await
+            .unwrap();
         let mut resumed_entries = Vec::new();
         while let Some(entry) = iter.next().await.unwrap() {
             resumed_entries.push(entry);
@@ -1254,7 +1270,8 @@ mod tests {
                         retention_min_seq,
                     })
                     .await
-                    .unwrap();
+                    .unwrap()
+                    .sorted_run;
 
                 let mut expected_entries = Vec::new();
                 for sst in &full_run.sst_views {
@@ -1299,7 +1316,8 @@ mod tests {
                             retention_min_seq,
                         })
                         .await
-                        .unwrap();
+                        .unwrap()
+                        .sorted_run;
 
                     let mut resumed_entries = Vec::new();
                     for sst in &resumed_run.sst_views {
@@ -1435,6 +1453,7 @@ mod tests {
             })
             .await
             .unwrap()
+            .map(|output| output.sorted_run)
         }
     }
 

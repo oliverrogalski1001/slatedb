@@ -1,8 +1,10 @@
 use async_trait::async_trait;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use ulid::Ulid;
 
 use crate::error::SlateDBError;
 use crate::iter::{RowEntryIterator, TrackedRowEntryIterator};
@@ -36,6 +38,8 @@ pub(crate) struct RetentionIterator<T: RowEntryIterator> {
     system_clock: Arc<dyn SystemClock>,
     /// Historical sequence metadata used to translate sequence numbers into wall-clock timestamps.
     sequence_tracker: Arc<SequenceTracker>,
+    /// When set, blob ids from versions dropped by retention are appended (compaction path).
+    orphan_blob_sink: Option<Arc<Mutex<Vec<Ulid>>>>,
 }
 
 impl<T: RowEntryIterator> RetentionIterator<T> {
@@ -48,6 +52,7 @@ impl<T: RowEntryIterator> RetentionIterator<T> {
         compaction_start_ts: i64,
         system_clock: Arc<dyn SystemClock>,
         sequence_tracker: Arc<SequenceTracker>,
+        orphan_blob_sink: Option<Arc<Mutex<Vec<Ulid>>>>,
     ) -> Result<Self, SlateDBError> {
         Ok(Self {
             inner,
@@ -58,7 +63,27 @@ impl<T: RowEntryIterator> RetentionIterator<T> {
             system_clock,
             sequence_tracker,
             buffer: RetentionBuffer::new(),
+            orphan_blob_sink,
         })
+    }
+
+    fn record_retention_dropped_blob_ids(
+        sink: &Option<Arc<Mutex<Vec<Ulid>>>>,
+        ordered: &[RowEntry],
+        dropped_indices: &[usize],
+    ) {
+        let Some(s) = sink else {
+            return;
+        };
+        let mut guard = s.lock().expect("orphan blob sink mutex poisoned");
+        for &idx in dropped_indices {
+            if let ValueDeletable::BlobRef(br) = &ordered[idx].value {
+                let id = br.blob_id;
+                if !guard.contains(&id) {
+                    guard.push(id);
+                }
+            }
+        }
     }
 
     /// Applies retention filtering to a collection of versions for the same key
@@ -75,75 +100,48 @@ impl<T: RowEntryIterator> RetentionIterator<T> {
         retention_min_seq: Option<u64>,
         filter_tombstone: bool,
         sequence_tracker: Arc<SequenceTracker>,
+        orphan_blob_sink: Option<Arc<Mutex<Vec<Ulid>>>>,
     ) -> BTreeMap<Reverse<u64>, RowEntry> {
+        let ordered: Vec<RowEntry> = versions.into_iter().map(|(_, e)| e).collect();
         let mut filtered_versions = BTreeMap::new();
+        let mut dropped_indices: Vec<usize> = Vec::new();
         let current_system_ts = system_clock.now().timestamp_millis();
-        for (_, entry) in versions.into_iter() {
-            // filter out any expired entries -- eventually we can consider
-            // abstracting this away into generic, pluggable compaction filters
-            // but for now we do it inline
-            let is_merge = matches!(&entry.value, ValueDeletable::Merge(_));
-            let entry = match entry.expire_ts.as_ref() {
+        let n = ordered.len();
+        let mut i = 0usize;
+        while i < n {
+            let orig = &ordered[i];
+            let is_merge = matches!(&orig.value, ValueDeletable::Merge(_));
+            let entry = match orig.expire_ts.as_ref() {
                 Some(expire_ts) if *expire_ts <= compaction_start_ts => {
                     if is_merge {
-                        // just skip expired merge entries rather than write a tombstone
-                        // as earlier merges may still be un-expired
+                        dropped_indices.push(i);
+                        i += 1;
                         continue;
                     }
-                    // for values, insert a tombstone instead of just filtering out the
-                    // value in the iterator because this may otherwise "revive"
-                    // an older version of the KV pair that has a larger TTL in
-                    // a lower level of the LSM tree
+                    // Track expired BlobRef for orphan GC: the blob content is no longer
+                    // referenced once the entry is replaced by a tombstone.
+                    if matches!(&orig.value, ValueDeletable::BlobRef(_)) {
+                        dropped_indices.push(i);
+                    }
                     RowEntry {
-                        key: entry.key,
+                        key: orig.key.clone(),
                         value: Tombstone,
-                        seq: entry.seq,
+                        seq: orig.seq,
                         expire_ts: None,
-                        create_ts: entry.create_ts,
+                        create_ts: orig.create_ts,
                     }
                 }
-                _ => entry,
+                _ => orig.clone(),
             };
 
             let entry_seq = entry.seq;
+            filtered_versions.insert(Reverse(entry_seq), entry);
 
-            // always keep the entry with latest version.
-            filtered_versions.insert(Reverse(entry.seq), entry);
-
-            // For older versions, we keep iterating until we find the first entry outside the retention
-            // window (by both time AND seq). This entry serves as a "boundary value" for snapshot reads.
-            //
-            // Example: Why we need the boundary value
-            //   1. set a = 'v0' (seq=1)
-            //   2. set a = 'v1' (seq=2)
-            //   3. set b = 'v2' (seq=3)
-            //   4. create snapshot s1 (captures seq=3, so min_retention_seq=3)
-            //   5. delete a (seq=4, creates tombstone)
-            //   6. run compaction (with retention_min_seq=3)
-            //
-            // For key 'a', the compaction will see:
-            //   - tombstone (seq=4) -> KEEP (latest version, AND seq > min_seq)
-            //   - 'v1' (seq=2) -> KEEP (boundary: first entry with seq <= min_seq)
-            //   - 'v0' (seq=1) -> DROP (older than boundary)
-            //
-            // The boundary value (seq=2) is crucial: if snapshot s1 reads key 'a', it needs to find
-            // a version at or before seq=3. Without keeping seq=2, the snapshot would incorrectly
-            // see the tombstone (seq=4) which didn't exist when the snapshot was created.
-            //
-            // Note: We use OR logic below because we keep iterating as long as the entry is within
-            // EITHER the time window OR the seq window. We only stop when it's outside BOTH.
             let continue_retain_by_time = retention_timeout
                 .map(|timeout| {
                     let create_sys_ts = sequence_tracker
-                        // Use RoundUp to conservatively estimate creation time. For example:
-                        // - If retention window is 10min and current time is 12:00:00
-                        // - And sequence tracker has timestamps at 11:49:30 and 11:50:30
-                        // - RoundUp will use 11:50:30 (later timestamp) to avoid over-aggressive filtering
                         .find_ts(entry_seq, FindOption::RoundUp)
                         .map(|ts| ts.timestamp_millis())
-                        // if the sequence number is greater than the last recorded sequence
-                        // number we just assume that it was produced now (so it effectively
-                        // should be kept in the filtered results)
                         .unwrap_or(current_system_ts);
                     create_sys_ts + (timeout.as_millis() as i64) > current_system_ts
                 })
@@ -154,15 +152,17 @@ impl<T: RowEntryIterator> RetentionIterator<T> {
 
             let continue_retain = continue_retain_by_time || continue_retain_by_seq || is_merge;
             if !continue_retain {
-                // if we find the first non-merge entry that's neither in retention window by time
-                // nor by seq we should break the loop to filter out the earlier versions of the
-                // same key.
+                for j in (i + 1)..n {
+                    dropped_indices.push(j);
+                }
                 break;
             }
+            i += 1;
         }
 
+        Self::record_retention_dropped_blob_ids(&orphan_blob_sink, &ordered, &dropped_indices);
+
         if filter_tombstone {
-            // remove the tombstones in the tail
             while filtered_versions
                 .iter()
                 .last()
@@ -235,6 +235,7 @@ impl<T: RowEntryIterator> RowEntryIterator for RetentionIterator<T> {
                             retention_min_seq,
                             self.filter_tombstone,
                             self.sequence_tracker.clone(),
+                            self.orphan_blob_sink.clone(),
                         )
                     })?;
                 }
@@ -410,7 +411,8 @@ impl RetentionBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::RowEntry;
+    use crate::types::{BlobRef, RowEntry, ValueDeletable};
+    use bytes::Bytes;
     use rstest::rstest;
 
     #[cfg(feature = "test-util")]
@@ -1012,6 +1014,7 @@ mod tests {
             test_case.retention_min_seq,
             test_case.filter_tombstone,
             Arc::new(SequenceTracker::new()),
+            None,
         );
 
         // Convert filtered versions back to expected order
@@ -1124,6 +1127,7 @@ mod tests {
             None,
             false,
             tracker,
+            None,
         );
 
         let derived_ts = sorted_points
@@ -1139,5 +1143,79 @@ mod tests {
             "{:?}[{}@{} Now({})]",
             filtered, entry_seq, derived_ts, clock_now
         );
+    }
+
+    #[test]
+    fn apply_retention_filter_records_blob_dropped_past_retention_boundary() {
+        use crate::test_utils::TestIterator;
+        use slatedb_common::clock::MockSystemClock;
+
+        let blob_id = Ulid::new();
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let mut versions = BTreeMap::new();
+        versions.insert(Reverse(3u64), RowEntry::new_value(b"k", b"newest", 3));
+        versions.insert(Reverse(2u64), RowEntry::new_value(b"k", b"boundary", 2));
+        versions.insert(
+            Reverse(1u64),
+            RowEntry::new(
+                Bytes::copy_from_slice(b"k"),
+                ValueDeletable::BlobRef(BlobRef::new(blob_id, 8)),
+                1,
+                None,
+                None,
+            ),
+        );
+        let system_clock = Arc::new(MockSystemClock::with_time(1_000_000));
+        let tracker = Arc::new(SequenceTracker::new());
+        let _filtered = RetentionIterator::<TestIterator>::apply_retention_filter(
+            versions,
+            i64::MAX,
+            system_clock,
+            None,
+            Some(2),
+            false,
+            tracker,
+            Some(sink.clone()),
+        );
+        assert_eq!(*sink.lock().unwrap(), vec![blob_id]);
+    }
+
+    #[test]
+    fn apply_retention_filter_records_blob_when_expired() {
+        use crate::test_utils::TestIterator;
+        use slatedb_common::clock::MockSystemClock;
+
+        let blob_id = Ulid::new();
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let mut versions = BTreeMap::new();
+        // BlobRef with an expire_ts in the past — should be converted to tombstone and tracked.
+        versions.insert(
+            Reverse(1u64),
+            RowEntry::new(
+                Bytes::copy_from_slice(b"k"),
+                ValueDeletable::BlobRef(BlobRef::new(blob_id, 8)),
+                1,
+                None,       // create_ts
+                Some(500),  // expire_ts
+            ),
+        );
+        let compaction_start_ts = 1_000i64; // past the expire_ts
+        let system_clock = Arc::new(MockSystemClock::with_time(1_000_000));
+        let tracker = Arc::new(SequenceTracker::new());
+        let filtered = RetentionIterator::<TestIterator>::apply_retention_filter(
+            versions,
+            compaction_start_ts,
+            system_clock,
+            None,
+            None,
+            false,
+            tracker,
+            Some(sink.clone()),
+        );
+        // Entry replaced by tombstone, not dropped entirely.
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered.values().next().unwrap().value.is_tombstone());
+        // Blob id recorded for GC.
+        assert_eq!(*sink.lock().unwrap(), vec![blob_id]);
     }
 }

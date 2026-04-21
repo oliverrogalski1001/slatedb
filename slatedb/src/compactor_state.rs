@@ -6,7 +6,7 @@ use log::{error, info};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::db_state::{ManifestCore, SortedRun, SsTableHandle, SsTableView};
+use crate::db_state::{ManifestCore, OrphanBlob, SortedRun, SsTableHandle, SsTableView};
 use crate::error::SlateDBError;
 use crate::manifest::Manifest;
 use slatedb_txn_obj::DirtyObject;
@@ -555,6 +555,17 @@ impl CompactorState {
             }
         }
 
+        // Merge orphan blobs: start from remote (source of truth for blobs recorded by other
+        // writers), then append any locally-added orphans not yet in the remote manifest.
+        // Without this, orphans added by finish_compaction would be silently dropped each
+        // time load_manifest/write_manifest calls merge_remote_manifest.
+        let mut merged_orphan_blobs = remote_manifest.value.core.orphan_blobs.clone();
+        for o in &my_db_state.orphan_blobs {
+            if !merged_orphan_blobs.iter().any(|r| r.blob_id == o.blob_id) {
+                merged_orphan_blobs.push(o.clone());
+            }
+        }
+
         // write out the merged core db state and manifest
         let merged = ManifestCore {
             initialized: remote_manifest.value.core.initialized,
@@ -570,7 +581,7 @@ impl CompactorState {
             wal_object_store_uri: my_db_state.wal_object_store_uri.clone(),
             recent_snapshot_min_seq: remote_manifest.value.core.recent_snapshot_min_seq,
             sequence_tracker: remote_manifest.value.core.sequence_tracker,
-            orphan_blobs: remote_manifest.value.core.orphan_blobs.clone(),
+            orphan_blobs: merged_orphan_blobs,
         };
         remote_manifest.value.core = merged;
         self.manifest = remote_manifest;
@@ -638,7 +649,12 @@ impl CompactorState {
     /// This removes compacted L0 SSTs and source SRs, inserts the output SR in id-descending
     /// order, updates `l0_last_compacted`, and marks the compaction finished (retaining the most
     /// recent finished compaction for GC; see #1044).
-    pub(crate) fn finish_compaction(&mut self, compaction_id: Ulid, output_sr: SortedRun) {
+    pub(crate) fn finish_compaction(
+        &mut self,
+        compaction_id: Ulid,
+        output_sr: SortedRun,
+        retention_orphan_blob_ids: Vec<Ulid>,
+    ) {
         let mut db_state = self.db_state().clone();
         if let Some(compaction) = self.compactions.value.get_mut(&compaction_id) {
             let spec = compaction.spec();
@@ -693,6 +709,21 @@ impl CompactorState {
             }
             db_state.l0 = new_l0;
             db_state.compacted = new_compacted;
+            if !retention_orphan_blob_ids.is_empty() {
+                let recorded_at_manifest_id: u64 = self.manifest.id.next().into();
+                for blob_id in retention_orphan_blob_ids {
+                    if !db_state
+                        .orphan_blobs
+                        .iter()
+                        .any(|existing| existing.blob_id == blob_id)
+                    {
+                        db_state.orphan_blobs.push(OrphanBlob {
+                            blob_id,
+                            recorded_at_manifest_id,
+                        });
+                    }
+                }
+            }
             self.manifest.value.core = db_state;
             self.update_compaction(&compaction_id, |c| {
                 c.set_status(CompactionStatus::Completed);
@@ -927,7 +958,7 @@ mod tests {
             id: 0,
             sst_views: compacted_ssts,
         };
-        state.finish_compaction(compaction_id, sr.clone());
+        state.finish_compaction(compaction_id, sr.clone(), vec![]);
 
         // then:
         assert_eq!(
@@ -969,7 +1000,7 @@ mod tests {
             id: 0,
             sst_views: compacted_ssts,
         };
-        state.finish_compaction(compaction_id, sr);
+        state.finish_compaction(compaction_id, sr, vec![]);
 
         // then:
         assert_eq!(state.active_compactions().count(), 0)
@@ -1026,6 +1057,7 @@ mod tests {
                 id: 0,
                 sst_views: vec![original_l0s.back().unwrap().clone()],
             },
+            vec![],
         );
         // open a new db and write another l0
         let db = build_db(os.clone(), rt.handle());
@@ -1091,6 +1123,7 @@ mod tests {
                 id: 0,
                 sst_views: original_l0s.clone().into(),
             },
+            vec![],
         );
         assert_eq!(state.db_state().l0.len(), 0);
         // open a new db and write another l0

@@ -97,6 +97,14 @@ pub use crate::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
 
 pub(crate) const COMPACTOR_TASK_NAME: &str = "compactor";
 
+/// Successful output of a single compaction job attempt.
+#[derive(Clone, Debug)]
+pub(crate) struct CompactionJobOutput {
+    pub sorted_run: SortedRun,
+    /// Blob ids dropped by retention during compaction (must be appended to manifest orphans).
+    pub retention_orphan_blob_ids: Vec<Ulid>,
+}
+
 /// Supplies a concrete [`CompactionScheduler`] implementation.
 ///
 /// This indirection lets SlateDB plug different scheduling policies (e.g. size-tiered,
@@ -209,8 +217,8 @@ pub(crate) enum CompactorMessage {
     CompactionJobFinished {
         /// Job id (distinct from the canonical compaction id).
         id: Ulid,
-        /// Output SR on success, or the compaction error.
-        result: Result<SortedRun, SlateDBError>,
+        /// Output SR and retention orphans on success, or the compaction error.
+        result: Result<CompactionJobOutput, SlateDBError>,
     },
     /// Periodic progress update from the [`CompactionExecutor`].
     CompactionJobProgress {
@@ -447,7 +455,7 @@ impl MessageHandler<CompactorMessage> for CompactorEventHandler {
             CompactorMessage::PollManifest => self.handle_ticker().await?,
             CompactorMessage::CompactionJobFinished { id, result } => {
                 match result {
-                    Ok(sr) => self.finish_compaction(id, sr).await?,
+                    Ok(output) => self.finish_compaction(id, output).await?,
                     Err(err) => {
                         error!("error executing compaction [error={:#?}]", err);
                         self.finish_failed_compaction(id).await?;
@@ -936,9 +944,13 @@ impl CompactorEventHandler {
     async fn finish_compaction(
         &mut self,
         id: Ulid,
-        output_sr: SortedRun,
+        output: CompactionJobOutput,
     ) -> Result<(), SlateDBError> {
-        self.state_mut().finish_compaction(id, output_sr);
+        self.state_mut().finish_compaction(
+            id,
+            output.sorted_run,
+            output.retention_orphan_blob_ids,
+        );
         self.log_compaction_state();
         self.state_writer.write_state_safely().await?;
         self.maybe_schedule_compactions().await?;
@@ -3533,7 +3545,10 @@ mod tests {
         };
         let msg = CompactorMessage::CompactionJobFinished {
             id: compaction_id,
-            result: Ok(output_sr),
+            result: Ok(CompactionJobOutput {
+                sorted_run: output_sr,
+                retention_orphan_blob_ids: vec![],
+            }),
         };
         handler.handle(msg).await.unwrap();
 
@@ -3646,7 +3661,10 @@ mod tests {
         };
         let msg = CompactorMessage::CompactionJobFinished {
             id: job.id,
-            result: Ok(output_sr),
+            result: Ok(CompactionJobOutput {
+                sorted_run: output_sr,
+                retention_orphan_blob_ids: vec![],
+            }),
         };
 
         // when:

@@ -76,6 +76,7 @@ impl DbInner {
             imm_table.last_tick(),
             self.system_clock.clone(),
             Arc::new(state.core().sequence_tracker.clone()),
+            None,
         )
         .await?;
         iter.init().await?;
