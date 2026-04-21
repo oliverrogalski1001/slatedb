@@ -135,13 +135,45 @@ impl<T: RowEntryIterator> RetentionIterator<T> {
             };
 
             let entry_seq = entry.seq;
+
+            // always keep the entry with latest version (the one with the highest sequence number).
             filtered_versions.insert(Reverse(entry_seq), entry);
+
+            // For older versions, we keep iterating until we find the first entry outside the retention
+            // window (by both time AND seq). This entry serves as a "boundary value" for snapshot reads.
+            //
+            // Example: Why we need the boundary value
+            //   1. set a = 'v0' (seq=1)
+            //   2. set a = 'v1' (seq=2)
+            //   3. set b = 'v2' (seq=3)
+            //   4. create snapshot s1 (captures seq=3, so min_retention_seq=3)
+            //   5. delete a (seq=4, creates tombstone)
+            //   6. run compaction (with retention_min_seq=3)
+            //
+            // For key 'a', the compaction will see:
+            //   - tombstone (seq=4) -> KEEP (latest version, AND seq > min_seq)
+            //   - 'v1' (seq=2) -> KEEP (boundary: first entry with seq <= min_seq)
+            //   - 'v0' (seq=1) -> DROP (older than boundary)
+            //
+            // The boundary value (seq=2) is crucial: if snapshot s1 reads key 'a', it needs to find
+            // a version at or before seq=3. Without keeping seq=2, the snapshot would incorrectly
+            // see the tombstone (seq=4) which didn't exist when the snapshot was created.
+            //
+            // Note: We use OR logic below because we keep iterating as long as the entry is within
+            // EITHER the time window OR the seq window. We only stop when it's outside BOTH.
 
             let continue_retain_by_time = retention_timeout
                 .map(|timeout| {
                     let create_sys_ts = sequence_tracker
+                        // Use RoundUp to conservatively estimate creation time. For example:
+                        // - If retention window is 10min and current time is 12:00:00
+                        // - And sequence tracker has timestamps at 11:49:30 and 11:50:30
+                        // - RoundUp will use 11:50:30 (later timestamp) to avoid over-aggressive filtering
                         .find_ts(entry_seq, FindOption::RoundUp)
                         .map(|ts| ts.timestamp_millis())
+                        // if the sequence number is greater than the last recorded sequence
+                        // number we just assume that it was produced now (so it effectively
+                        // should be kept in the filtered results)
                         .unwrap_or(current_system_ts);
                     create_sys_ts + (timeout.as_millis() as i64) > current_system_ts
                 })
@@ -163,6 +195,7 @@ impl<T: RowEntryIterator> RetentionIterator<T> {
         Self::record_retention_dropped_blob_ids(&orphan_blob_sink, &ordered, &dropped_indices);
 
         if filter_tombstone {
+            // remove the tombstones in the tail
             while filtered_versions
                 .iter()
                 .last()
