@@ -1861,6 +1861,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_blob_gc_deletes_non_existant_orphans() {
+        use crate::manifest::OrphanBlob;
+
+        let (manifest_store, compactions_store, table_store, _) = build_objects();
+        let b1 = ulid::Ulid::new();
+        let b2 = ulid::Ulid::new();
+
+        // Manifest becomes id=2 after update; orphans recorded at id=1 satisfy
+        // recorded_at_manifest_id < min_checkpoint_id (=2, current manifest id).
+        seed_manifest_with_orphans(
+            manifest_store.clone(),
+            vec![
+                OrphanBlob {
+                    blob_id: b1,
+                    recorded_at_manifest_id: 1,
+                },
+                OrphanBlob {
+                    blob_id: b2,
+                    recorded_at_manifest_id: 1,
+                },
+            ],
+            vec![],
+        )
+        .await;
+
+        run_blob_gc_once(
+            manifest_store.clone(),
+            compactions_store,
+            table_store.clone(),
+        )
+        .await;
+
+        assert!(!blob_exists(&table_store, b1).await);
+        assert!(!blob_exists(&table_store, b2).await);
+        let (_, manifest) = manifest_store.read_latest_manifest().await.unwrap();
+        assert!(manifest.core.orphan_blobs.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_blob_gc_no_orphans_is_noop() {
         let (manifest_store, compactions_store, table_store, _) = build_objects();
         seed_manifest_with_orphans(manifest_store.clone(), vec![], vec![]).await;

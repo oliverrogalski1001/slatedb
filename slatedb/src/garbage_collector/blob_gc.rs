@@ -115,14 +115,21 @@ impl GcTask for BlobGcTask {
             return Ok(());
         }
 
-        // TODO: make delete requests in parallel; treat not-found as success.
+        // TODO: make delete requests in parallel.
         let mut deleted_ids: HashSet<Ulid> = HashSet::with_capacity(to_delete.len());
         for blob_id in to_delete {
-            if let Err(e) = self.table_store.delete_blob(blob_id).await {
-                error!("error deleting blob [id={}, error={}]", blob_id, e);
-            } else {
-                self.stats.gc_blob_count.increment(1);
-                deleted_ids.insert(blob_id);
+            match self.table_store.delete_blob(blob_id).await {
+                Ok(()) => {
+                    self.stats.gc_blob_count.increment(1);
+                    deleted_ids.insert(blob_id);
+                }
+                // Blob already gone — still prune the orphan entry.
+                Err(SlateDBError::ObjectStoreError(e))
+                    if matches!(e.as_ref(), object_store::Error::NotFound { .. }) =>
+                {
+                    deleted_ids.insert(blob_id);
+                }
+                Err(e) => error!("error deleting blob [id={}, error={}]", blob_id, e),
             }
         }
 
