@@ -1282,6 +1282,20 @@ pub struct BlobOptions {
     ///
     /// Default: None (no compression)
     pub blob_compression_codec: Option<CompressionCodec>,
+
+    /// Maximum number of blob `PUT` requests to keep in flight while flushing a
+    /// single immutable memtable to L0. Higher values overlap more S3 round-trips
+    /// (cutting flush latency proportionally) at the cost of holding that many
+    /// values in memory simultaneously and consuming more object-store HTTP
+    /// connections. Bound by your object_store client's connection pool.
+    ///
+    /// Default: 32
+    #[serde(default = "default_flush_concurrency")]
+    pub flush_concurrency: usize,
+}
+
+fn default_flush_concurrency() -> usize {
+    32
 }
 
 impl Default for BlobOptions {
@@ -1289,6 +1303,7 @@ impl Default for BlobOptions {
         Self {
             min_value_size: 4096,
             blob_compression_codec: None,
+            flush_concurrency: default_flush_concurrency(),
         }
     }
 }

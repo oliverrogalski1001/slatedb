@@ -9,6 +9,7 @@ use crate::oracle::Oracle;
 use crate::reader::DbStateReader;
 use crate::retention_iterator::RetentionIterator;
 use crate::types::{BlobRef, RowEntry, ValueDeletable};
+use futures::stream::{self, TryStreamExt};
 use std::sync::Arc;
 use ulid::Ulid;
 
@@ -21,8 +22,33 @@ impl DbInner {
     ) -> Result<SsTableHandle, SlateDBError> {
         let mut sst_builder = self.table_store.table_builder();
         let mut iter = self.iter_imm_table(imm_table.clone()).await?;
+
+        // Pipeline blob externalization across up to `flush_concurrency` PUTs.
+        // try_buffered preserves yield order, so the SST builder still receives
+        // entries in iterator order.
+        let concurrency = self
+            .settings
+            .blob_options
+            .as_ref()
+            .map(|o| o.flush_concurrency)
+            .unwrap_or(1)
+            .max(1);
+
+        // Drain the iterator into a Vec so we can drive externalization as a
+        // pipelined Stream. The imm_memtable already holds these entries, so
+        // the extra allocation is a vec of cheap RowEntry handles (keys/values
+        // are refcounted Bytes).
+        let mut entries: Vec<RowEntry> = Vec::new();
         while let Some(entry) = iter.next().await? {
-            let entry = self.externalize_blob_value_if_needed(entry).await?;
+            entries.push(entry);
+        }
+
+        let externalized = stream::iter(entries.into_iter().map(Ok::<_, SlateDBError>))
+            .map_ok(|entry| self.externalize_blob_value_if_needed(entry))
+            .try_buffered(concurrency);
+        let mut externalized = std::pin::pin!(externalized);
+
+        while let Some(entry) = externalized.try_next().await? {
             sst_builder.add(entry).await?;
         }
 

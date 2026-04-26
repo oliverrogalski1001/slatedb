@@ -56,7 +56,7 @@ async fn open_db(
     };
     settings.blob_options = Some(BlobOptions {
         min_value_size: 1,
-        blob_compression_codec: None,
+        ..Default::default()
     });
 
     let compactor_options = CompactorOptions {
