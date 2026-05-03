@@ -15,6 +15,7 @@ use slatedb::{
 };
 use tracing::info;
 
+use crate::blob_db::{ValueDistribution, WorkloadPattern};
 use crate::db::{FixedSetKeyGenerator, KeyGenerator, RandomKeyGenerator};
 
 #[derive(Parser, Clone)]
@@ -51,6 +52,7 @@ pub(crate) struct BencherArgs {
 #[derive(Subcommand, Clone)]
 pub(crate) enum BencherCommands {
     Db(BenchmarkDbArgs),
+    BlobDb(BenchmarkBlobDbArgs),
     Compaction(BenchmarkCompactionArgs),
     Transaction(BenchmarkTransactionArgs),
 }
@@ -249,6 +251,87 @@ impl Display for KeyGeneratorType {
                 KeyGeneratorType::FixedSet => KEY_GENERATOR_TYPE_FIXEDSET,
             }
         )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BlobDb subcommand args
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Args, Clone)]
+#[command(about = "Benchmark BlobDB key-value separation against a SlateDB baseline.")]
+pub(crate) struct BenchmarkBlobDbArgs {
+    #[clap(flatten)]
+    pub(crate) db_args: DbArgs,
+
+    #[arg(long, help = "Duration in seconds.", default_value_t = 120)]
+    pub(crate) duration: u32,
+
+    #[arg(
+        long,
+        help = "Workload: write-heavy | read-heavy | update-heavy | range-scan",
+        default_value = "write-heavy"
+    )]
+    pub(crate) workload: String,
+
+    #[arg(
+        long,
+        help = "Value distribution: small | large | mixed",
+        default_value = "small"
+    )]
+    pub(crate) val_dist: String,
+
+    /// 0 means blob storage disabled (baseline).
+    #[arg(
+        long,
+        help = "Blob threshold in bytes. 0 = baseline (no blob separation).",
+        default_value_t = 0
+    )]
+    pub(crate) blob_threshold: usize,
+
+    #[arg(long, default_value_t = 4)]
+    pub(crate) concurrency: u32,
+
+    #[arg(long, default_value_t = 100_000)]
+    pub(crate) key_count: u64,
+
+    #[arg(long, default_value_t = 16)]
+    pub(crate) key_len: usize,
+
+    #[arg(long, default_value_t = 100)]
+    pub(crate) scan_width: usize,
+}
+
+impl BenchmarkBlobDbArgs {
+    pub(crate) fn workload_pattern(&self) -> WorkloadPattern {
+        match self.workload.to_lowercase().replace('-', "_").as_str() {
+            "read_heavy" => WorkloadPattern::ReadHeavy,
+            "update_heavy" => WorkloadPattern::UpdateHeavy,
+            "range_scan" => WorkloadPattern::RangeScan,
+            _ => WorkloadPattern::WriteHeavy,
+        }
+    }
+
+    pub(crate) fn value_distribution(&self) -> ValueDistribution {
+        match self.val_dist.to_lowercase().as_str() {
+            "large" => ValueDistribution::Large,
+            "mixed" => ValueDistribution::Mixed,
+            _ => ValueDistribution::Small,
+        }
+    }
+}
+
+impl KeyGeneratorSupplier for BenchmarkBlobDbArgs {
+    fn key_generator(&self) -> KeyGeneratorType {
+        KeyGeneratorType::FixedSet
+    }
+
+    fn key_len(&self) -> usize {
+        self.key_len
+    }
+
+    fn key_count(&self) -> u64 {
+        self.key_count
     }
 }
 
