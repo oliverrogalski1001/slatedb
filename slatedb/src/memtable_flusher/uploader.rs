@@ -344,6 +344,7 @@ mod tests {
             PathResolver::new(Path::from(path)),
             fp_registry.clone(),
             None,
+            None,
         ));
         let status_manager = DbStatusManager::new(0);
         let (write_tx, _) =

@@ -206,6 +206,7 @@ impl TableStore {
         self.sst_format.wal_table_builder()
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn put_pack(&self, pack_id: Ulid, data: Bytes) -> Result<(), SlateDBError> {
         let object_store = self.object_stores.store_of(ObjectStoreType::Main);
         let path = self.path_resolver.pack_object_path(&pack_id);
@@ -1965,11 +1966,11 @@ mod blob_cache_tests {
     use ulid::Ulid;
 
     use crate::blob_cache::BlobCache;
-    use crate::db_metrics::DbMetrics;
     use crate::format::sst::SsTableFormat;
     use crate::object_stores::ObjectStores;
     use crate::paths::PathResolver;
     use crate::tablestore::TableStore;
+    use slatedb_common::metrics::test_recorder_helper;
 
     const ROOT: &str = "/root";
 
@@ -1977,8 +1978,8 @@ mod blob_cache_tests {
         object_store: Arc<dyn ObjectStore>,
         max_capacity_bytes: u64,
     ) -> (Arc<TableStore>, Arc<BlobCache>) {
-        let metrics = DbMetrics::new(None);
-        let blob_cache = Arc::new(BlobCache::new(max_capacity_bytes, &metrics));
+        let (_recorder, helper) = test_recorder_helper();
+        let blob_cache = Arc::new(BlobCache::new(max_capacity_bytes, &helper));
         let ts = Arc::new(TableStore::new_with_fp_registry(
             ObjectStores::new(object_store, None),
             SsTableFormat::default(),

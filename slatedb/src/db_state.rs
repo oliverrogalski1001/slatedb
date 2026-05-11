@@ -8,7 +8,7 @@ use crate::wal_id::WalIdStore;
 use bytes::Bytes;
 use serde::Serialize;
 use slatedb_txn_obj::DirtyObject;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::ops::{Bound, Range, RangeBounds};

@@ -517,7 +517,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             .blob_options
             .as_ref()
             .and_then(|b| b.cache.as_ref())
-            .map(|opts| Arc::new(BlobCache::new(opts.max_capacity_bytes, &db_metrics)));
+            .map(|opts| Arc::new(BlobCache::new(opts.max_capacity_bytes, &recorder)));
         let table_store = Arc::new(TableStore::new_with_fp_registry(
             ObjectStores::new(
                 maybe_cached_main_object_store.clone(),

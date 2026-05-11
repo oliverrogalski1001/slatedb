@@ -2,9 +2,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use slatedb_common::metrics::CounterFn;
+use slatedb_common::metrics::{CounterFn, MetricsRecorderHelper};
 
-use crate::db_metrics::DbMetrics;
 use crate::error::SlateDBError;
 use crate::types::BlobRef;
 
@@ -15,7 +14,7 @@ pub(crate) struct BlobCache {
 }
 
 impl BlobCache {
-    pub(crate) fn new(max_capacity_bytes: u64, db_metrics: &DbMetrics) -> Self {
+    pub(crate) fn new(max_capacity_bytes: u64, recorder: &MetricsRecorderHelper) -> Self {
         let inner = moka::future::Cache::builder()
             .weigher(|_key: &BlobRef, value: &Bytes| {
                 u32::try_from(value.len()).unwrap_or(u32::MAX)
@@ -24,8 +23,8 @@ impl BlobCache {
             .build();
         Self {
             inner,
-            hit: db_metrics.counter(stats::BLOB_CACHE_HIT).register(),
-            miss: db_metrics.counter(stats::BLOB_CACHE_MISS).register(),
+            hit: recorder.counter(stats::BLOB_CACHE_HIT).register(),
+            miss: recorder.counter(stats::BLOB_CACHE_MISS).register(),
         }
     }
 
@@ -58,7 +57,7 @@ impl BlobCache {
 pub mod stats {
     macro_rules! blob_cache_stat_name {
         ($suffix:expr) => {
-            crate::stat_name!("blob_cache", $suffix)
+            concat!("slatedb.blob_cache.", $suffix)
         };
     }
 

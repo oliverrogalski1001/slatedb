@@ -381,6 +381,15 @@ pub(crate) struct ManifestCore {
 
     /// The URI of the object store dedicated specifically for WAL, if any.
     pub wal_object_store_uri: Option<String>,
+
+    /// Packed blob files that have lost all live BlobRefs and are awaiting
+    /// deletion by blob GC once no recent checkpoint can still reference them.
+    pub orphan_packs: Vec<OrphanPack>,
+
+    /// Live packed blob files indexed by pack id. Tracks total/live byte
+    /// accounting so packs can transition to `orphan_packs` when live_bytes
+    /// reaches zero.
+    pub pack_files: HashMap<ulid::Ulid, PackFile>,
 }
 
 impl ManifestCore {
@@ -398,6 +407,8 @@ impl ManifestCore {
             wal_object_store_uri: None,
             recent_snapshot_min_seq: 0,
             sequence_tracker: SequenceTracker::new(),
+            orphan_packs: vec![],
+            pack_files: HashMap::new(),
         }
     }
 

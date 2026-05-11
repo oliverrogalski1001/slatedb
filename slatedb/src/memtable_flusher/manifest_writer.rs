@@ -959,6 +959,7 @@ mod tests {
             PathResolver::new(Path::from(path.clone())),
             Arc::clone(&fp_registry),
             None,
+            None,
         ));
         let status_manager = DbStatusManager::new(0);
         let (write_tx, _) =

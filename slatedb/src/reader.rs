@@ -12,7 +12,6 @@ use crate::segment_iterator::{build_segment_iter, SegmentScanContext};
 use crate::sst_iter::SstIteratorOptions;
 use crate::tablestore::TableStore;
 use crate::types::{BlobRef, KeyValue, ValueDeletable};
-use crate::utils::{build_concurrent, compute_max_parallel};
 use crate::{db_iter::DbIteratorRangeTracker, error::SlateDBError, DbIterator};
 
 use bytes::Bytes;
@@ -273,6 +272,7 @@ impl Reader {
             None,
             self.read_merge_operator.clone(),
             sst_iter_options.order,
+            Some(self.table_store.clone()),
         )
         .await?;
 
@@ -339,6 +339,7 @@ impl Reader {
             ctx.range_tracker,
             self.read_merge_operator.clone(),
             options.order,
+            Some(self.table_store.clone()),
         )
         .await
     }
@@ -1960,8 +1961,9 @@ mod tests {
             vec![TestEntry::blob_ref(b"key1", blob_ref, 50).with_location(LayerLocation::L0Sst(0))];
         let write_batch = populate_db_state(&mut test_db_state, entries).await?;
 
-        let db_metrics = crate::db_metrics::DbMetrics::new(None);
-        let db_stats = DbStats::new(&db_metrics);
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let helper = MetricsRecorderHelper::new(recorder.clone(), MetricLevel::default());
+        let db_stats = DbStats::new(&helper);
         let reader = build_reader(&test_db_state, db_stats, false).await;
 
         let result = reader
@@ -1969,7 +1971,7 @@ mod tests {
                 b"key1",
                 &ReadOptions::default().with_dirty(true),
                 &test_db_state,
-                write_batch,
+                wb_point_iter(&write_batch, b"key1"),
                 None,
             )
             .await?;

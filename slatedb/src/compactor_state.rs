@@ -1183,7 +1183,7 @@ mod tests {
             id: 0,
             sst_views: before_compaction.tree.l0.iter().cloned().collect(),
         };
-        state.finish_compaction(compaction_id, sr);
+        state.finish_compaction(compaction_id, sr, HashMap::new());
 
         let external_dbs = &state.manifest().value.external_dbs;
         assert_eq!(external_dbs.len(), 2, "entries must be retained");
@@ -1716,7 +1716,7 @@ mod tests {
             id: 7,
             sst_views: Vec::new(),
         };
-        state.finish_compaction(compaction_id, output);
+        state.finish_compaction(compaction_id, output, HashMap::new());
 
         // The segment's compacted list now holds only the new SR(7).
         let seg = state
@@ -1901,7 +1901,7 @@ mod tests {
             id: 7,
             sst_views: Vec::new(),
         };
-        state.finish_compaction(compaction_id, output);
+        state.finish_compaction(compaction_id, output, HashMap::new());
 
         let compaction = state
             .compactions

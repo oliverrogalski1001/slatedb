@@ -65,7 +65,6 @@ pub(crate) enum GcMessage {
     Manifest,
     Detach,
     Blob,
-    LogStats,
 }
 
 /// SlateDB's garbage collector.
@@ -140,7 +139,6 @@ impl MessageHandler<GcMessage> for GarbageCollector {
             ));
         }
 
-        tickers.push((Duration::from_secs(60), Box::new(|| GcMessage::LogStats)));
         tickers
     }
 
@@ -188,7 +186,6 @@ impl MessageHandler<GcMessage> for GarbageCollector {
                     .expect("got blob tick with unconfigured blob task");
                 self.run_gc_task(task).await;
             }
-            GcMessage::LogStats => self.log_stats(),
         }
         Ok(())
     }
@@ -383,7 +380,6 @@ mod tests {
     use crate::config::{GarbageCollectorDirectoryOptions, GarbageCollectorOptions};
     use crate::dispatcher::MessageHandlerExecutor;
     use crate::error::SlateDBError;
-    use crate::manifest::OrphanPack;
     use crate::object_stores::ObjectStores;
     use crate::paths::PathResolver;
     use crate::types::RowEntry;
