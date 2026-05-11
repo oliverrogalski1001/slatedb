@@ -17,6 +17,7 @@ pub struct GcStats {
     pub gc_compacted_count: Arc<dyn CounterFn>,
     pub gc_compactions_count: Arc<dyn CounterFn>,
     pub gc_detach_count: Arc<dyn CounterFn>,
+    pub gc_blob_count: Arc<dyn CounterFn>,
     pub gc_count: Arc<dyn CounterFn>,
 }
 
@@ -42,6 +43,10 @@ impl GcStats {
             gc_detach_count: recorder
                 .counter(DELETED_COUNT)
                 .labels(&[("resource", "detach")])
+                .register(),
+            gc_blob_count: recorder
+                .counter(DELETED_COUNT)
+                .labels(&[("resource", "blob")])
                 .register(),
             gc_count: recorder.counter(GC_COUNT).register(),
         }

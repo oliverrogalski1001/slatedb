@@ -196,6 +196,7 @@ use uuid::Uuid;
 use crate::error::SlateDBError;
 
 use crate::garbage_collector::{DEFAULT_INTERVAL, DEFAULT_MIN_AGE};
+use crate::merge_operator::MergeOperatorType;
 
 /// Enum representing different levels of cache preloading on startup
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
@@ -723,6 +724,20 @@ pub struct Settings {
     /// Default: no TTL (insertions will remain until deleted)
     pub default_ttl: Option<u64>,
 
+    /// The merge operator to use for the database. If not set, the database will not support merge operations.
+    ///
+    /// The merge operator allows applications to bypass the traditional read/modify/write cycle
+    /// by expressing partial updates using an associative operator. Merge operands are combined
+    /// during reads and compactions to produce the final result.
+    #[serde(skip)]
+    pub merge_operator: Option<MergeOperatorType>,
+
+    /// Configuration options for key-value separation (BlobDB/WiscKey-style).
+    /// When enabled, values larger than the configured threshold are stored as
+    /// separate blob objects on object storage rather than inline in SST blocks.
+    /// This reduces write amplification during compaction for large-value workloads.
+    pub blob_options: Option<BlobOptions>,
+
     /// The block format for SST files. This is only available in tests
     /// to verify backward compatibility between V1 and V2 formats.
     #[cfg(test)]
@@ -756,7 +771,8 @@ impl std::fmt::Debug for Settings {
                 &self.object_store_cache_options,
             )
             .field("garbage_collector_options", &self.garbage_collector_options)
-            .field("default_ttl", &self.default_ttl);
+            .field("default_ttl", &self.default_ttl)
+            .field("blob_options", &self.blob_options);
         data.finish()
     }
 }
@@ -952,6 +968,8 @@ impl Default for Settings {
             object_store_cache_options: ObjectStoreCacheOptions::default(),
             garbage_collector_options: Some(GarbageCollectorOptions::default()),
             default_ttl: None,
+            merge_operator: None,
+            blob_options: None,
             #[cfg(test)]
             block_format: None,
         }
@@ -1233,6 +1251,11 @@ pub struct GarbageCollectorOptions {
     ///
     /// None means detach is disabled.
     pub detach_options: Option<GarbageCollectorScheduleOptions>,
+
+    /// Garbage collection options for blobs
+    ///
+    /// None means garbage collection is disabled for the compactions directory.
+    pub blob_options: Option<GarbageCollectorDirectoryOptions>,
 }
 
 impl GarbageCollectorOptions {
@@ -1242,6 +1265,7 @@ impl GarbageCollectorOptions {
             && self.compacted_options.is_none()
             && self.compactions_options.is_none()
             && self.detach_options.is_none()
+            && self.blob_options.is_none()
     }
 }
 
@@ -1314,6 +1338,130 @@ impl Default for GarbageCollectorOptions {
             compacted_options: Some(GarbageCollectorDirectoryOptions::default()),
             compactions_options: Some(GarbageCollectorDirectoryOptions::default()),
             detach_options: Some(GarbageCollectorScheduleOptions::default()),
+            blob_options: Some(GarbageCollectorDirectoryOptions::default()),
+        }
+    }
+}
+
+/// Configuration for key-value separation (BlobDB/WiscKey-style).
+///
+/// When enabled, values larger than `min_value_size` are stored as individual
+/// blob objects on object storage (under the `blob/` prefix) rather than inline
+/// in SST blocks. The SST row stores a compact blob pointer instead of the
+/// full value. This reduces write amplification during compaction since only
+/// keys and small pointers are rewritten, not large values.
+///
+/// Blob cleanup is handled by deferred batch deletion: compaction records
+/// orphaned blob IDs when keys are dropped, and the garbage collector deletes
+/// them in the background.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BlobOptions {
+    /// The minimum value size in bytes for key-value separation. Values with
+    /// a size greater than or equal to this threshold are stored as separate
+    /// blob objects. Values smaller than this remain inline in SST blocks.
+    ///
+    /// Choosing a good threshold depends on your workload:
+    /// - Lower thresholds (e.g. 1024) reduce write amplification more aggressively
+    ///   but increase the number of blob objects and extra reads on the read path.
+    /// - Higher thresholds (e.g. 8192) keep more values inline for read locality
+    ///   but provide less write amplification savings.
+    ///
+    /// Default: 4096 bytes (4 KiB)
+    pub min_value_size: usize,
+
+    /// Optional compression codec for blob objects. If set, blob values are
+    /// compressed before being written to object storage. This is independent
+    /// of the SST compression codec.
+    ///
+    /// Default: None (no compression)
+    pub blob_compression_codec: Option<CompressionCodec>,
+
+    /// Maximum number of pack `PUT` requests to keep in flight while flushing a
+    /// single immutable memtable to L0. Higher values overlap more S3 round-trips
+    /// (cutting flush latency proportionally) at the cost of holding that many
+    /// pack buffers in memory simultaneously and consuming more object-store HTTP
+    /// connections. Bound by your object_store client's connection pool.
+    ///
+    /// Default: 32
+    #[serde(default = "default_flush_concurrency")]
+    pub flush_concurrency: usize,
+
+    /// Target maximum size in bytes of a single packed blob object. During a
+    /// flush, externalized values are concatenated into pack buffers; a buffer
+    /// is sealed and uploaded once adding the next value would push it past
+    /// this threshold. A single value larger than `target_pack_size_bytes` is
+    /// still placed in its own pack.
+    ///
+    /// Larger packs amortize S3 PUT cost over more values but raise the cost
+    /// of partially-dead packs (until blob-compaction reclaims them). Range
+    /// reads use byte-range GETs, so larger packs do not increase per-read
+    /// latency.
+    ///
+    /// Default: 64 MiB.
+    #[serde(default = "default_target_pack_size_bytes")]
+    pub target_pack_size_bytes: usize,
+
+    /// In-memory cache for recently-fetched blob values.
+    ///
+    /// When set, blob values that have been read from object storage are kept in
+    /// an in-process size-weighted cache. Subsequent reads for the same blob avoid
+    /// the object-store round-trip. Blobs are write-once and content-addressed, so
+    /// no invalidation is needed.
+    ///
+    /// Default: None (disabled). Enable by providing a [`BlobCacheOptions`].
+    #[cfg(feature = "moka")]
+    #[serde(default)]
+    pub cache: Option<BlobCacheOptions>,
+}
+
+fn default_flush_concurrency() -> usize {
+    32
+}
+
+fn default_target_pack_size_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+impl Default for BlobOptions {
+    fn default() -> Self {
+        Self {
+            min_value_size: 4096,
+            blob_compression_codec: None,
+            flush_concurrency: default_flush_concurrency(),
+            target_pack_size_bytes: default_target_pack_size_bytes(),
+            #[cfg(feature = "moka")]
+            cache: None,
+        }
+    }
+}
+
+/// Options for the in-memory blob value cache.
+///
+/// When enabled via [`BlobOptions::cache`], recently-fetched blob values are
+/// kept in a size-weighted LRU cache backed by Moka. Each entry counts for its
+/// exact byte length toward the capacity limit.
+#[cfg(feature = "moka")]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BlobCacheOptions {
+    /// Maximum total memory for the blob value cache in bytes.
+    ///
+    /// Eviction is size-weighted: entries are evicted by byte length, not by count.
+    ///
+    /// Default: 256 MiB
+    #[serde(default = "default_blob_cache_capacity")]
+    pub max_capacity_bytes: u64,
+}
+
+#[cfg(feature = "moka")]
+fn default_blob_cache_capacity() -> u64 {
+    256 * 1024 * 1024
+}
+
+#[cfg(feature = "moka")]
+impl Default for BlobCacheOptions {
+    fn default() -> Self {
+        Self {
+            max_capacity_bytes: default_blob_cache_capacity(),
         }
     }
 }

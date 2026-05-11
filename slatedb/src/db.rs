@@ -1849,7 +1849,7 @@ mod tests {
     use crate::cached_object_store_stats::CachedObjectStoreStats;
     use crate::config::DurabilityLevel::{Memory, Remote};
     use crate::config::{
-        CheckpointOptions, CompactorOptions, GarbageCollectorDirectoryOptions,
+        BlobOptions, CheckpointOptions, CompactorOptions, GarbageCollectorDirectoryOptions,
         GarbageCollectorOptions, ObjectStoreCacheOptions, PutOptions, Settings, Ttl, WriteOptions,
     };
     use crate::db::builder::GarbageCollectorBuilder;
@@ -2006,6 +2006,55 @@ mod tests {
         kv_store.delete(key).await.unwrap();
         assert_eq!(None, kv_store.get(key).await.unwrap());
         kv_store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_read_large_flushed_values_from_blob_storage() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut options = test_db_options(0, 1024, None);
+        options.blob_options = Some(BlobOptions::default());
+
+        let db = Db::builder("/tmp/test_get_blob_backed_value", object_store)
+            .with_settings(options)
+            .build()
+            .await
+            .unwrap();
+
+        let large_value = vec![b'x'; 4096];
+        db.put(b"blob-key", large_value.as_slice()).await.unwrap();
+        db.flush().await.unwrap();
+
+        assert_eq!(
+            db.get(b"blob-key").await.unwrap(),
+            Some(Bytes::from(large_value)),
+        );
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_scan_large_flushed_values_from_blob_storage() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut options = test_db_options(0, 1024, None);
+        options.blob_options = Some(BlobOptions::default());
+
+        let db = Db::builder("/tmp/test_scan_blob_backed_value", object_store)
+            .with_settings(options)
+            .build()
+            .await
+            .unwrap();
+
+        let large_value = vec![b'y'; 4096];
+        db.put(b"blob-key", large_value.as_slice()).await.unwrap();
+        db.flush().await.unwrap();
+
+        let mut iter = db.scan(b"blob-key".as_slice()..).await.unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, Bytes::from_static(b"blob-key"));
+        assert_eq!(kv.value, Bytes::from(large_value));
+        assert!(iter.next().await.unwrap().is_none());
+
+        db.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -6117,6 +6166,8 @@ mod tests {
             object_store_cache_options: ObjectStoreCacheOptions::default(),
             garbage_collector_options: None,
             default_ttl: ttl,
+            merge_operator: None,
+            blob_options: None,
             block_format: None,
         }
     }
@@ -6548,6 +6599,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_merge_with_blob_backed_base_value_on_get() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut options = test_db_options(0, 1024, None);
+        options.blob_options = Some(BlobOptions::default());
+
+        let db = Db::builder("/tmp/test_merge_blob_get", object_store.clone())
+            .with_settings(options)
+            .with_merge_operator(Arc::new(StringConcatMergeOperator))
+            .build()
+            .await
+            .unwrap();
+
+        let mut expected = vec![b'a'; 4096];
+        expected.extend_from_slice(b"tail");
+
+        db.put(b"key1", &expected[..4096]).await.unwrap();
+        db.flush().await.unwrap();
+        db.merge(b"key1", b"tail").await.unwrap();
+
+        let result = db.get(b"key1").await.unwrap();
+        assert_eq!(result, Some(Bytes::from(expected)));
+    }
+
+    #[tokio::test]
+    async fn should_merge_with_blob_backed_base_value_on_scan() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut options = test_db_options(0, 1024, None);
+        options.blob_options = Some(BlobOptions::default());
+
+        let db = Db::builder("/tmp/test_merge_blob_scan", object_store.clone())
+            .with_settings(options)
+            .with_merge_operator(Arc::new(StringConcatMergeOperator))
+            .build()
+            .await
+            .unwrap();
+
+        let mut expected = vec![b'b'; 4096];
+        expected.extend_from_slice(b"tail");
+
+        db.put(b"key1", &expected[..4096]).await.unwrap();
+        db.flush().await.unwrap();
+        db.merge(b"key1", b"tail").await.unwrap();
+
+        let mut iter = db.scan(b"key1".as_slice()..).await.unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, Bytes::from_static(b"key1"));
+        assert_eq!(kv.value, Bytes::from(expected));
+        assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn should_error_when_merging_without_merge_operator() {
         // Given: Database with merge operator, merge operands written
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -6744,6 +6846,7 @@ mod tests {
                 min_age: Duration::from_millis(0),
             }),
             detach_options: None,
+            blob_options: None,
         };
 
         let gc = GarbageCollectorBuilder::new(path.clone(), object_store.clone())

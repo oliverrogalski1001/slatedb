@@ -8,7 +8,7 @@ use crate::wal_id::WalIdStore;
 use bytes::Bytes;
 use serde::Serialize;
 use slatedb_txn_obj::DirtyObject;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::ops::{Bound, Range, RangeBounds};
@@ -637,6 +637,26 @@ impl COWDbState {
     }
 }
 
+/// Pack object awaiting deletion after the last BlobRef pointing into it was dropped.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Debug)]
+pub struct OrphanPack {
+    pub pack_id: Ulid,
+    /// Manifest id at which this pack transitioned to orphan. Blob GC requires
+    /// `orphaned_at_manifest_id < min_checkpoint_id` before deleting.
+    pub orphaned_at_manifest_id: u64,
+}
+
+/// Metadata for a packed blob object that still has live BlobRefs pointing into it.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Debug)]
+pub struct PackFile {
+    pub pack_id: Ulid,
+    /// Total bytes uploaded to object storage for this pack.
+    pub total_bytes: u64,
+    /// Bytes still referenced by live BlobRef rows. When this hits zero the
+    /// pack moves to `orphan_packs`.
+    pub live_bytes: u64,
+}
+
 // represents a consistent view of the current db state
 #[derive(Clone)]
 pub(crate) struct DbStateView {
@@ -735,6 +755,27 @@ impl<'a> StateModifier<'a> {
         let tree = my_db_state.tree.merge_from_compactor(&remote.tree);
         let segments =
             crate::manifest::merge_segments_from_compactor(&my_db_state.segments, &remote.segments);
+
+        // Pack files: the compactor owns decrements/removals via orphan_packs, so remote
+        // is authoritative for live_bytes on shared entries. But the writer is the only
+        // producer of new packs, and just-flushed entries that haven't yet reached remote
+        // (a CAS retry race) must survive the merge — otherwise an L0 SST referencing the
+        // pack would be persisted with no `pack_files` entry, and a later compaction would
+        // fail to attribute its dropped bytes to any live pack.
+        let remote_orphan_ids: HashSet<Ulid> = remote_manifest
+            .value
+            .core
+            .orphan_packs
+            .iter()
+            .map(|o| o.pack_id)
+            .collect();
+        let mut merged_pack_files = remote_manifest.value.core.pack_files.clone();
+        for (pack_id, pack) in &my_db_state.pack_files {
+            if !merged_pack_files.contains_key(pack_id) && !remote_orphan_ids.contains(pack_id) {
+                merged_pack_files.insert(*pack_id, pack.clone());
+            }
+        }
+
         remote_manifest.value.core = ManifestCore {
             initialized: my_db_state.initialized,
             tree,
@@ -749,6 +790,8 @@ impl<'a> StateModifier<'a> {
             sequence_tracker: my_db_state.sequence_tracker.clone(),
             checkpoints: remote_manifest.value.core.checkpoints,
             wal_object_store_uri: my_db_state.wal_object_store_uri.clone(),
+            orphan_packs: remote_manifest.value.core.orphan_packs.clone(),
+            pack_files: merged_pack_files,
         };
         self.state.manifest = remote_manifest;
     }

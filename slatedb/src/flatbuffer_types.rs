@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ops::{Bound, RangeBounds};
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -15,7 +15,7 @@ use crate::compactor_state::{
     Compactions as CompactorCompactions, SourceId,
 };
 use crate::db_state::{self, FilterFormat, SsTableInfo, SsTableInfoCodec, SstType};
-use crate::db_state::{SsTableHandle, SsTableView};
+use crate::db_state::{OrphanPack, PackFile, SsTableHandle, SsTableView};
 
 #[path = "./generated/root_generated.rs"]
 #[allow(warnings, clippy::disallowed_macros, clippy::disallowed_types, clippy::disallowed_methods, unreachable_pub)]
@@ -158,7 +158,7 @@ pub(crate) struct FlatBufferManifestCodec {}
 
 impl ObjectCodec<Manifest> for FlatBufferManifestCodec {
     fn encode(&self, manifest: &Manifest) -> Bytes {
-        Self::create_from_manifest_v1(manifest)
+        Self::create_from_manifest(manifest)
     }
 
     fn decode(&self, bytes: &Bytes) -> Result<Manifest, Box<dyn std::error::Error + Send + Sync>> {
@@ -323,6 +323,8 @@ impl FlatBufferManifestCodec {
             wal_object_store_uri: manifest.wal_object_store_uri().map(|uri| uri.to_string()),
             recent_snapshot_min_seq: manifest.recent_snapshot_min_seq(),
             sequence_tracker,
+            orphan_packs: vec![],
+            pack_files: HashMap::new(),
         };
         Ok(Manifest {
             external_dbs,
@@ -423,6 +425,10 @@ impl FlatBufferManifestCodec {
                     .collect()
             })
             .unwrap_or_default();
+        // TODO: re-derive orphan_packs and pack_files from flatbuffer once the
+        // schema is regenerated to expose OrphanPack/PackFile types.
+        let orphan_packs: Vec<OrphanPack> = Vec::new();
+        let pack_files: HashMap<Ulid, PackFile> = HashMap::new();
         let core = ManifestCore {
             initialized: manifest.initialized(),
             tree,
@@ -436,6 +442,8 @@ impl FlatBufferManifestCodec {
             wal_object_store_uri: None,
             recent_snapshot_min_seq: manifest.recent_snapshot_min_seq(),
             sequence_tracker,
+            orphan_packs,
+            pack_files,
         };
         Ok(Manifest {
             external_dbs,
@@ -724,6 +732,47 @@ impl<'b> DbFlatBufferBuilder<'b> {
     {
         let ulids: Vec<WIPOffset<FbUlid>> = ulids.map(|ulid| self.add_ulid(ulid)).collect();
         self.builder.create_vector(ulids.as_ref())
+    }
+
+    fn add_orphan_packs(
+        &mut self,
+        orphans: &[OrphanPack],
+    ) -> WIPOffset<Vector<'b, ForwardsUOffset<FbOrphanPack<'b>>>> {
+        let entries: Vec<WIPOffset<FbOrphanPack>> = orphans
+            .iter()
+            .map(|o| {
+                let pack_id = self.add_ulid(&o.pack_id);
+                FbOrphanPack::create(
+                    &mut self.builder,
+                    &FbOrphanPackArgs {
+                        pack_id: Some(pack_id),
+                        orphaned_at_manifest_id: o.orphaned_at_manifest_id,
+                    },
+                )
+            })
+            .collect();
+        self.builder.create_vector(entries.as_ref())
+    }
+
+    fn add_pack_files(
+        &mut self,
+        pack_files: &HashMap<Ulid, PackFile>,
+    ) -> WIPOffset<Vector<'b, ForwardsUOffset<FbPackFile<'b>>>> {
+        let entries: Vec<WIPOffset<FbPackFile>> = pack_files
+            .values()
+            .map(|p| {
+                let pack_id = self.add_ulid(&p.pack_id);
+                FbPackFile::create(
+                    &mut self.builder,
+                    &FbPackFileArgs {
+                        pack_id: Some(pack_id),
+                        total_bytes: p.total_bytes,
+                        live_bytes: p.live_bytes,
+                    },
+                )
+            })
+            .collect();
+        self.builder.create_vector(entries.as_ref())
     }
 
     fn add_compacted_sst(&mut self, handle: &SsTableHandle) -> WIPOffset<CompactedSsTable<'b>> {
@@ -1134,6 +1183,18 @@ impl<'b> DbFlatBufferBuilder<'b> {
 
         let sequence_tracker_data = core.sequence_tracker.to_bytes();
         let sequence_tracker = self.builder.create_vector(sequence_tracker_data.as_slice());
+
+        let orphan_packs = if core.orphan_packs.is_empty() {
+            None
+        } else {
+            Some(self.add_orphan_packs(&core.orphan_packs))
+        };
+
+        let pack_files = if core.pack_files.is_empty() {
+            None
+        } else {
+            Some(self.add_pack_files(&core.pack_files))
+        };
 
         let manifest = ManifestV2::create(
             &mut self.builder,

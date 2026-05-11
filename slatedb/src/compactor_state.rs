@@ -3,11 +3,11 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::{Display, Formatter};
 
 use bytes::Bytes;
-use log::{error, info};
+use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::db_state::{SortedRun, SsTableHandle, SsTableView};
+use crate::db_state::{OrphanPack, SortedRun, SsTableHandle, SsTableView};
 use crate::error::SlateDBError;
 use crate::manifest::{Manifest, ManifestCore};
 use slatedb_txn_obj::DirtyObject;
@@ -627,6 +627,41 @@ impl CompactorState {
         let segments =
             crate::manifest::merge_segments_from_writer(&my_db_state.segments, &remote.segments);
         // Segment configuration is stable; the writer is the source of truth.
+
+        // Local orphans are stamped with remote_manifest.id — the version this compactor is
+        // about to build on top of, i.e. the last id at which the pack was still reachable.
+        // Re-stamping on every merge keeps the tag monotonic across write retries so the GC
+        // watermark invariant (`tag < min_checkpoint_id`) stays correct even when the manifest
+        // advances between finish_compaction and the final update().
+        let mut merged_orphan_packs = std::mem::take(&mut remote_manifest.value.core.orphan_packs);
+        if !my_db_state.orphan_packs.is_empty() {
+            let existing: HashSet<Ulid> = merged_orphan_packs.iter().map(|o| o.pack_id).collect();
+            let orphaned_at_manifest_id: u64 = remote_manifest.id.into();
+            for o in &my_db_state.orphan_packs {
+                if !existing.contains(&o.pack_id) {
+                    merged_orphan_packs.push(OrphanPack {
+                        pack_id: o.pack_id,
+                        orphaned_at_manifest_id,
+                    });
+                }
+            }
+        }
+
+        // Pack files: the compactor is the only producer of decrements and removals
+        // (via orphan promotion in finish_compaction), so local is authoritative for
+        // entries it already knows about. Pull in remote-only entries to pick up new
+        // packs that the writer has flushed since our last load. Skip remote entries
+        // that we've just orphaned locally — they're already in `merged_orphan_packs`
+        // and must not reappear in `pack_files`.
+        let local_orphan_ids: HashSet<Ulid> =
+            my_db_state.orphan_packs.iter().map(|o| o.pack_id).collect();
+        let mut merged_pack_files = my_db_state.pack_files.clone();
+        for (pack_id, pack) in &remote_manifest.value.core.pack_files {
+            if !merged_pack_files.contains_key(pack_id) && !local_orphan_ids.contains(pack_id) {
+                merged_pack_files.insert(*pack_id, pack.clone());
+            }
+        }
+
         let merged = ManifestCore {
             initialized: remote_manifest.value.core.initialized,
             tree,
@@ -640,6 +675,8 @@ impl CompactorState {
             wal_object_store_uri: my_db_state.wal_object_store_uri.clone(),
             recent_snapshot_min_seq: remote_manifest.value.core.recent_snapshot_min_seq,
             sequence_tracker: remote_manifest.value.core.sequence_tracker,
+            orphan_packs: merged_orphan_packs,
+            pack_files: merged_pack_files,
         };
         remote_manifest.value.core = merged;
         self.manifest = remote_manifest;
@@ -728,7 +765,17 @@ impl CompactorState {
     /// (root tree for an empty segment), inserts the output SR in id-descending order,
     /// updates `last_compacted_l0_*`, and marks the compaction finished (retaining the most
     /// recent finished compaction for GC; see #1044).
-    pub(crate) fn finish_compaction(&mut self, compaction_id: Ulid, output_sr: SortedRun) {
+    ///
+    /// `retention_dropped_pack_bytes` carries the bytes dropped per pack by retention. For each
+    /// entry, `pack_files[pack_id].live_bytes` is decremented; once a pack's `live_bytes` hits
+    /// zero it is moved to `orphan_packs` (stamped with the next manifest id) and removed from
+    /// `pack_files`.
+    pub(crate) fn finish_compaction(
+        &mut self,
+        compaction_id: Ulid,
+        output_sr: SortedRun,
+        retention_dropped_pack_bytes: HashMap<Ulid, u64>,
+    ) {
         let mut db_state = self.db_state().clone();
         if let Some(compaction) = self.compactions.value.get_mut(&compaction_id) {
             let spec = compaction.spec();
@@ -799,6 +846,42 @@ impl CompactorState {
             }
             tree.l0 = new_l0;
             tree.compacted = new_compacted;
+            if !retention_dropped_pack_bytes.is_empty() {
+                let orphaned_at_manifest_id: u64 = self.manifest.id.next().into();
+                let mut existing_orphans: HashSet<Ulid> =
+                    db_state.orphan_packs.iter().map(|o| o.pack_id).collect();
+                for (pack_id, dropped_bytes) in retention_dropped_pack_bytes {
+                    debug!(
+                        "dropping bytes for pack_id={:?}, bytes={}",
+                        pack_id, dropped_bytes
+                    );
+                    let became_orphan = match db_state.pack_files.get_mut(&pack_id) {
+                        Some(pack) => {
+                            pack.live_bytes = pack.live_bytes.saturating_sub(dropped_bytes);
+                            pack.live_bytes == 0
+                        }
+                        None => {
+                            // No live entry for this pack — either it was already orphaned by a
+                            // prior compaction, or the manifest was loaded from a pre-pack
+                            // version. Either way, do not emit a duplicate orphan.
+                            error!(
+                                "retention dropped bytes for unknown pack [pack_id={:?}, bytes={}]",
+                                pack_id, dropped_bytes
+                            );
+                            false
+                        }
+                    };
+                    if became_orphan {
+                        db_state.pack_files.remove(&pack_id);
+                        if existing_orphans.insert(pack_id) {
+                            db_state.orphan_packs.push(OrphanPack {
+                                pack_id,
+                                orphaned_at_manifest_id,
+                            });
+                        }
+                    }
+                }
+            }
             self.manifest.value.core = db_state;
             self.manifest.value.prune_external_sst_ids();
             self.update_compaction(&compaction_id, |c| {
@@ -1037,7 +1120,7 @@ mod tests {
             id: 0,
             sst_views: compacted_ssts,
         };
-        state.finish_compaction(compaction_id, sr.clone());
+        state.finish_compaction(compaction_id, sr.clone(), HashMap::new());
 
         // then:
         assert_eq!(
@@ -1135,7 +1218,7 @@ mod tests {
             id: 0,
             sst_views: compacted_ssts,
         };
-        state.finish_compaction(compaction_id, sr);
+        state.finish_compaction(compaction_id, sr, HashMap::new());
 
         // then:
         assert_eq!(state.active_compactions().count(), 0)
@@ -1198,6 +1281,7 @@ mod tests {
                 id: 0,
                 sst_views: vec![original_l0s.back().unwrap().clone()],
             },
+            HashMap::new(),
         );
         // open a new db and write another l0
         let db = build_db(os.clone(), rt.handle());
@@ -1265,6 +1349,7 @@ mod tests {
                 id: 0,
                 sst_views: original_l0s.clone().into(),
             },
+            HashMap::new(),
         );
         assert_eq!(state.db_state().tree.l0.len(), 0);
         // open a new db and write another l0

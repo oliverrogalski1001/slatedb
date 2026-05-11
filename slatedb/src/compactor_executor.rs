@@ -13,8 +13,8 @@ use tokio::task::JoinHandle;
 use crate::compaction_filter::CompactionFilterSupplier;
 #[cfg(feature = "compaction_filters")]
 use crate::compaction_filter_iterator::CompactionFilterIterator;
-use crate::compactor::CompactorMessage;
 use crate::compactor::CompactorMessage::CompactionJobFinished;
+use crate::compactor::{CompactionJobOutput, CompactorMessage};
 use crate::config::CompactorOptions;
 use crate::db_state::{SortedRun, SsTableHandle, SsTableId, SsTableView};
 use crate::error::SlateDBError;
@@ -191,6 +191,8 @@ pub(crate) struct TokioCompactionExecutorOptions {
     pub clock: Arc<dyn SystemClock>,
     pub manifest_store: Arc<ManifestStore>,
     pub merge_operator: Option<MergeOperatorType>,
+    /// When blob externalization is enabled, do not fold merges into a `BlobRef` base.
+    pub skip_merge_when_blob_ref_base: bool,
     #[cfg(feature = "compaction_filters")]
     pub compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
@@ -222,6 +224,7 @@ impl TokioCompactionExecutor {
                 is_stopped: AtomicBool::new(false),
                 manifest_store: opts.manifest_store,
                 merge_operator,
+                skip_merge_when_blob_ref_base: opts.skip_merge_when_blob_ref_base,
                 #[cfg(feature = "compaction_filters")]
                 compaction_filter_supplier: opts.compaction_filter_supplier,
             }),
@@ -244,7 +247,7 @@ impl CompactionExecutor for TokioCompactionExecutor {
 }
 
 struct TokioCompactionTask {
-    task: JoinHandle<Result<SortedRun, SlateDBError>>,
+    task: JoinHandle<Result<CompactionJobOutput, SlateDBError>>,
 }
 
 pub(crate) struct TokioCompactionExecutorInner {
@@ -259,6 +262,7 @@ pub(crate) struct TokioCompactionExecutorInner {
     is_stopped: AtomicBool,
     manifest_store: Arc<ManifestStore>,
     merge_operator: Option<MergeOperatorType>,
+    skip_merge_when_blob_ref_base: bool,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
@@ -269,6 +273,7 @@ impl TokioCompactionExecutorInner {
     async fn load_iterators<'a>(
         &self,
         job_args: &'a StartCompactionJobArgs,
+        dropped_pack_bytes_sink: Option<Arc<std::sync::Mutex<HashMap<Ulid, u64>>>>,
     ) -> Result<ResumingIterator<Box<dyn TrackedRowEntryIterator + 'a>>, SlateDBError> {
         let resume_cursor = match job_args.output_ssts.last() {
             Some(output_sst) => {
@@ -318,6 +323,8 @@ impl TokioCompactionExecutorInner {
                     merge_iter,
                     false,
                     job_args.retention_min_seq,
+                    Some(self.table_store.clone()),
+                    self.skip_merge_when_blob_ref_base,
                 ))
             } else {
                 Box::new(MergeOperatorRequiredIterator::new(merge_iter))
@@ -333,6 +340,7 @@ impl TokioCompactionExecutorInner {
             job_args.compaction_clock_tick,
             self.clock.clone(),
             Arc::new(stored_manifest.db_state().sequence_tracker.clone()),
+            dropped_pack_bytes_sink,
         )
         .await?;
         retention_iter.init().await?;
@@ -397,9 +405,12 @@ impl TokioCompactionExecutorInner {
     async fn execute_compaction_job(
         &self,
         args: StartCompactionJobArgs,
-    ) -> Result<SortedRun, SlateDBError> {
+    ) -> Result<CompactionJobOutput, SlateDBError> {
         debug!("executing compaction [job_args={:?}]", args);
-        let mut all_iter = self.load_iterators(&args).await?;
+        let dropped_pack_bytes_sink = Arc::new(std::sync::Mutex::new(HashMap::<Ulid, u64>::new()));
+        let mut all_iter = self
+            .load_iterators(&args, Some(dropped_pack_bytes_sink.clone()))
+            .await?;
         let mut output_ssts = args.output_ssts.clone();
         let mut current_writer = self.table_store.table_writer(SsTableId::Compacted(
             self.rand.rng().gen_ulid(self.clock.as_ref()),
@@ -449,15 +460,22 @@ impl TokioCompactionExecutorInner {
             output_ssts.push(sst);
         }
 
-        Ok(SortedRun {
-            id: args.destination,
-            sst_views: output_ssts
-                .into_iter()
-                .map(|sst| {
-                    let id = self.rand.rng().gen_ulid(self.clock.as_ref());
-                    SsTableView::new(id, sst)
-                })
-                .collect(),
+        let retention_dropped_pack_bytes = dropped_pack_bytes_sink
+            .lock()
+            .expect("dropped pack bytes sink mutex poisoned")
+            .clone();
+        Ok(CompactionJobOutput {
+            sorted_run: SortedRun {
+                id: args.destination,
+                sst_views: output_ssts
+                    .into_iter()
+                    .map(|sst| {
+                        let id = self.rand.rng().gen_ulid(self.clock.as_ref());
+                        SsTableView::new(id, sst)
+                    })
+                    .collect(),
+            },
+            retention_dropped_pack_bytes,
         })
     }
 
@@ -1028,6 +1046,7 @@ mod tests {
             clock,
             manifest_store,
             merge_operator,
+            skip_merge_when_blob_ref_base: false,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
         });
@@ -1096,7 +1115,11 @@ mod tests {
 
         // Verify the resumed iterator yields all remaining rows, starting immediately
         // after the persisted prefix and continuing in sorted order.
-        let mut iter = executor.inner.load_iterators(&job_args).await.unwrap();
+        let mut iter = executor
+            .inner
+            .load_iterators(&job_args, None)
+            .await
+            .unwrap();
         let mut resumed_entries = Vec::new();
         while let Some(entry) = iter.next().await.unwrap() {
             resumed_entries.push(entry);
@@ -1236,6 +1259,7 @@ mod tests {
                     clock,
                     manifest_store,
                     merge_operator,
+                    skip_merge_when_blob_ref_base: false,
                     #[cfg(feature = "compaction_filters")]
                     compaction_filter_supplier: None,
                 });
@@ -1262,7 +1286,8 @@ mod tests {
                         retention_min_seq,
                     })
                     .await
-                    .unwrap();
+                    .unwrap()
+                    .sorted_run;
 
                 let mut expected_entries = Vec::new();
                 for sst in &full_run.sst_views {
@@ -1307,7 +1332,8 @@ mod tests {
                             retention_min_seq,
                         })
                         .await
-                        .unwrap();
+                        .unwrap()
+                        .sorted_run;
 
                     let mut resumed_entries = Vec::new();
                     for sst in &resumed_run.sst_views {
@@ -1399,6 +1425,7 @@ mod tests {
                 clock,
                 manifest_store,
                 merge_operator: self.merge_operator,
+                skip_merge_when_blob_ref_base: false,
                 #[cfg(feature = "compaction_filters")]
                 compaction_filter_supplier: self.compaction_filter_supplier,
             });
@@ -1442,6 +1469,7 @@ mod tests {
             })
             .await
             .unwrap()
+            .map(|output| output.sorted_run)
         }
     }
 

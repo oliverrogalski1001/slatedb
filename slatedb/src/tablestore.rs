@@ -14,6 +14,8 @@ use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
 use crate::blob::ReadOnlyBlob;
+#[cfg(feature = "moka")]
+use crate::blob_cache::BlobCache;
 use crate::db_cache::{CachedEntry, CachedKey, DbCache, EncodedCachedFilter};
 use crate::db_state::{SsTableHandle, SsTableId};
 use crate::error::SlateDBError;
@@ -25,6 +27,8 @@ use crate::object_stores::{ObjectStoreType, ObjectStores};
 use crate::paths::PathResolver;
 use crate::sst_builder::EncodedSsTableBuilder;
 use crate::sst_stats::SstStats;
+#[cfg(feature = "moka")]
+use crate::types::BlobRef;
 use crate::types::RowEntry;
 use crate::wal::wal_sst_builder::EncodedWalSsTableBuilder;
 
@@ -36,6 +40,9 @@ pub(crate) struct TableStore {
     fp_registry: Arc<FailPointRegistry>,
     /// In-memory cache for data blocks, indices, and filters
     cache: Option<Arc<dyn DbCache>>,
+    /// In-memory cache for externalized blob values (requires `moka` feature)
+    #[cfg(feature = "moka")]
+    blob_cache: Option<Arc<BlobCache>>,
 }
 
 struct ReadOnlyObject {
@@ -86,6 +93,8 @@ impl TableStore {
             PathResolver::new(root_path),
             Arc::new(FailPointRegistry::new()),
             block_cache,
+            #[cfg(feature = "moka")]
+            None,
         )
     }
 
@@ -95,6 +104,7 @@ impl TableStore {
         path_resolver: PathResolver,
         fp_registry: Arc<FailPointRegistry>,
         cache: Option<Arc<dyn DbCache>>,
+        #[cfg(feature = "moka")] blob_cache: Option<Arc<BlobCache>>,
     ) -> Self {
         Self {
             object_stores,
@@ -102,6 +112,8 @@ impl TableStore {
             path_resolver,
             fp_registry,
             cache,
+            #[cfg(feature = "moka")]
+            blob_cache,
         }
     }
 
@@ -192,6 +204,68 @@ impl TableStore {
 
     pub(crate) fn wal_table_builder(&self) -> EncodedWalSsTableBuilder {
         self.sst_format.wal_table_builder()
+    }
+
+    pub(crate) async fn put_pack(&self, pack_id: Ulid, data: Bytes) -> Result<(), SlateDBError> {
+        let object_store = self.object_stores.store_of(ObjectStoreType::Main);
+        let path = self.path_resolver.pack_object_path(&pack_id);
+        object_store
+            .put_opts(&path, data.into(), PutOptions::from(PutMode::Create))
+            .await
+            .map_err(SlateDBError::from)?;
+        Ok(())
+    }
+
+    pub(crate) async fn get_pack_range(
+        &self,
+        pack_id: Ulid,
+        offset: u32,
+        length: u32,
+    ) -> Result<Bytes, SlateDBError> {
+        #[cfg(feature = "moka")]
+        if let Some(ref cache) = self.blob_cache {
+            let blob_ref = BlobRef::new(pack_id, offset, length);
+            return cache
+                .get_or_fetch(blob_ref, || self.fetch_pack_range(pack_id, offset, length))
+                .await;
+        }
+        self.fetch_pack_range(pack_id, offset, length).await
+    }
+
+    /// Fetches a byte range from a pack file, bypassing the blob cache.
+    /// Used by tests that probe object-store existence and must not see a
+    /// stale cached read.
+    #[cfg(test)]
+    pub(crate) async fn get_pack_range_uncached(
+        &self,
+        pack_id: Ulid,
+        offset: u32,
+        length: u32,
+    ) -> Result<Bytes, SlateDBError> {
+        self.fetch_pack_range(pack_id, offset, length).await
+    }
+
+    async fn fetch_pack_range(
+        &self,
+        pack_id: Ulid,
+        offset: u32,
+        length: u32,
+    ) -> Result<Bytes, SlateDBError> {
+        let object_store = self.object_stores.store_of(ObjectStoreType::Main);
+        let path = self.path_resolver.pack_object_path(&pack_id);
+        let start = u64::from(offset);
+        let end = start + u64::from(length);
+        object_store
+            .get_range(&path, start..end)
+            .await
+            .map_err(SlateDBError::from)
+    }
+
+    pub(crate) async fn delete_pack(&self, pack_id: Ulid) -> Result<(), SlateDBError> {
+        let object_store = self.object_stores.store_of(ObjectStoreType::Main);
+        let path = self.path_resolver.pack_object_path(&pack_id);
+        debug!("deleting pack [path={}]", path);
+        object_store.delete(&path).await.map_err(SlateDBError::from)
     }
 
     pub(crate) async fn write_sst(
@@ -839,6 +913,7 @@ mod tests {
     use rstest::rstest;
     use std::collections::VecDeque;
     use std::sync::Arc;
+    use ulid::Ulid;
 
     use crate::db_cache::test_utils::TestCache;
     use crate::db_cache::SplitCache;
@@ -1302,7 +1377,6 @@ mod tests {
             Some(cache),
         );
         assert_eq!(meta_cache.entry_count(), 0);
-
         let _ = reader.read_index(&handle, false).await.unwrap();
         assert!(meta_cache
             .get_index(&(handle.id, handle.info.index_offset).into())
@@ -1773,6 +1847,45 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_put_get_delete_pack() {
+        let main_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ts = Arc::new(TableStore::new(
+            ObjectStores::new(main_store.clone(), None),
+            SsTableFormat::default(),
+            Path::from(ROOT),
+            None,
+        ));
+
+        let pack_id = Ulid::from_string("01J79C21YKR31J2BS1EFXJZ7MR").unwrap();
+        let payload = Bytes::from_static(b"pack-payload-bytes");
+        let expected_path = Path::from("/root/blob/01J79C21YKR31J2BS1EFXJZ7MR.data");
+
+        ts.put_pack(pack_id, payload.clone()).await.unwrap();
+
+        let stored = main_store
+            .get(&expected_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(stored, payload);
+
+        let full = ts
+            .get_pack_range(pack_id, 0, payload.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(full, payload);
+
+        let suffix = ts.get_pack_range(pack_id, 5, 7).await.unwrap();
+        assert_eq!(suffix, payload.slice(5..12));
+
+        ts.delete_pack(pack_id).await.unwrap();
+        let err = main_store.get(&expected_path).await.unwrap_err();
+        assert!(matches!(err, object_store::Error::NotFound { .. }));
+    }
+
     #[rstest]
     #[case::main_only(make_store(), None)]
     #[case::main_and_wal(make_store(), Some(make_store()))]
@@ -1839,5 +1952,145 @@ mod tests {
                 assert_eq!(num_blocks, ts.bytes_to_blocks(bytes));
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "moka"))]
+mod blob_cache_tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use fail_parallel::FailPointRegistry;
+    use object_store::{memory::InMemory, path::Path, ObjectStore};
+    use ulid::Ulid;
+
+    use crate::blob_cache::BlobCache;
+    use crate::db_metrics::DbMetrics;
+    use crate::format::sst::SsTableFormat;
+    use crate::object_stores::ObjectStores;
+    use crate::paths::PathResolver;
+    use crate::tablestore::TableStore;
+
+    const ROOT: &str = "/root";
+
+    fn make_table_store_with_cache(
+        object_store: Arc<dyn ObjectStore>,
+        max_capacity_bytes: u64,
+    ) -> (Arc<TableStore>, Arc<BlobCache>) {
+        let metrics = DbMetrics::new(None);
+        let blob_cache = Arc::new(BlobCache::new(max_capacity_bytes, &metrics));
+        let ts = Arc::new(TableStore::new_with_fp_registry(
+            ObjectStores::new(object_store, None),
+            SsTableFormat::default(),
+            PathResolver::new(Path::from(ROOT)),
+            Arc::new(FailPointRegistry::new()),
+            None,
+            Some(blob_cache.clone()),
+        ));
+        (ts, blob_cache)
+    }
+
+    #[tokio::test]
+    async fn test_blob_cache_hit_on_second_read() {
+        let os = Arc::new(InMemory::new());
+        let (ts, cache) = make_table_store_with_cache(os.clone(), 64 * 1024 * 1024);
+
+        let pack_id = Ulid::new();
+        let data = Bytes::from_static(b"hello from blob cache test");
+        ts.put_pack(pack_id, data.clone()).await.unwrap();
+
+        // First read: miss, fetches from object store and populates cache.
+        let first = ts.get_pack_range(pack_id, 0, data.len() as u32).await.unwrap();
+        assert_eq!(first, data);
+        assert_eq!(cache.entry_count().await, 1);
+
+        // Delete the pack from object storage to prove second read comes from cache.
+        let path = PathResolver::new(Path::from(ROOT)).pack_object_path(&pack_id);
+        os.delete(&path).await.unwrap();
+
+        let second = ts.get_pack_range(pack_id, 0, data.len() as u32).await.unwrap();
+        assert_eq!(second, data);
+    }
+
+    #[tokio::test]
+    async fn test_blob_cache_miss_then_hit_metrics() {
+        let os = Arc::new(InMemory::new());
+        let (ts, cache) = make_table_store_with_cache(os.clone(), 64 * 1024 * 1024);
+
+        let pack_id = Ulid::new();
+        let data = Bytes::from(vec![42u8; 1024]);
+        ts.put_pack(pack_id, data.clone()).await.unwrap();
+
+        // Miss
+        ts.get_pack_range(pack_id, 0, data.len() as u32).await.unwrap();
+        // Hit
+        ts.get_pack_range(pack_id, 0, data.len() as u32).await.unwrap();
+
+        // Check via direct cache entry count (metrics counters are opaque via trait objects)
+        assert_eq!(cache.entry_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_pack_range_uncached_skips_cache() {
+        let os = Arc::new(InMemory::new());
+        let (ts, cache) = make_table_store_with_cache(os.clone(), 64 * 1024 * 1024);
+
+        let pack_id = Ulid::new();
+        let data = Bytes::from_static(b"uncached read test data");
+        ts.put_pack(pack_id, data.clone()).await.unwrap();
+
+        // uncached read — should NOT populate cache
+        let result = ts.get_pack_range_uncached(pack_id, 0, data.len() as u32).await.unwrap();
+        assert_eq!(result, data);
+        assert_eq!(cache.entry_count().await, 0, "uncached read must not populate blob cache");
+    }
+
+    #[tokio::test]
+    async fn test_tablestore_without_blob_cache_still_reads() {
+        // TableStore::new() has no blob_cache — reads still work via object store.
+        let os = Arc::new(InMemory::new());
+        let ts = Arc::new(TableStore::new(
+            ObjectStores::new(os.clone(), None),
+            SsTableFormat::default(),
+            Path::from(ROOT),
+            None,
+        ));
+
+        let pack_id = Ulid::new();
+        let data = Bytes::from_static(b"no cache path");
+        ts.put_pack(pack_id, data.clone()).await.unwrap();
+
+        let result = ts.get_pack_range(pack_id, 0, data.len() as u32).await.unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[tokio::test]
+    async fn test_blob_cache_partial_range_read() {
+        // Reads a sub-range of a pack — cache key is BlobRef{pack_id, offset, length},
+        // so different ranges are cached as independent entries.
+        let os = Arc::new(InMemory::new());
+        let (ts, cache) = make_table_store_with_cache(os.clone(), 64 * 1024 * 1024);
+
+        let pack_id = Ulid::new();
+        let data = Bytes::from(b"abcdefghijklmnop".as_slice());
+        ts.put_pack(pack_id, data.clone()).await.unwrap();
+
+        // Read first 4 bytes (offset=0, length=4)
+        let part1 = ts.get_pack_range(pack_id, 0, 4).await.unwrap();
+        assert_eq!(part1.as_ref(), b"abcd");
+
+        // Read next 4 bytes (offset=4, length=4)
+        let part2 = ts.get_pack_range(pack_id, 4, 4).await.unwrap();
+        assert_eq!(part2.as_ref(), b"efgh");
+
+        // Two distinct BlobRefs → two cache entries
+        assert_eq!(cache.entry_count().await, 2);
+
+        // Delete from object store; re-read from cache
+        let path = PathResolver::new(Path::from(ROOT)).pack_object_path(&pack_id);
+        os.delete(&path).await.unwrap();
+
+        let cached_part1 = ts.get_pack_range(pack_id, 0, 4).await.unwrap();
+        assert_eq!(cached_part1.as_ref(), b"abcd");
     }
 }

@@ -54,6 +54,7 @@
 //! represents a description (Spec), a durable decision (Compaction), or a running
 //! attempt (JobSpec).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -96,6 +97,16 @@ pub use crate::db::builder::CompactorBuilder;
 pub use crate::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
 
 pub(crate) const COMPACTOR_TASK_NAME: &str = "compactor";
+
+/// Successful output of a single compaction job attempt.
+#[derive(Clone, Debug)]
+pub(crate) struct CompactionJobOutput {
+    pub sorted_run: SortedRun,
+    /// Bytes dropped per pack by retention during compaction. The compactor
+    /// decrements `pack_files[pack_id].live_bytes` by these amounts and emits
+    /// an `OrphanPack` once a pack reaches zero live bytes.
+    pub retention_dropped_pack_bytes: HashMap<Ulid, u64>,
+}
 
 /// Supplies a concrete [`CompactionScheduler`] implementation.
 ///
@@ -225,8 +236,8 @@ pub(crate) enum CompactorMessage {
     CompactionJobFinished {
         /// Job id (distinct from the canonical compaction id).
         id: Ulid,
-        /// Output SR on success, or the compaction error.
-        result: Result<SortedRun, SlateDBError>,
+        /// Output SR and retention orphans on success, or the compaction error.
+        result: Result<CompactionJobOutput, SlateDBError>,
     },
     /// Periodic progress update from the [`CompactionExecutor`].
     CompactionJobProgress {
@@ -281,6 +292,7 @@ pub struct Compactor {
     stats: Arc<CompactionStats>,
     system_clock: Arc<dyn SystemClock>,
     merge_operator: Option<MergeOperatorType>,
+    skip_merge_when_blob_ref_base: bool,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
 }
@@ -299,6 +311,7 @@ impl Compactor {
         system_clock: Arc<dyn SystemClock>,
         closed_result: Arc<dyn ClosedResultWriter>,
         merge_operator: Option<MergeOperatorType>,
+        skip_merge_when_blob_ref_base: bool,
         #[cfg(feature = "compaction_filters")] compaction_filter_supplier: Option<
             Arc<dyn CompactionFilterSupplier>,
         >,
@@ -320,6 +333,7 @@ impl Compactor {
             stats,
             system_clock,
             merge_operator,
+            skip_merge_when_blob_ref_base,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier,
         }
@@ -347,6 +361,7 @@ impl Compactor {
                 clock: self.system_clock.clone(),
                 manifest_store: self.manifest_store.clone(),
                 merge_operator: self.merge_operator.clone(),
+                skip_merge_when_blob_ref_base: self.skip_merge_when_blob_ref_base,
                 #[cfg(feature = "compaction_filters")]
                 compaction_filter_supplier: self.compaction_filter_supplier.clone(),
             },
@@ -459,7 +474,7 @@ impl MessageHandler<CompactorMessage> for CompactorEventHandler {
             CompactorMessage::PollManifest => self.handle_ticker().await?,
             CompactorMessage::CompactionJobFinished { id, result } => {
                 match result {
-                    Ok(sr) => self.finish_compaction(id, sr).await?,
+                    Ok(output) => self.finish_compaction(id, output).await?,
                     Err(err) => {
                         error!("error executing compaction [error={:#?}]", err);
                         self.finish_failed_compaction(id).await?;
@@ -962,9 +977,13 @@ impl CompactorEventHandler {
     async fn finish_compaction(
         &mut self,
         id: Ulid,
-        output_sr: SortedRun,
+        output: CompactionJobOutput,
     ) -> Result<(), SlateDBError> {
-        self.state_mut().finish_compaction(id, output_sr);
+        self.state_mut().finish_compaction(
+            id,
+            output.sorted_run,
+            output.retention_dropped_pack_bytes,
+        );
         self.log_compaction_state();
         self.state_writer.write_state_safely().await?;
         self.maybe_schedule_compactions().await?;
@@ -3166,6 +3185,7 @@ mod tests {
                     clock: Arc::new(DefaultSystemClock::new()),
                     manifest_store: manifest_store.clone(),
                     merge_operator: None,
+                    skip_merge_when_blob_ref_base: false,
                     #[cfg(feature = "compaction_filters")]
                     compaction_filter_supplier: None,
                 },
@@ -3751,7 +3771,10 @@ mod tests {
         };
         let msg = CompactorMessage::CompactionJobFinished {
             id: compaction_id,
-            result: Ok(output_sr),
+            result: Ok(CompactionJobOutput {
+                sorted_run: output_sr,
+                retention_dropped_pack_bytes: HashMap::new(),
+            }),
         };
         handler.handle(msg).await.unwrap();
 
@@ -3870,7 +3893,10 @@ mod tests {
         };
         let msg = CompactorMessage::CompactionJobFinished {
             id: job.id,
-            result: Ok(output_sr),
+            result: Ok(CompactionJobOutput {
+                sorted_run: output_sr,
+                retention_dropped_pack_bytes: HashMap::new(),
+            }),
         };
 
         // when:

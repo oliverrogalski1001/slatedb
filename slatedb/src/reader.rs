@@ -11,7 +11,8 @@ use crate::oracle::Oracle;
 use crate::segment_iterator::{build_segment_iter, SegmentScanContext};
 use crate::sst_iter::SstIteratorOptions;
 use crate::tablestore::TableStore;
-use crate::types::KeyValue;
+use crate::types::{BlobRef, KeyValue, ValueDeletable};
+use crate::utils::{build_concurrent, compute_max_parallel};
 use crate::{db_iter::DbIteratorRangeTracker, error::SlateDBError, DbIterator};
 
 use bytes::Bytes;
@@ -90,6 +91,39 @@ impl Reader {
             oracle,
             read_merge_operator,
         }
+    }
+
+    async fn row_entry_to_key_value(
+        &self,
+        entry: crate::types::RowEntry,
+    ) -> Result<KeyValue, SlateDBError> {
+        let crate::types::RowEntry {
+            key,
+            value,
+            seq,
+            create_ts,
+            expire_ts,
+        } = entry;
+
+        let value = match value {
+            ValueDeletable::Value(value) | ValueDeletable::Merge(value) => value,
+            ValueDeletable::BlobRef(blob_ref) => self.read_blob_value(blob_ref).await?,
+            ValueDeletable::Tombstone => return Err(SlateDBError::UnexpectedTombstone),
+        };
+
+        Ok(KeyValue {
+            key,
+            value,
+            seq,
+            create_ts: create_ts.unwrap_or(0),
+            expire_ts,
+        })
+    }
+
+    async fn read_blob_value(&self, blob_ref: BlobRef) -> Result<Bytes, SlateDBError> {
+        self.table_store
+            .get_pack_range(blob_ref.pack_id, blob_ref.offset, blob_ref.length)
+            .await
     }
 
     /// Determines the maximum sequence number for read operations (get and scan). Read operations will filter
@@ -242,17 +276,10 @@ impl Reader {
         )
         .await?;
 
-        iterator
-            .next_entry()
-            .await?
-            .map(|entry| {
-                if entry.value.is_tombstone() {
-                    Err(SlateDBError::UnexpectedTombstone)
-                } else {
-                    Ok(KeyValue::from(entry))
-                }
-            })
-            .transpose()
+        match iterator.next_entry().await? {
+            Some(entry) => Ok(Some(self.row_entry_to_key_value(entry).await?)),
+            None => Ok(None),
+        }
     }
 
     /// Create an iterator over a key range.
@@ -493,6 +520,16 @@ mod tests {
             let id = SsTableId::Compacted(Ulid::new());
             self.table_store.write_sst(&id, &encoded, false).await
         }
+
+        async fn put_blob_value(&self, value: Bytes) -> Result<BlobRef, SlateDBError> {
+            let pack_id = Ulid::new();
+            self.table_store.put_pack(pack_id, value.clone()).await?;
+            Ok(BlobRef::new(
+                pack_id,
+                0,
+                u32::try_from(value.len()).expect("blob size > u32"),
+            ))
+        }
     }
 
     impl DbStateReader for TestDbState {
@@ -560,6 +597,16 @@ mod tests {
             }
         }
 
+        fn blob_ref(key: &'static [u8], blob_ref: BlobRef, seq: u64) -> Self {
+            Self {
+                location: LayerLocation::Memtable,
+                key,
+                value: ValueDeletable::BlobRef(blob_ref),
+                seq,
+                expire_ts: None,
+            }
+        }
+
         fn with_location(mut self, location: LayerLocation) -> Self {
             self.location = location;
             self
@@ -604,6 +651,9 @@ mod tests {
                         match &entry.value {
                             ValueDeletable::Value(v) => {
                                 batch.put(entry.key, v.as_ref());
+                            }
+                            ValueDeletable::BlobRef(_) => {
+                                panic!("blob refs are not supported in write batches");
                             }
                             ValueDeletable::Tombstone => {
                                 batch.delete(entry.key);
@@ -1897,6 +1947,36 @@ mod tests {
         let kv = result.expect("should return value");
         assert_eq!(kv.value.as_ref(), b"value2");
         assert_eq!(kv.expire_ts, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn should_resolve_blob_refs_on_get() -> Result<(), SlateDBError> {
+        let mut test_db_state = TestDbState::new().await;
+        let blob_value = Bytes::from_static(b"blob-value");
+        let blob_ref = test_db_state.put_blob_value(blob_value.clone()).await?;
+        let entries =
+            vec![TestEntry::blob_ref(b"key1", blob_ref, 50).with_location(LayerLocation::L0Sst(0))];
+        let write_batch = populate_db_state(&mut test_db_state, entries).await?;
+
+        let db_metrics = crate::db_metrics::DbMetrics::new(None);
+        let db_stats = DbStats::new(&db_metrics);
+        let reader = build_reader(&test_db_state, db_stats, false).await;
+
+        let result = reader
+            .get_key_value_with_options(
+                b"key1",
+                &ReadOptions::default().with_dirty(true),
+                &test_db_state,
+                write_batch,
+                None,
+            )
+            .await?;
+
+        let kv = result.expect("should return blob-backed value");
+        assert_eq!(kv.value, blob_value);
+        assert_eq!(kv.seq, 50);
 
         Ok(())
     }

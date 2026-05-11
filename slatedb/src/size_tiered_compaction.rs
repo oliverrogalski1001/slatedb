@@ -925,6 +925,8 @@ mod tests {
             wal_object_store_uri: None,
             recent_snapshot_min_seq: 0,
             sequence_tracker: SequenceTracker::new(),
+            orphan_packs: vec![],
+            pack_files: std::collections::HashMap::new(),
         }
     }
 

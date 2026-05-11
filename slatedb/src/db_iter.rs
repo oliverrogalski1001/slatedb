@@ -9,7 +9,8 @@ use crate::merge_operator::{
     MergeOperatorIterator, MergeOperatorRequiredIterator, MergeOperatorType,
 };
 use crate::segment_iterator::{build_l0_point_iters, build_sr_point_iters, SegmentScanContext};
-use crate::types::{KeyValue, RowEntry, ValueDeletable};
+use crate::tablestore::TableStore;
+use crate::types::{BlobRef, KeyValue, RowEntry, ValueDeletable};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -230,6 +231,7 @@ pub struct DbIterator {
     invalidated_error: Option<SlateDBError>,
     last_key: Option<Bytes>,
     range_tracker: Option<Arc<DbIteratorRangeTracker>>,
+    table_store: Option<Arc<TableStore>>,
 }
 
 impl DbIterator {
@@ -242,6 +244,7 @@ impl DbIterator {
         range_tracker: Option<Arc<DbIteratorRangeTracker>>,
         merge_operator: Option<MergeOperatorType>,
         order: IterationOrder,
+        table_store: Option<Arc<TableStore>>,
     ) -> Result<Self, SlateDBError> {
         // The write_batch iterator is provided only when operating within a Transaction. It represents the uncommitted
         // writes made during the transaction. We do not need to apply the max_seq filter to them, because they do
@@ -288,6 +291,8 @@ impl DbIterator {
                 // The entries in the write batch iterator have seq num u64::MAX and any merges
                 // there need to be merged with the entries from the other iterators.
                 None,
+                table_store.clone(),
+                false,
             ));
         } else {
             // When no merge operator is configured, wrap with iterator that errors on merge operands
@@ -302,6 +307,41 @@ impl DbIterator {
             invalidated_error: None,
             last_key: None,
             range_tracker,
+            table_store,
+        })
+    }
+
+    async fn read_blob_value(&self, blob_ref: BlobRef) -> Result<Bytes, SlateDBError> {
+        let table_store = self
+            .table_store
+            .as_ref()
+            .ok_or(SlateDBError::InvalidDBState)?;
+        table_store
+            .get_pack_range(blob_ref.pack_id, blob_ref.offset, blob_ref.length)
+            .await
+    }
+
+    async fn row_entry_to_key_value(&self, entry: RowEntry) -> Result<KeyValue, SlateDBError> {
+        let RowEntry {
+            key,
+            value,
+            seq,
+            create_ts,
+            expire_ts,
+        } = entry;
+
+        let value = match value {
+            ValueDeletable::Value(value) | ValueDeletable::Merge(value) => value,
+            ValueDeletable::BlobRef(blob_ref) => self.read_blob_value(blob_ref).await?,
+            ValueDeletable::Tombstone => return Err(SlateDBError::UnexpectedTombstone),
+        };
+
+        Ok(KeyValue {
+            key,
+            value,
+            seq,
+            create_ts: create_ts.unwrap_or(0),
+            expire_ts,
         })
     }
 
@@ -316,14 +356,7 @@ impl DbIterator {
     pub async fn next(&mut self) -> Result<Option<KeyValue>, crate::Error> {
         let entry_opt = self.next_entry().await?;
         match entry_opt {
-            Some(entry) => {
-                if entry.value.is_tombstone() {
-                    return Err(crate::Error::from(
-                        crate::error::SlateDBError::UnexpectedTombstone,
-                    ));
-                }
-                Ok(Some(KeyValue::from(entry)))
-            }
+            Some(entry) => Ok(Some(self.row_entry_to_key_value(entry).await?)),
             None => Ok(None),
         }
     }
@@ -440,6 +473,7 @@ mod tests {
             None,
             None,
             IterationOrder::Ascending,
+            None,
         )
         .await
         .unwrap();
@@ -481,6 +515,7 @@ mod tests {
             None,
             None,
             IterationOrder::Ascending,
+            None,
         )
         .await
         .unwrap();
@@ -512,6 +547,7 @@ mod tests {
             None,
             None,
             IterationOrder::Ascending,
+            None,
         )
         .await
         .unwrap();
@@ -561,6 +597,7 @@ mod tests {
             None,
             None,
             IterationOrder::Ascending,
+            None,
         )
         .await
         .unwrap();

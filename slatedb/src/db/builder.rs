@@ -131,7 +131,9 @@ use crate::compactor_executor::{TokioCompactionExecutor, TokioCompactionExecutor
 use crate::config::CompactorOptions;
 use crate::config::DbReaderOptions;
 use crate::config::GarbageCollectorOptions;
-use crate::config::{Settings, SstBlockSize};
+use crate::config::{BlobOptions, Settings, SstBlockSize};
+#[cfg(feature = "moka")]
+use crate::blob_cache::BlobCache;
 use crate::db::Db;
 use crate::db::DbInner;
 use crate::db_cache::SplitCache;
@@ -509,6 +511,13 @@ impl<P: Into<Path>> DbBuilder<P> {
 
         // Create path resolver and table store
         let path_resolver = PathResolver::new_with_external_ssts(path.clone(), external_ssts);
+        #[cfg(feature = "moka")]
+        let blob_cache: Option<Arc<BlobCache>> = self
+            .settings
+            .blob_options
+            .as_ref()
+            .and_then(|b| b.cache.as_ref())
+            .map(|opts| Arc::new(BlobCache::new(opts.max_capacity_bytes, &db_metrics)));
         let table_store = Arc::new(TableStore::new_with_fp_registry(
             ObjectStores::new(
                 maybe_cached_main_object_store.clone(),
@@ -524,6 +533,8 @@ impl<P: Into<Path>> DbBuilder<P> {
                     system_clock.clone(),
                 )) as Arc<dyn DbCache>
             }),
+            #[cfg(feature = "moka")]
+            blob_cache,
         ));
 
         // Get next WAL ID before writing manifest
@@ -612,6 +623,8 @@ impl<P: Into<Path>> DbBuilder<P> {
             path_resolver.clone(),
             self.fp_registry.clone(),
             None,
+            #[cfg(feature = "moka")]
+            None,
         ));
 
         let compactor_builder = self.compactor_builder.or_else(|| {
@@ -629,6 +642,9 @@ impl<P: Into<Path>> DbBuilder<P> {
 
             if let Some(operator) = self.merge_operator {
                 builder = builder.with_merge_operator(operator);
+            }
+            if let Some(blob_options) = self.settings.blob_options.as_ref() {
+                builder = builder.with_blob_options(blob_options.clone());
             }
 
             let (handler, rx) = builder
@@ -942,6 +958,7 @@ pub struct CompactorBuilder<P: Into<Path>> {
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
+    blob_options: Option<BlobOptions>,
 }
 
 #[allow(unused)]
@@ -962,6 +979,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             filter_policies: default_filter_policies(),
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: None,
+            blob_options: None,
         }
     }
 
@@ -981,6 +999,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             filter_policies: self.filter_policies,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier: self.compaction_filter_supplier,
+            blob_options: self.blob_options,
         }
     }
 
@@ -1033,6 +1052,18 @@ impl<P: Into<Path>> CompactorBuilder<P> {
     /// Sets the merge operator to use for the compactor.
     pub fn with_merge_operator(mut self, merge_operator: MergeOperatorType) -> Self {
         self.merge_operator = Some(merge_operator);
+        self
+    }
+
+    /// Sets the blob options for the compactor. When set, compaction preserves
+    /// `BlobRef` base rows and emits queued merge operands above them rather than
+    /// folding operands into the blob — maintaining the key-value-separation
+    /// invariant that blob-backed values are not re-inlined during compaction.
+    ///
+    /// This must be set to match the `blob_options` in the [`Settings`] used to
+    /// open the database; `DbBuilder` configures it automatically.
+    pub fn with_blob_options(mut self, blob_options: BlobOptions) -> Self {
+        self.blob_options = Some(blob_options);
         self
     }
 
@@ -1109,7 +1140,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             ObjectStores::new(retrying_main_object_store, None),
             sst_format,
             path,
-            None, // no need for cache in GC
+            None, // no need for cache in compactor
         ));
 
         let scheduler_supplier = self
@@ -1128,6 +1159,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             self.system_clock,
             self.closed_result,
             self.merge_operator,
+            self.blob_options.is_some(),
             #[cfg(feature = "compaction_filters")]
             self.compaction_filter_supplier,
         )
@@ -1169,6 +1201,7 @@ impl<P: Into<Path>> CompactorBuilder<P> {
                 clock: self.system_clock.clone(),
                 manifest_store: manifest_store.clone(),
                 merge_operator: self.merge_operator,
+                skip_merge_when_blob_ref_base: self.blob_options.is_some(),
                 #[cfg(feature = "compaction_filters")]
                 compaction_filter_supplier: self.compaction_filter_supplier,
             },
@@ -1427,6 +1460,8 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             block_cache: self.db_cache.clone(),
             block_transformer: self.block_transformer.clone(),
             filter_policies: self.filter_policies.clone(),
+            #[cfg(feature = "moka")]
+            blob_cache: None,
         };
 
         let reader = DbReader::open_internal(

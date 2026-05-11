@@ -1827,6 +1827,8 @@ mod tests {
             object_store_cache_options: crate::config::ObjectStoreCacheOptions::default(),
             garbage_collector_options: None,
             default_ttl: None,
+            merge_operator: None,
+            blob_options: None,
             block_format: None,
         }
     }

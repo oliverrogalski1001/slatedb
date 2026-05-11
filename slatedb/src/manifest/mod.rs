@@ -19,7 +19,9 @@ use uuid::Uuid;
 
 pub(crate) mod store;
 
-pub use crate::db_state::{SortedRun, SsTableHandle, SsTableId, SsTableInfo, SsTableView};
+pub use crate::db_state::{
+    OrphanPack, PackFile, SortedRun, SsTableHandle, SsTableId, SsTableInfo, SsTableView,
+};
 
 /// Per-LSM-tree state. Shared shape between the unsegmented tree (held directly
 /// on `ManifestCore`) and each named segment held in `ManifestCore::segments`.

@@ -46,6 +46,8 @@ pub use config::{Settings, SstBlockSize};
 pub use db::{Db, DbBuilder, DbReaderBuilder, DbStatus, WriteHandle};
 pub use db_cache::stats as db_cache_stats;
 pub use db_cache_manager::CacheTarget;
+#[cfg(feature = "moka")]
+pub use blob_cache::stats as blob_cache_stats;
 pub use db_iter::DbIterator;
 pub use db_reader::DbReader;
 pub use db_snapshot::DbSnapshot;
@@ -92,6 +94,8 @@ pub mod size_tiered_compaction;
 mod batch;
 mod batch_write;
 mod blob;
+#[cfg(feature = "moka")]
+mod blob_cache;
 mod block_iterator;
 mod block_iterator_v2;
 #[cfg(feature = "bench-internal")]

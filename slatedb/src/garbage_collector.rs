@@ -23,6 +23,7 @@ use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::Manifest;
 use crate::tablestore::TableStore;
 use async_trait::async_trait;
+use blob_gc::BlobGcTask;
 use chrono::{DateTime, Utc};
 use compacted_gc::CompactedGcTask;
 use compactions_gc::CompactionsGcTask;
@@ -39,6 +40,7 @@ use std::time::Duration;
 use tracing::instrument;
 use wal_gc::WalGcTask;
 
+mod blob_gc;
 mod compacted_gc;
 mod compactions_gc;
 mod detach_gc;
@@ -62,6 +64,8 @@ pub(crate) enum GcMessage {
     Compactions,
     Manifest,
     Detach,
+    Blob,
+    LogStats,
 }
 
 /// SlateDB's garbage collector.
@@ -90,6 +94,7 @@ pub struct GarbageCollector {
     compacted_gc_task: Option<CompactedGcTask>,
     compactions_gc_task: Option<CompactionsGcTask>,
     detach_gc_task: Option<DetachGcTask>,
+    blob_gc_task: Option<BlobGcTask>,
 }
 
 #[async_trait]
@@ -128,6 +133,14 @@ impl MessageHandler<GcMessage> for GarbageCollector {
             ));
         }
 
+        if let Some(opts) = self.options.blob_options {
+            tickers.push((
+                opts.interval.unwrap_or(DEFAULT_INTERVAL),
+                Box::new(|| GcMessage::Blob),
+            ));
+        }
+
+        tickers.push((Duration::from_secs(60), Box::new(|| GcMessage::LogStats)));
         tickers
     }
 
@@ -168,6 +181,14 @@ impl MessageHandler<GcMessage> for GarbageCollector {
                     .expect("got detach tick with unconfigured detach task");
                 self.run_gc_task(task).await;
             }
+            GcMessage::Blob => {
+                let task = self
+                    .blob_gc_task
+                    .as_ref()
+                    .expect("got blob tick with unconfigured blob task");
+                self.run_gc_task(task).await;
+            }
+            GcMessage::LogStats => self.log_stats(),
         }
         Ok(())
     }
@@ -243,6 +264,15 @@ impl GarbageCollector {
                 detach_options,
             )
         });
+        let blob_gc_task = options.blob_options.map(|blob_options| {
+            BlobGcTask::new(
+                manifest_store.clone(),
+                table_store.clone(),
+                stats.clone(),
+                system_clock.clone(),
+                blob_options,
+            )
+        });
         Self {
             manifest_store,
             options,
@@ -253,6 +283,7 @@ impl GarbageCollector {
             compacted_gc_task,
             compactions_gc_task,
             detach_gc_task,
+            blob_gc_task,
         }
     }
 
@@ -278,6 +309,9 @@ impl GarbageCollector {
             self.run_gc_task(task).await;
         }
         if let Some(task) = &self.detach_gc_task {
+            self.run_gc_task(task).await;
+        }
+        if let Some(task) = &self.blob_gc_task {
             self.run_gc_task(task).await;
         }
 
@@ -349,6 +383,7 @@ mod tests {
     use crate::config::{GarbageCollectorDirectoryOptions, GarbageCollectorOptions};
     use crate::dispatcher::MessageHandlerExecutor;
     use crate::error::SlateDBError;
+    use crate::manifest::OrphanPack;
     use crate::object_stores::ObjectStores;
     use crate::paths::PathResolver;
     use crate::types::RowEntry;
@@ -1429,6 +1464,7 @@ mod tests {
                 interval: None,
             }),
             detach_options: None,
+            blob_options: None,
         };
 
         let gc = GarbageCollector::new(
@@ -1497,6 +1533,7 @@ mod tests {
                 interval: None,
             }),
             detach_options: None,
+            blob_options: None,
         };
 
         let mut gc = GarbageCollector::new(
@@ -1561,6 +1598,7 @@ mod tests {
                 interval: None,
             }),
             detach_options: None,
+            blob_options: None,
         };
 
         let gc = GarbageCollector::new(
@@ -1601,6 +1639,7 @@ mod tests {
                 interval: Some(Duration::from_secs(17)),
             }),
             detach_options: None,
+            blob_options: None,
         };
 
         let mut gc = GarbageCollector::new(
@@ -1647,6 +1686,7 @@ mod tests {
                 interval: Some(Duration::from_secs(1)),
             }),
             detach_options: None,
+            blob_options: None,
         };
 
         let gc = GarbageCollector::new(

@@ -78,6 +78,25 @@ table ManifestV1 {
     sequence_tracker: [ubyte];
 }
 
+// Pack ids awaiting deletion after compaction dropped the last BlobRef pointing into them.
+// orphaned_at_manifest_id is the manifest id at which the pack transitioned to orphan
+// (used by GC to enforce checkpoint protection).
+table OrphanPack {
+    pack_id: Ulid (required);
+    orphaned_at_manifest_id: ulong;
+}
+
+// Metadata for a packed blob object. Created at flush time and tracked until all of its
+// BlobRefs are dropped, at which point the pack is moved to orphan_packs and removed from here.
+table PackFile {
+    pack_id: Ulid (required);
+    // Total bytes uploaded to object storage for this pack.
+    total_bytes: ulong;
+    // Bytes still referenced by live BlobRef rows. Decremented as compaction drops refs.
+    // When this reaches 0, the pack is appended to orphan_packs.
+    live_bytes: ulong;
+}
+
 // Manifest to persist state of DB, version 2 (CompactedSsTableV2 changed to CompactedSsTableView).
 table ManifestV2 {
     // Id of manifest. Manifest file name will be derived from this id.
@@ -148,6 +167,33 @@ table ManifestV2 {
     // (RFC-0024). Persisted so the writer can detect accidental reconfiguration
     // on startup. Absent when no extractor is configured.
     segment_extractor_name: string;
+
+    // Orphan packs awaiting GC (packed WiscKey-style external values).
+    orphan_packs: [OrphanPack];
+
+    // Live pack files referenced by BlobRef rows in the active SSTs. Tracked per-pack so
+    // compaction can decrement `live_bytes` as refs are dropped and emit OrphanPack
+    // entries when a pack reaches zero live bytes.
+    pack_files: [PackFile];
+}
+
+// Pack ids awaiting deletion after compaction dropped the last BlobRef pointing into them.
+// orphaned_at_manifest_id is the manifest id at which the pack transitioned to orphan
+// (used by GC to enforce checkpoint protection).
+table OrphanPack {
+    pack_id: Ulid (required);
+    orphaned_at_manifest_id: ulong;
+}
+
+// Metadata for a packed blob object. Created at flush time and tracked until all of its
+// BlobRefs are dropped, at which point the pack is moved to orphan_packs and removed from here.
+table PackFile {
+    pack_id: Ulid (required);
+    // Total bytes uploaded to object storage for this pack.
+    total_bytes: ulong;
+    // Bytes still referenced by live BlobRef rows. Decremented as compaction drops refs.
+    // When this reaches 0, the pack is appended to orphan_packs.
+    live_bytes: ulong;
 }
 
 // Per-segment LSM state. Structurally mirrors the top-level `l0` / `compacted` /
