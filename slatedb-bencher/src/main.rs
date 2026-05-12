@@ -2,14 +2,16 @@
 
 use crate::args::BencherArgs;
 use args::{
-    BencherCommands, BenchmarkCompactionArgs, BenchmarkDbArgs, BenchmarkTransactionArgs,
-    CompactionSubcommands, KeyGeneratorSupplier,
+    BencherCommands, BenchmarkBlobDbArgs, BenchmarkCompactionArgs, BenchmarkDbArgs,
+    BenchmarkTransactionArgs, CompactionSubcommands, KeyGeneratorSupplier,
 };
+use blob_db::BlobDbBench;
 use bytes::Bytes;
 use clap::Parser;
 use db::DbBench;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use serde_json;
 use object_store::path::Path;
 use object_store::Error as ObjectStoreError;
 use object_store::ObjectStore;
@@ -28,6 +30,7 @@ use tracing_subscriber::EnvFilter;
 use transactions::TransactionBench;
 
 mod args;
+pub mod blob_db;
 pub mod db;
 pub mod stats;
 pub mod system_monitor;
@@ -59,6 +62,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match args.command {
         BencherCommands::Db(subcommand_args) => {
             exec_benchmark_db(path.clone(), object_store.clone(), subcommand_args).await;
+        }
+        BencherCommands::BlobDb(subcommand_args) => {
+            exec_benchmark_blob_db(path.clone(), object_store.clone(), subcommand_args).await;
         }
         BencherCommands::Compaction(subcommand_args) => {
             exec_benchmark_compaction(path.clone(), object_store.clone(), subcommand_args).await;
@@ -105,6 +111,52 @@ async fn exec_benchmark_db(path: Path, object_store: Arc<dyn ObjectStore>, args:
     bencher.run().await;
 
     db.close().await.expect("failed to close db");
+}
+
+async fn exec_benchmark_blob_db(
+    path: Path,
+    object_store: Arc<dyn ObjectStore>,
+    args: BenchmarkBlobDbArgs,
+) {
+    let (mut config, memory_cache) = args.db_args.config().unwrap();
+
+    if args.blob_threshold > 0 {
+        config.blob_options = Some(slatedb::config::BlobOptions {
+            min_value_size: args.blob_threshold,
+            ..Default::default()
+        });
+    }
+
+    let write_options = slatedb::config::WriteOptions {
+        await_durable: false,
+    };
+
+    let mut builder = Db::builder(path.clone(), object_store.clone()).with_settings(config);
+    if let Some(cache) = memory_cache {
+        builder = builder.with_db_cache(cache);
+    }
+
+    let db = Arc::new(builder.build().await.unwrap());
+    let bench = BlobDbBench::new(
+        args.key_gen_supplier(),
+        args.workload_pattern(),
+        args.value_distribution(),
+        write_options,
+        args.concurrency,
+        None,
+        Some(std::time::Duration::from_secs(args.duration as u64)),
+        args.scan_width,
+        args.blob_threshold,
+        db.clone(),
+        object_store,
+        path,
+    );
+
+    let result = bench.run().await;
+    db.close().await.expect("failed to close db");
+
+    // Print JSON result to stdout for the orchestrator to capture.
+    println!("{}", serde_json::to_string(&result).unwrap());
 }
 
 async fn exec_benchmark_compaction(
