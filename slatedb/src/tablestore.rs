@@ -2001,7 +2001,10 @@ mod blob_cache_tests {
         ts.put_pack(pack_id, data.clone()).await.unwrap();
 
         // First read: miss, fetches from object store and populates cache.
-        let first = ts.get_pack_range(pack_id, 0, data.len() as u32).await.unwrap();
+        let first = ts
+            .get_pack_range(pack_id, 0, data.len() as u32)
+            .await
+            .unwrap();
         assert_eq!(first, data);
         assert_eq!(cache.entry_count().await, 1);
 
@@ -2009,7 +2012,10 @@ mod blob_cache_tests {
         let path = PathResolver::new(Path::from(ROOT)).pack_object_path(&pack_id);
         os.delete(&path).await.unwrap();
 
-        let second = ts.get_pack_range(pack_id, 0, data.len() as u32).await.unwrap();
+        let second = ts
+            .get_pack_range(pack_id, 0, data.len() as u32)
+            .await
+            .unwrap();
         assert_eq!(second, data);
     }
 
@@ -2023,9 +2029,13 @@ mod blob_cache_tests {
         ts.put_pack(pack_id, data.clone()).await.unwrap();
 
         // Miss
-        ts.get_pack_range(pack_id, 0, data.len() as u32).await.unwrap();
+        ts.get_pack_range(pack_id, 0, data.len() as u32)
+            .await
+            .unwrap();
         // Hit
-        ts.get_pack_range(pack_id, 0, data.len() as u32).await.unwrap();
+        ts.get_pack_range(pack_id, 0, data.len() as u32)
+            .await
+            .unwrap();
 
         // Check via direct cache entry count (metrics counters are opaque via trait objects)
         assert_eq!(cache.entry_count().await, 1);
@@ -2041,9 +2051,16 @@ mod blob_cache_tests {
         ts.put_pack(pack_id, data.clone()).await.unwrap();
 
         // uncached read — should NOT populate cache
-        let result = ts.get_pack_range_uncached(pack_id, 0, data.len() as u32).await.unwrap();
+        let result = ts
+            .get_pack_range_uncached(pack_id, 0, data.len() as u32)
+            .await
+            .unwrap();
         assert_eq!(result, data);
-        assert_eq!(cache.entry_count().await, 0, "uncached read must not populate blob cache");
+        assert_eq!(
+            cache.entry_count().await,
+            0,
+            "uncached read must not populate blob cache"
+        );
     }
 
     #[tokio::test]
@@ -2061,7 +2078,10 @@ mod blob_cache_tests {
         let data = Bytes::from_static(b"no cache path");
         ts.put_pack(pack_id, data.clone()).await.unwrap();
 
-        let result = ts.get_pack_range(pack_id, 0, data.len() as u32).await.unwrap();
+        let result = ts
+            .get_pack_range(pack_id, 0, data.len() as u32)
+            .await
+            .unwrap();
         assert_eq!(result, data);
     }
 

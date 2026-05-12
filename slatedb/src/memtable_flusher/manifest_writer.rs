@@ -503,6 +503,13 @@ impl ManifestWriterHandler {
                     };
                     tree.l0.push_front(view);
                 }
+                // Register packed blob files in the same manifest update as
+                // the SSTs that reference them: by construction the packs
+                // are already durable in object storage, so on crash
+                // recovery either both land or neither does.
+                for pack in &uploaded.pack_files {
+                    core.pack_files.insert(pack.pack_id, pack.clone());
+                }
                 core.replay_after_wal_id = uploaded.imm_memtable.recent_flushed_wal_id();
 
                 let memtable_tick = uploaded.imm_memtable.table().last_tick();
@@ -1482,6 +1489,7 @@ mod tests {
         UploadedMemtable {
             imm_memtable,
             segments,
+            pack_files: Vec::new(),
             first_seq,
             last_seq,
         }

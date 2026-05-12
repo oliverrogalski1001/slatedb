@@ -33,6 +33,8 @@ pub use fail_parallel;
 pub use object_store;
 
 pub use batch::WriteBatch;
+#[cfg(feature = "moka")]
+pub use blob_cache::stats as blob_cache_stats;
 pub use cached_object_store::stats as cached_object_store_stats;
 pub use checkpoint::{Checkpoint, CheckpointCreateResult};
 #[cfg(feature = "compaction_filters")]
@@ -46,8 +48,6 @@ pub use config::{Settings, SstBlockSize};
 pub use db::{Db, DbBuilder, DbReaderBuilder, DbStatus, WriteHandle};
 pub use db_cache::stats as db_cache_stats;
 pub use db_cache_manager::CacheTarget;
-#[cfg(feature = "moka")]
-pub use blob_cache::stats as blob_cache_stats;
 pub use db_iter::DbIterator;
 pub use db_reader::DbReader;
 pub use db_snapshot::DbSnapshot;

@@ -13,7 +13,7 @@
 
 use super::tracker::TrackerMessage;
 use crate::db::DbInner;
-use crate::db_state::{SsTableHandle, SsTableId};
+use crate::db_state::{PackFile, SsTableHandle, SsTableId};
 use crate::db_status::ClosedResultWriter;
 use crate::dispatcher::{MessageHandler, MessageHandlerExecutor};
 use crate::error::SlateDBError;
@@ -75,6 +75,12 @@ pub(crate) struct UploadedMemtable {
     /// Per-segment uploaded SSTs, sorted ascending by `prefix`. May be
     /// empty when retention pruned every entry in the memtable.
     pub(crate) segments: Vec<SegmentedSstHandle>,
+    /// Packed blob files written during this flush. Already durable in
+    /// object storage by the time `build_imm_ssts` returns, so the
+    /// `BlobRef`s embedded in the segment SSTs are safe to publish. The
+    /// manifest writer registers these into `core.pack_files` in the same
+    /// atomic update as the SSTs.
+    pub(crate) pack_files: Vec<PackFile>,
     /// Lowest sequence number present in the immutable memtable.
     pub(crate) first_seq: u64,
     /// Highest sequence number present in the immutable memtable.
@@ -96,6 +102,7 @@ impl UploadedMemtable {
                 prefix: Bytes::new(),
                 sst_handle,
             }],
+            pack_files: Vec::new(),
             first_seq,
             last_seq,
         }
@@ -182,6 +189,9 @@ impl UploadHandler {
         // Build once, retry only the upload. `write_sst` takes
         // `&EncodedSsTable`, so the encoded SSTs stay alive for retries —
         // no need to rebuild from the memtable on transient upload errors.
+        // `build_imm_ssts` also durably uploads any packed blob files this
+        // flush produced, so the `BlobRef`s already embedded in each SST
+        // are guaranteed to resolve once the SST itself becomes durable.
         let built = self.db.build_imm_ssts(job.imm_memtable.table()).await?;
         let first_seq = job
             .imm_memtable
@@ -201,6 +211,7 @@ impl UploadHandler {
         // internally and they are not visible here for explicit cleanup.
         let segments = futures::future::try_join_all(
             built
+                .ssts
                 .iter()
                 .map(|sst| self.upload_segment_sst(&job.imm_memtable, sst)),
         )
@@ -209,6 +220,7 @@ impl UploadHandler {
         Ok(UploadedMemtable {
             imm_memtable: Arc::clone(&job.imm_memtable),
             segments,
+            pack_files: built.pack_files,
             first_seq,
             last_seq,
         })

@@ -175,25 +175,9 @@ table ManifestV2 {
     // compaction can decrement `live_bytes` as refs are dropped and emit OrphanPack
     // entries when a pack reaches zero live bytes.
     pack_files: [PackFile];
-}
 
-// Pack ids awaiting deletion after compaction dropped the last BlobRef pointing into them.
-// orphaned_at_manifest_id is the manifest id at which the pack transitioned to orphan
-// (used by GC to enforce checkpoint protection).
-table OrphanPack {
-    pack_id: Ulid (required);
-    orphaned_at_manifest_id: ulong;
-}
-
-// Metadata for a packed blob object. Created at flush time and tracked until all of its
-// BlobRefs are dropped, at which point the pack is moved to orphan_packs and removed from here.
-table PackFile {
-    pack_id: Ulid (required);
-    // Total bytes uploaded to object storage for this pack.
-    total_bytes: ulong;
-    // Bytes still referenced by live BlobRef rows. Decremented as compaction drops refs.
-    // When this reaches 0, the pack is appended to orphan_packs.
-    live_bytes: ulong;
+    // URI of the WAL object store. None for dbs that use the main object store for the WAL.
+    wal_object_store_uri: string;
 }
 
 // Per-segment LSM state. Structurally mirrors the top-level `l0` / `compacted` /

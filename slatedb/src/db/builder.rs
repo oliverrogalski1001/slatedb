@@ -117,6 +117,8 @@ use tokio::runtime::Handle;
 use crate::admin::Admin;
 use crate::batch_write::WriteBatchEventHandler;
 use crate::batch_write::WRITE_BATCH_TASK_NAME;
+#[cfg(feature = "moka")]
+use crate::blob_cache::BlobCache;
 use crate::cached_object_store::CachedObjectStore;
 #[cfg(feature = "compaction_filters")]
 use crate::compaction_filter::CompactionFilterSupplier;
@@ -132,8 +134,6 @@ use crate::config::CompactorOptions;
 use crate::config::DbReaderOptions;
 use crate::config::GarbageCollectorOptions;
 use crate::config::{BlobOptions, Settings, SstBlockSize};
-#[cfg(feature = "moka")]
-use crate::blob_cache::BlobCache;
 use crate::db::Db;
 use crate::db::DbInner;
 use crate::db_cache::SplitCache;

@@ -716,6 +716,22 @@ impl VersionedManifest {
         self.manifest.core.wal_object_store_uri.as_deref()
     }
 
+    /// Returns the orphan-pack list — pack files that have lost all live
+    /// `BlobRef`s and are awaiting GC. Each entry's
+    /// `orphaned_at_manifest_id` records the manifest version at which the
+    /// pack transitioned to orphan, so blob GC can gate deletion on
+    /// checkpoint protection.
+    pub fn orphan_packs(&self) -> &Vec<OrphanPack> {
+        &self.manifest.core.orphan_packs
+    }
+
+    /// Returns the live pack-file table — every pack that has at least one
+    /// `BlobRef` row in the active SSTs, keyed by pack id with byte
+    /// accounting (`total_bytes`, `live_bytes`).
+    pub fn pack_files(&self) -> &HashMap<ulid::Ulid, PackFile> {
+        &self.manifest.core.pack_files
+    }
+
     pub(crate) fn core(&self) -> &ManifestCore {
         &self.manifest.core
     }

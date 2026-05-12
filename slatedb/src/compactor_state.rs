@@ -1912,6 +1912,158 @@ mod tests {
         assert_eq!(state.compactions.value.iter_active().count(), 0);
     }
 
+    /// Seed `state.manifest.value.core.pack_files` with an entry whose
+    /// `live_bytes == total_bytes`. Returned ulid is used by callers to
+    /// construct the `retention_dropped_pack_bytes` map.
+    fn seed_pack(state: &mut CompactorState, total_bytes: u64) -> Ulid {
+        let pack_id = Ulid::new();
+        state.manifest.value.core.pack_files.insert(
+            pack_id,
+            crate::db_state::PackFile {
+                pack_id,
+                total_bytes,
+                live_bytes: total_bytes,
+            },
+        );
+        pack_id
+    }
+
+    /// Build an L0 compaction off the current state and register it. Returns
+    /// `(compaction_id, output_sr)` ready to feed into `finish_compaction`.
+    /// Reusing the existing L0s as sources keeps these tests scoped to pack
+    /// accounting — the L0 → SR mechanics are covered by other tests.
+    fn build_and_register_l0_compaction(
+        state: &mut CompactorState,
+        system_clock: &Arc<dyn SystemClock>,
+        rand: &Arc<DbRand>,
+    ) -> (Ulid, SortedRun) {
+        let before = state.db_state().clone();
+        let compaction_id = rand.rng().gen_ulid(system_clock.as_ref());
+        let spec = build_l0_compaction(&before.tree.l0, 0);
+        state
+            .add_compaction(Compaction::new(compaction_id, spec))
+            .expect("failed to add compaction");
+        let output_sr = SortedRun {
+            id: 0,
+            sst_views: before.tree.l0.iter().cloned().collect(),
+        };
+        (compaction_id, output_sr)
+    }
+
+    #[test]
+    fn test_finish_compaction_decrements_live_bytes_without_orphaning() {
+        // Dropping some bytes from a pack but not all of them: the pack
+        // stays in `pack_files` with reduced `live_bytes`, and `orphan_packs`
+        // is untouched.
+        let rt = build_runtime();
+        let (_, _, mut state, system_clock, rand) = build_test_state(rt.handle());
+        let pack_id = seed_pack(&mut state, 1000);
+
+        let (compaction_id, output_sr) =
+            build_and_register_l0_compaction(&mut state, &system_clock, &rand);
+        let mut drops = HashMap::new();
+        drops.insert(pack_id, 400u64);
+        state.finish_compaction(compaction_id, output_sr, drops);
+
+        let pack = state
+            .db_state()
+            .pack_files
+            .get(&pack_id)
+            .expect("pack must remain live while live_bytes > 0");
+        assert_eq!(pack.total_bytes, 1000);
+        assert_eq!(pack.live_bytes, 600);
+        assert!(state.db_state().orphan_packs.is_empty());
+    }
+
+    #[test]
+    fn test_finish_compaction_orphans_pack_when_live_bytes_reach_zero() {
+        // Dropping the last live byte transitions the pack from
+        // `pack_files` → `orphan_packs`. The orphan record carries
+        // `orphaned_at_manifest_id = self.manifest.id.next()` because the
+        // commit it ships in is the *next* manifest version.
+        let rt = build_runtime();
+        let (_, _, mut state, system_clock, rand) = build_test_state(rt.handle());
+        let pack_id = seed_pack(&mut state, 1000);
+        let expected_orphan_manifest_id: u64 = state.manifest.id.next().into();
+
+        let (compaction_id, output_sr) =
+            build_and_register_l0_compaction(&mut state, &system_clock, &rand);
+        let mut drops = HashMap::new();
+        drops.insert(pack_id, 1000u64);
+        state.finish_compaction(compaction_id, output_sr, drops);
+
+        assert!(
+            !state.db_state().pack_files.contains_key(&pack_id),
+            "pack must move out of pack_files when fully drained"
+        );
+        let orphans = &state.db_state().orphan_packs;
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].pack_id, pack_id);
+        assert_eq!(
+            orphans[0].orphaned_at_manifest_id,
+            expected_orphan_manifest_id
+        );
+    }
+
+    #[test]
+    fn test_finish_compaction_orphans_only_fully_drained_packs() {
+        // Mixed batch: one pack drained to zero, another only partially.
+        // Only the fully-drained pack becomes an orphan; the partial one
+        // stays in `pack_files` with the residual `live_bytes`.
+        let rt = build_runtime();
+        let (_, _, mut state, system_clock, rand) = build_test_state(rt.handle());
+        let drained = seed_pack(&mut state, 500);
+        let surviving = seed_pack(&mut state, 300);
+        let expected_orphan_manifest_id: u64 = state.manifest.id.next().into();
+
+        let (compaction_id, output_sr) =
+            build_and_register_l0_compaction(&mut state, &system_clock, &rand);
+        let mut drops = HashMap::new();
+        drops.insert(drained, 500u64);
+        drops.insert(surviving, 100u64);
+        state.finish_compaction(compaction_id, output_sr, drops);
+
+        assert!(!state.db_state().pack_files.contains_key(&drained));
+        let surviving_pack = state
+            .db_state()
+            .pack_files
+            .get(&surviving)
+            .expect("partially-drained pack must remain live");
+        assert_eq!(surviving_pack.live_bytes, 200);
+
+        let orphans = &state.db_state().orphan_packs;
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].pack_id, drained);
+        assert_eq!(
+            orphans[0].orphaned_at_manifest_id,
+            expected_orphan_manifest_id
+        );
+    }
+
+    #[test]
+    fn test_finish_compaction_with_no_pack_drops_is_noop_on_packs() {
+        // The retention iterator yields an empty map when nothing got
+        // dropped past the retention boundary. `finish_compaction` must
+        // not invent orphans or perturb live byte counts in that case —
+        // important because every legacy compaction test passes an empty
+        // HashMap and would otherwise observe spurious mutations.
+        let rt = build_runtime();
+        let (_, _, mut state, system_clock, rand) = build_test_state(rt.handle());
+        let pack_id = seed_pack(&mut state, 1000);
+
+        let (compaction_id, output_sr) =
+            build_and_register_l0_compaction(&mut state, &system_clock, &rand);
+        state.finish_compaction(compaction_id, output_sr, HashMap::new());
+
+        let pack = state
+            .db_state()
+            .pack_files
+            .get(&pack_id)
+            .expect("pack must remain live");
+        assert_eq!(pack.live_bytes, 1000);
+        assert!(state.db_state().orphan_packs.is_empty());
+    }
+
     fn build_db(os: Arc<dyn ObjectStore>, tokio_handle: &Handle) -> Db {
         let opts = Settings {
             l0_sst_size_bytes: 256,

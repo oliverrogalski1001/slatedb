@@ -16,9 +16,7 @@ pub(crate) struct BlobCache {
 impl BlobCache {
     pub(crate) fn new(max_capacity_bytes: u64, recorder: &MetricsRecorderHelper) -> Self {
         let inner = moka::future::Cache::builder()
-            .weigher(|_key: &BlobRef, value: &Bytes| {
-                u32::try_from(value.len()).unwrap_or(u32::MAX)
-            })
+            .weigher(|_key: &BlobRef, value: &Bytes| u32::try_from(value.len()).unwrap_or(u32::MAX))
             .max_capacity(max_capacity_bytes)
             .build();
         Self {

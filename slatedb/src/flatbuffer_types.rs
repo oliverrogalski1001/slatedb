@@ -37,10 +37,15 @@ use crate::flatbuffer_types::root_generated::{
     CompactedSsTableArgs, CompactedSsTableV2, CompactedSsTableV2Args, CompactedSsTableView,
     CompactedSsTableViewArgs, Compaction as FbCompaction, CompactionArgs as FbCompactionArgs,
     CompactionSpec as FbCompactionSpec, CompactionStatus as FbCompactionStatus, CompactionsV1,
-    CompactionsV1Args, CompressionFormat, ManifestV1Args, Segment as FbSegment,
-    SegmentArgs as FbSegmentArgs, SortedRun as FbSortedRunV1, SortedRunArgs as FbSortedRunV1Args,
-    SortedRunV2, SortedRunV2Args, SstType as FbSstType, TieredCompactionSpec,
-    TieredCompactionSpecArgs, Ulid as FbUlid, UlidArgs as FbUlidArgs, Uuid, UuidArgs,
+    CompactionsV1Args, CompressionFormat, OrphanPack as FbOrphanPack,
+    OrphanPackArgs as FbOrphanPackArgs, PackFile as FbPackFile, PackFileArgs as FbPackFileArgs,
+    Segment as FbSegment, SegmentArgs as FbSegmentArgs, SortedRunV2, SortedRunV2Args,
+    SstType as FbSstType, TieredCompactionSpec, TieredCompactionSpecArgs, Ulid as FbUlid,
+    UlidArgs as FbUlidArgs, Uuid, UuidArgs,
+};
+#[cfg(test)]
+use crate::flatbuffer_types::root_generated::{
+    ManifestV1Args, SortedRun as FbSortedRunV1, SortedRunArgs as FbSortedRunV1Args,
 };
 use crate::format::sst::SST_FORMAT_VERSION;
 use crate::manifest::{ExternalDb, LsmTreeState, Manifest, ManifestCore, Segment};
@@ -158,7 +163,7 @@ pub(crate) struct FlatBufferManifestCodec {}
 
 impl ObjectCodec<Manifest> for FlatBufferManifestCodec {
     fn encode(&self, manifest: &Manifest) -> Bytes {
-        Self::create_from_manifest_v1(manifest)
+        Self::create_from_manifest(manifest)
     }
 
     fn decode(&self, bytes: &Bytes) -> Result<Manifest, Box<dyn std::error::Error + Send + Sync>> {
@@ -425,10 +430,37 @@ impl FlatBufferManifestCodec {
                     .collect()
             })
             .unwrap_or_default();
-        // TODO: re-derive orphan_packs and pack_files from flatbuffer once the
-        // schema is regenerated to expose OrphanPack/PackFile types.
-        let orphan_packs: Vec<OrphanPack> = Vec::new();
-        let pack_files: HashMap<Ulid, PackFile> = HashMap::new();
+        let orphan_packs: Vec<OrphanPack> = manifest
+            .orphan_packs()
+            .map(|packs| {
+                packs
+                    .iter()
+                    .map(|p| OrphanPack {
+                        pack_id: p.pack_id().ulid(),
+                        orphaned_at_manifest_id: p.orphaned_at_manifest_id(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let pack_files: HashMap<Ulid, PackFile> = manifest
+            .pack_files()
+            .map(|packs| {
+                packs
+                    .iter()
+                    .map(|p| {
+                        let pack_id = p.pack_id().ulid();
+                        (
+                            pack_id,
+                            PackFile {
+                                pack_id,
+                                total_bytes: p.total_bytes(),
+                                live_bytes: p.live_bytes(),
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let core = ManifestCore {
             initialized: manifest.initialized(),
             tree,
@@ -439,7 +471,7 @@ impl FlatBufferManifestCodec {
             last_l0_seq: manifest.last_l0_seq(),
             last_l0_clock_tick: manifest.last_l0_clock_tick(),
             checkpoints,
-            wal_object_store_uri: None,
+            wal_object_store_uri: manifest.wal_object_store_uri().map(|s| s.to_string()),
             recent_snapshot_min_seq: manifest.recent_snapshot_min_seq(),
             sequence_tracker,
             orphan_packs,
@@ -513,13 +545,13 @@ impl FlatBufferManifestCodec {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn create_from_manifest_v1(manifest: &Manifest) -> Bytes {
         let builder = FlatBufferBuilder::new();
         let mut db_fb_builder = DbFlatBufferBuilder::new(builder);
         db_fb_builder.create_manifest_v1(manifest)
     }
 
-    #[allow(unused)]
     pub(crate) fn create_from_manifest(manifest: &Manifest) -> Bytes {
         let builder = FlatBufferBuilder::new();
         let mut db_fb_builder = DbFlatBufferBuilder::new(builder);
@@ -734,9 +766,52 @@ impl<'b> DbFlatBufferBuilder<'b> {
         self.builder.create_vector(ulids.as_ref())
     }
 
-    // TODO: re-enable orphan_packs / pack_files serialization once the
-    // FlatBuffer schema is regenerated (flatc 24.3.25) to expose
-    // FbOrphanPack / FbPackFile from schemas/manifest.fbs.
+    /// Serialize `core.orphan_packs` as a flatbuffer vector. Order is
+    /// preserved to match the in-memory append-on-orphan ordering.
+    fn add_orphan_packs(
+        &mut self,
+        orphan_packs: &[OrphanPack],
+    ) -> WIPOffset<Vector<'b, ForwardsUOffset<FbOrphanPack<'b>>>> {
+        let offsets: Vec<WIPOffset<FbOrphanPack>> = orphan_packs
+            .iter()
+            .map(|p| {
+                let pack_id = self.add_ulid(&p.pack_id);
+                FbOrphanPack::create(
+                    &mut self.builder,
+                    &FbOrphanPackArgs {
+                        pack_id: Some(pack_id),
+                        orphaned_at_manifest_id: p.orphaned_at_manifest_id,
+                    },
+                )
+            })
+            .collect();
+        self.builder.create_vector(offsets.as_ref())
+    }
+
+    /// Serialize `core.pack_files` as a flatbuffer vector. The in-memory
+    /// map is unordered; sort by pack id for stable, comparable encodings.
+    fn add_pack_files(
+        &mut self,
+        pack_files: &HashMap<Ulid, PackFile>,
+    ) -> WIPOffset<Vector<'b, ForwardsUOffset<FbPackFile<'b>>>> {
+        let mut entries: Vec<&PackFile> = pack_files.values().collect();
+        entries.sort_by_key(|p| p.pack_id);
+        let offsets: Vec<WIPOffset<FbPackFile>> = entries
+            .into_iter()
+            .map(|p| {
+                let pack_id = self.add_ulid(&p.pack_id);
+                FbPackFile::create(
+                    &mut self.builder,
+                    &FbPackFileArgs {
+                        pack_id: Some(pack_id),
+                        total_bytes: p.total_bytes,
+                        live_bytes: p.live_bytes,
+                    },
+                )
+            })
+            .collect();
+        self.builder.create_vector(offsets.as_ref())
+    }
 
     fn add_compacted_sst(&mut self, handle: &SsTableHandle) -> WIPOffset<CompactedSsTable<'b>> {
         let ulid = match handle.id {
@@ -770,6 +845,7 @@ impl<'b> DbFlatBufferBuilder<'b> {
         self.builder.create_vector(compacted_ssts.as_ref())
     }
 
+    #[cfg(test)]
     fn add_compacted_sst_from_view(
         &mut self,
         view: &SsTableView,
@@ -917,6 +993,7 @@ impl<'b> DbFlatBufferBuilder<'b> {
         self.builder.create_vector(segment_offsets.as_ref())
     }
 
+    #[cfg(test)]
     fn add_sorted_run_v1(
         &mut self,
         sorted_run: &db_state::SortedRun,
@@ -936,6 +1013,7 @@ impl<'b> DbFlatBufferBuilder<'b> {
         )
     }
 
+    #[cfg(test)]
     fn add_sorted_runs_v1(
         &mut self,
         sorted_runs: &[db_state::SortedRun],
@@ -1147,8 +1225,20 @@ impl<'b> DbFlatBufferBuilder<'b> {
         let sequence_tracker_data = core.sequence_tracker.to_bytes();
         let sequence_tracker = self.builder.create_vector(sequence_tracker_data.as_slice());
 
-        // TODO: serialize core.orphan_packs / core.pack_files once the schema
-        // has been regenerated with FbOrphanPack / FbPackFile types.
+        let orphan_packs = if core.orphan_packs.is_empty() {
+            None
+        } else {
+            Some(self.add_orphan_packs(&core.orphan_packs))
+        };
+        let pack_files = if core.pack_files.is_empty() {
+            None
+        } else {
+            Some(self.add_pack_files(&core.pack_files))
+        };
+        let wal_object_store_uri = core
+            .wal_object_store_uri
+            .as_ref()
+            .map(|uri| self.builder.create_string(uri));
 
         let manifest = ManifestV2::create(
             &mut self.builder,
@@ -1171,6 +1261,9 @@ impl<'b> DbFlatBufferBuilder<'b> {
                 sequence_tracker: Some(sequence_tracker),
                 segments: Some(segments),
                 segment_extractor_name,
+                orphan_packs,
+                pack_files,
+                wal_object_store_uri,
             },
         );
         self.builder.finish(manifest, None);
@@ -1180,6 +1273,7 @@ impl<'b> DbFlatBufferBuilder<'b> {
         bytes.into()
     }
 
+    #[cfg(test)]
     fn create_manifest_v1(&mut self, manifest: &Manifest) -> Bytes {
         let core = &manifest.core;
 
@@ -1573,10 +1667,14 @@ mod tests {
         let v1_bytes = bytes.freeze();
         codec.decode(&v1_bytes).expect("Should decode V1 manifest");
 
-        // Test encode/decode round-trip (currently writes V1 for forward compatibility)
+        // Encode/decode round-trip writes V2 so packed-blob `pack_files` and
+        // `orphan_packs` survive serialization. V1 has no fields for those.
         let manifest = Manifest::initial(ManifestCore::new());
         let encoded = codec.encode(&manifest);
-        assert_eq!(u16::from_be_bytes([encoded[0], encoded[1]]), 1);
+        assert_eq!(
+            u16::from_be_bytes([encoded[0], encoded[1]]),
+            MANIFEST_FORMAT_VERSION
+        );
         codec
             .decode(&encoded)
             .expect("Should decode manifest round-trip");
@@ -1618,7 +1716,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_not_encode_wal_object_store_uri_in_v2() {
+    fn test_should_encode_decode_wal_object_store_uri_in_v2() {
         let mut manifest = Manifest::initial(ManifestCore::new());
         manifest.core.wal_object_store_uri = Some("s3://bucket/path".to_string());
 
@@ -1630,10 +1728,7 @@ mod tests {
             u16::from_be_bytes([bytes[0], bytes[1]]),
             MANIFEST_FORMAT_VERSION
         );
-
-        let mut expected = manifest.clone();
-        expected.core.wal_object_store_uri = None;
-        assert_eq!(expected, decoded);
+        assert_eq!(manifest, decoded);
     }
 
     #[test]

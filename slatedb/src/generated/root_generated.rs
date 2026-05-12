@@ -3503,6 +3503,253 @@ impl core::fmt::Debug for ManifestV1<'_> {
       ds.finish()
   }
 }
+pub enum OrphanPackOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct OrphanPack<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for OrphanPack<'a> {
+  type Inner = OrphanPack<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: flatbuffers::Table::new(buf, loc) }
+  }
+}
+
+impl<'a> OrphanPack<'a> {
+  pub const VT_PACK_ID: flatbuffers::VOffsetT = 4;
+  pub const VT_ORPHANED_AT_MANIFEST_ID: flatbuffers::VOffsetT = 6;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+    OrphanPack { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: flatbuffers::Allocator + 'bldr>(
+    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr, A>,
+    args: &'args OrphanPackArgs<'args>
+  ) -> flatbuffers::WIPOffset<OrphanPack<'bldr>> {
+    let mut builder = OrphanPackBuilder::new(_fbb);
+    builder.add_orphaned_at_manifest_id(args.orphaned_at_manifest_id);
+    if let Some(x) = args.pack_id { builder.add_pack_id(x); }
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn pack_id(&self) -> Ulid<'a> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<Ulid>>(OrphanPack::VT_PACK_ID, None).unwrap()}
+  }
+  #[inline]
+  pub fn orphaned_at_manifest_id(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(OrphanPack::VT_ORPHANED_AT_MANIFEST_ID, Some(0)).unwrap()}
+  }
+}
+
+impl flatbuffers::Verifiable for OrphanPack<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.visit_table(pos)?
+     .visit_field::<flatbuffers::ForwardsUOffset<Ulid>>("pack_id", Self::VT_PACK_ID, true)?
+     .visit_field::<u64>("orphaned_at_manifest_id", Self::VT_ORPHANED_AT_MANIFEST_ID, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct OrphanPackArgs<'a> {
+    pub pack_id: Option<flatbuffers::WIPOffset<Ulid<'a>>>,
+    pub orphaned_at_manifest_id: u64,
+}
+impl<'a> Default for OrphanPackArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    OrphanPackArgs {
+      pack_id: None, // required field
+      orphaned_at_manifest_id: 0,
+    }
+  }
+}
+
+pub struct OrphanPackBuilder<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a, A>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> OrphanPackBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_pack_id(&mut self, pack_id: flatbuffers::WIPOffset<Ulid<'b >>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<Ulid>>(OrphanPack::VT_PACK_ID, pack_id);
+  }
+  #[inline]
+  pub fn add_orphaned_at_manifest_id(&mut self, orphaned_at_manifest_id: u64) {
+    self.fbb_.push_slot::<u64>(OrphanPack::VT_ORPHANED_AT_MANIFEST_ID, orphaned_at_manifest_id, 0);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> OrphanPackBuilder<'a, 'b, A> {
+    let start = _fbb.start_table();
+    OrphanPackBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<OrphanPack<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    self.fbb_.required(o, OrphanPack::VT_PACK_ID,"pack_id");
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl core::fmt::Debug for OrphanPack<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut ds = f.debug_struct("OrphanPack");
+      ds.field("pack_id", &self.pack_id());
+      ds.field("orphaned_at_manifest_id", &self.orphaned_at_manifest_id());
+      ds.finish()
+  }
+}
+pub enum PackFileOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct PackFile<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for PackFile<'a> {
+  type Inner = PackFile<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: flatbuffers::Table::new(buf, loc) }
+  }
+}
+
+impl<'a> PackFile<'a> {
+  pub const VT_PACK_ID: flatbuffers::VOffsetT = 4;
+  pub const VT_TOTAL_BYTES: flatbuffers::VOffsetT = 6;
+  pub const VT_LIVE_BYTES: flatbuffers::VOffsetT = 8;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+    PackFile { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: flatbuffers::Allocator + 'bldr>(
+    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr, A>,
+    args: &'args PackFileArgs<'args>
+  ) -> flatbuffers::WIPOffset<PackFile<'bldr>> {
+    let mut builder = PackFileBuilder::new(_fbb);
+    builder.add_live_bytes(args.live_bytes);
+    builder.add_total_bytes(args.total_bytes);
+    if let Some(x) = args.pack_id { builder.add_pack_id(x); }
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn pack_id(&self) -> Ulid<'a> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<Ulid>>(PackFile::VT_PACK_ID, None).unwrap()}
+  }
+  #[inline]
+  pub fn total_bytes(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(PackFile::VT_TOTAL_BYTES, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn live_bytes(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(PackFile::VT_LIVE_BYTES, Some(0)).unwrap()}
+  }
+}
+
+impl flatbuffers::Verifiable for PackFile<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.visit_table(pos)?
+     .visit_field::<flatbuffers::ForwardsUOffset<Ulid>>("pack_id", Self::VT_PACK_ID, true)?
+     .visit_field::<u64>("total_bytes", Self::VT_TOTAL_BYTES, false)?
+     .visit_field::<u64>("live_bytes", Self::VT_LIVE_BYTES, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct PackFileArgs<'a> {
+    pub pack_id: Option<flatbuffers::WIPOffset<Ulid<'a>>>,
+    pub total_bytes: u64,
+    pub live_bytes: u64,
+}
+impl<'a> Default for PackFileArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    PackFileArgs {
+      pack_id: None, // required field
+      total_bytes: 0,
+      live_bytes: 0,
+    }
+  }
+}
+
+pub struct PackFileBuilder<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a, A>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> PackFileBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_pack_id(&mut self, pack_id: flatbuffers::WIPOffset<Ulid<'b >>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<Ulid>>(PackFile::VT_PACK_ID, pack_id);
+  }
+  #[inline]
+  pub fn add_total_bytes(&mut self, total_bytes: u64) {
+    self.fbb_.push_slot::<u64>(PackFile::VT_TOTAL_BYTES, total_bytes, 0);
+  }
+  #[inline]
+  pub fn add_live_bytes(&mut self, live_bytes: u64) {
+    self.fbb_.push_slot::<u64>(PackFile::VT_LIVE_BYTES, live_bytes, 0);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> PackFileBuilder<'a, 'b, A> {
+    let start = _fbb.start_table();
+    PackFileBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<PackFile<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    self.fbb_.required(o, PackFile::VT_PACK_ID,"pack_id");
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl core::fmt::Debug for PackFile<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut ds = f.debug_struct("PackFile");
+      ds.field("pack_id", &self.pack_id());
+      ds.field("total_bytes", &self.total_bytes());
+      ds.field("live_bytes", &self.live_bytes());
+      ds.finish()
+  }
+}
 pub enum ManifestV2Offset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -3537,6 +3784,9 @@ impl<'a> ManifestV2<'a> {
   pub const VT_SEQUENCE_TRACKER: flatbuffers::VOffsetT = 34;
   pub const VT_SEGMENTS: flatbuffers::VOffsetT = 36;
   pub const VT_SEGMENT_EXTRACTOR_NAME: flatbuffers::VOffsetT = 38;
+  pub const VT_ORPHAN_PACKS: flatbuffers::VOffsetT = 40;
+  pub const VT_PACK_FILES: flatbuffers::VOffsetT = 42;
+  pub const VT_WAL_OBJECT_STORE_URI: flatbuffers::VOffsetT = 44;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -3556,6 +3806,9 @@ impl<'a> ManifestV2<'a> {
     builder.add_compactor_epoch(args.compactor_epoch);
     builder.add_writer_epoch(args.writer_epoch);
     builder.add_manifest_id(args.manifest_id);
+    if let Some(x) = args.wal_object_store_uri { builder.add_wal_object_store_uri(x); }
+    if let Some(x) = args.pack_files { builder.add_pack_files(x); }
+    if let Some(x) = args.orphan_packs { builder.add_orphan_packs(x); }
     if let Some(x) = args.segment_extractor_name { builder.add_segment_extractor_name(x); }
     if let Some(x) = args.segments { builder.add_segments(x); }
     if let Some(x) = args.sequence_tracker { builder.add_sequence_tracker(x); }
@@ -3696,6 +3949,27 @@ impl<'a> ManifestV2<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(ManifestV2::VT_SEGMENT_EXTRACTOR_NAME, None)}
   }
+  #[inline]
+  pub fn orphan_packs(&self) -> Option<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<OrphanPack<'a>>>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<OrphanPack>>>>(ManifestV2::VT_ORPHAN_PACKS, None)}
+  }
+  #[inline]
+  pub fn pack_files(&self) -> Option<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<PackFile<'a>>>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<PackFile>>>>(ManifestV2::VT_PACK_FILES, None)}
+  }
+  #[inline]
+  pub fn wal_object_store_uri(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(ManifestV2::VT_WAL_OBJECT_STORE_URI, None)}
+  }
 }
 
 impl flatbuffers::Verifiable for ManifestV2<'_> {
@@ -3723,6 +3997,9 @@ impl flatbuffers::Verifiable for ManifestV2<'_> {
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>("sequence_tracker", Self::VT_SEQUENCE_TRACKER, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<Segment>>>>("segments", Self::VT_SEGMENTS, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<&str>>("segment_extractor_name", Self::VT_SEGMENT_EXTRACTOR_NAME, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<OrphanPack>>>>("orphan_packs", Self::VT_ORPHAN_PACKS, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<PackFile>>>>("pack_files", Self::VT_PACK_FILES, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("wal_object_store_uri", Self::VT_WAL_OBJECT_STORE_URI, false)?
      .finish();
     Ok(())
   }
@@ -3746,6 +4023,9 @@ pub struct ManifestV2Args<'a> {
     pub sequence_tracker: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
     pub segments: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<Segment<'a>>>>>,
     pub segment_extractor_name: Option<flatbuffers::WIPOffset<&'a str>>,
+    pub orphan_packs: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<OrphanPack<'a>>>>>,
+    pub pack_files: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<PackFile<'a>>>>>,
+    pub wal_object_store_uri: Option<flatbuffers::WIPOffset<&'a str>>,
 }
 impl<'a> Default for ManifestV2Args<'a> {
   #[inline]
@@ -3769,6 +4049,9 @@ impl<'a> Default for ManifestV2Args<'a> {
       sequence_tracker: None,
       segments: None,
       segment_extractor_name: None,
+      orphan_packs: None,
+      pack_files: None,
+      wal_object_store_uri: None,
     }
   }
 }
@@ -3851,6 +4134,18 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> ManifestV2Builder<'a, 'b, A> {
     self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ManifestV2::VT_SEGMENT_EXTRACTOR_NAME, segment_extractor_name);
   }
   #[inline]
+  pub fn add_orphan_packs(&mut self, orphan_packs: flatbuffers::WIPOffset<flatbuffers::Vector<'b , flatbuffers::ForwardsUOffset<OrphanPack<'b >>>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ManifestV2::VT_ORPHAN_PACKS, orphan_packs);
+  }
+  #[inline]
+  pub fn add_pack_files(&mut self, pack_files: flatbuffers::WIPOffset<flatbuffers::Vector<'b , flatbuffers::ForwardsUOffset<PackFile<'b >>>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ManifestV2::VT_PACK_FILES, pack_files);
+  }
+  #[inline]
+  pub fn add_wal_object_store_uri(&mut self, wal_object_store_uri: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ManifestV2::VT_WAL_OBJECT_STORE_URI, wal_object_store_uri);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> ManifestV2Builder<'a, 'b, A> {
     let start = _fbb.start_table();
     ManifestV2Builder {
@@ -3890,6 +4185,9 @@ impl core::fmt::Debug for ManifestV2<'_> {
       ds.field("sequence_tracker", &self.sequence_tracker());
       ds.field("segments", &self.segments());
       ds.field("segment_extractor_name", &self.segment_extractor_name());
+      ds.field("orphan_packs", &self.orphan_packs());
+      ds.field("pack_files", &self.pack_files());
+      ds.field("wal_object_store_uri", &self.wal_object_store_uri());
       ds.finish()
   }
 }

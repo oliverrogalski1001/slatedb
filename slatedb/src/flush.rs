@@ -1,6 +1,7 @@
+use crate::config::BlobOptions;
 use crate::db::DbInner;
 use crate::db_state;
-use crate::db_state::SsTableHandle;
+use crate::db_state::{PackFile, SsTableHandle};
 use crate::error::SlateDBError;
 use crate::format::sst::EncodedSsTable;
 use crate::iter::RowEntryIterator;
@@ -11,8 +12,12 @@ use crate::prefix_extractor::PrefixTarget;
 use crate::reader::DbStateReader;
 use crate::retention_iterator::RetentionIterator;
 use crate::sst_builder::EncodedSsTableBuilder;
-use bytes::Bytes;
+use crate::types::{BlobRef, RowEntry, ValueDeletable};
+use crate::utils::IdGenerator;
+use bytes::{Bytes, BytesMut};
+use futures::stream::{self, TryStreamExt};
 use std::sync::Arc;
+use ulid::Ulid;
 
 /// One encoded-but-not-yet-uploaded SST from a memtable flush, tagged with
 /// the segment it belongs to (RFC-0024). Mirrors the shape of post-upload
@@ -22,65 +27,84 @@ pub(crate) struct EncodedSegmentSst {
     pub(crate) encoded: EncodedSsTable,
 }
 
-impl DbInner {
-    /// Build a single SST from an immutable memtable, ignoring any segment
-    /// extractor. Returns `None` when the post-retention iterator yields
-    /// zero entries — callers that want a real blob (e.g. the WAL fence)
-    /// should construct one explicitly rather than relying on this path.
-    /// For L0 flushes use [`Self::build_imm_ssts`] instead, which routes
-    /// entries through segment-aware builders.
-    async fn build_imm_sst(
-        &self,
-        imm_table: Arc<KVTable>,
-    ) -> Result<Option<EncodedSsTable>, SlateDBError> {
-        let mut sst_builder = self.table_store.table_builder();
-        let mut iter = self.iter_imm_table(imm_table).await?;
-        let mut any = false;
-        while let Some(entry) = iter.next().await? {
-            sst_builder.add(entry).await?;
-            any = true;
-        }
-        if !any {
-            return Ok(None);
-        }
-        Ok(Some(sst_builder.build().await?))
-    }
+/// Output of building one immutable memtable: the per-segment encoded SSTs
+/// (with externalized values already rewritten to `BlobRef`s) and the pack
+/// files that back them. Packs are uploaded inside `build_imm_ssts` so the
+/// pack data is durable before any SST upload begins; the caller is
+/// responsible for registering `pack_files` into the manifest alongside the
+/// uploaded SSTs.
+pub(crate) struct BuiltMemtable {
+    pub(crate) ssts: Vec<EncodedSegmentSst>,
+    pub(crate) pack_files: Vec<PackFile>,
+}
 
+impl DbInner {
     /// Build one or more L0 SSTs from a single immutable memtable, grouping
-    /// entries by the segment prefix derived from the configured extractor.
+    /// entries by the segment prefix derived from the configured extractor,
+    /// and externalize large values into packed blob files (RFC: packed blob
+    /// files). Pack uploads complete before this function returns, so the
+    /// returned `EncodedSegmentSst`s already carry `BlobRef`s whose backing
+    /// packs are durable in object storage.
     ///
-    /// Returns one `(prefix, EncodedSsTable)` per segment that received at
-    /// least one post-retention entry, sorted ascending by `prefix`. The
-    /// memtable iterator yields keys in sorted order and segments own
-    /// disjoint key intervals, so all entries for a given prefix arrive
-    /// consecutively — the implementation streams one open builder at a
-    /// time, finalizing on prefix transitions.
+    /// Returns one `EncodedSegmentSst` per segment that received at least
+    /// one post-retention entry, sorted ascending by `prefix`, plus the
+    /// `PackFile` records that the caller must register into the manifest
+    /// alongside the uploaded SSTs. The memtable iterator yields keys in
+    /// sorted order and segments own disjoint key intervals, so all entries
+    /// for a given prefix arrive consecutively — the implementation streams
+    /// one open builder at a time, finalizing on prefix transitions.
     ///
     /// When no extractor is configured, every entry routes to the empty
-    /// prefix and the result is at most one entry. If retention prunes
-    /// every entry the result is an empty Vec in both the extractor and
+    /// prefix and the SSTs Vec contains at most one entry. If retention
+    /// prunes every entry the SSTs Vec is empty in both the extractor and
     /// no-extractor cases — per-memtable progress in the manifest
     /// (`last_l0_seq`, `replay_after_wal_id`) advances independently of
-    /// whether any SST landed.
+    /// whether any SST landed. `pack_files` is empty when no externalized
+    /// value was encountered (either because `blob_options` is disabled or
+    /// no value met `min_value_size`).
     pub(crate) async fn build_imm_ssts(
         &self,
         imm_table: Arc<KVTable>,
+    ) -> Result<BuiltMemtable, SlateDBError> {
+        let mut pack_assembler = PackAssembler::new(self);
+        let ssts = self
+            .build_imm_ssts_inner(imm_table, &mut pack_assembler)
+            .await?;
+        let pack_files = pack_assembler.upload_all().await?;
+        Ok(BuiltMemtable { ssts, pack_files })
+    }
+
+    /// Inner loop for [`Self::build_imm_ssts`]. Streams post-retention
+    /// entries through `pack_assembler` (which rewrites large `Value` rows
+    /// to `BlobRef`s) and then into segment-aware SST builders. Splitting
+    /// the upload-all step out of this function keeps the pack-assembly
+    /// borrow on `self` from outliving the encoded SSTs.
+    async fn build_imm_ssts_inner(
+        &self,
+        imm_table: Arc<KVTable>,
+        pack_assembler: &mut PackAssembler<'_>,
     ) -> Result<Vec<EncodedSegmentSst>, SlateDBError> {
         let Some(extractor) = self.segment_extractor.as_ref() else {
-            return Ok(self
-                .build_imm_sst(imm_table)
-                .await?
-                .into_iter()
-                .map(|encoded| EncodedSegmentSst {
-                    prefix: Bytes::new(),
-                    encoded,
-                })
-                .collect());
+            let mut sst_builder = self.table_store.table_builder();
+            let mut iter = self.iter_imm_table(imm_table).await?;
+            let mut any = false;
+            while let Some(mut entry) = iter.next().await? {
+                pack_assembler.maybe_externalize(&mut entry);
+                sst_builder.add(entry).await?;
+                any = true;
+            }
+            if !any {
+                return Ok(Vec::new());
+            }
+            return Ok(vec![EncodedSegmentSst {
+                prefix: Bytes::new(),
+                encoded: sst_builder.build().await?,
+            }]);
         };
         let mut iter = self.iter_imm_table(imm_table).await?;
         let mut out: Vec<EncodedSegmentSst> = Vec::new();
         let mut current: Option<(Bytes, EncodedSsTableBuilder<'_>)> = None;
-        while let Some(entry) = iter.next().await? {
+        while let Some(mut entry) = iter.next().await? {
             let n = extractor
                 .prefix_len(&PrefixTarget::Point(entry.key.clone()))
                 .expect("extractor returned None for a key already in the memtable");
@@ -95,6 +119,7 @@ impl DbInner {
                 }
                 current = Some((prefix, self.table_store.table_builder()));
             }
+            pack_assembler.maybe_externalize(&mut entry);
             let (_, builder) = current.as_mut().expect("set on first iteration");
             builder.add(entry).await?;
         }
@@ -160,10 +185,9 @@ impl DbInner {
         imm_table: Arc<KVTable>,
         write_cache: bool,
     ) -> Result<Vec<SsTableHandle>, SlateDBError> {
-        use crate::utils::IdGenerator;
         let built = self.build_imm_ssts(imm_table.clone()).await?;
-        let mut handles = Vec::with_capacity(built.len());
-        for sst in built {
+        let mut handles = Vec::with_capacity(built.ssts.len());
+        for sst in built.ssts {
             let id = db_state::SsTableId::Compacted(
                 self.rand.rng().gen_ulid(self.system_clock.as_ref()),
             );
@@ -228,13 +252,118 @@ impl DbInner {
         iter.init().await?;
         Ok(iter)
     }
+}
 
+/// Externalizes large `Value` entries by packing them into shared object
+/// files. Walks the post-retention entry stream in order, accumulating each
+/// large value into the trailing pack buffer; a new pack opens whenever
+/// appending the next value would push the active buffer past
+/// `target_pack_size_bytes`. A single value larger than the target still
+/// lands in its own pack. Each externalized entry's `Value` is rewritten in
+/// place to a `BlobRef(pack_id, offset, length)` that points into one of
+/// the packs assembled here.
+struct PackAssembler<'a> {
+    db: &'a DbInner,
+    /// `None` when `blob_options` is unset; `maybe_externalize` becomes a
+    /// no-op and `upload_all` yields an empty Vec.
+    blob_options: Option<&'a BlobOptions>,
+    pack_buffers: Vec<BytesMut>,
+    pack_ids: Vec<Ulid>,
+}
+
+impl<'a> PackAssembler<'a> {
+    fn new(db: &'a DbInner) -> Self {
+        Self {
+            db,
+            blob_options: db.settings.blob_options.as_ref(),
+            pack_buffers: Vec::new(),
+            pack_ids: Vec::new(),
+        }
+    }
+
+    /// If `entry`'s value qualifies for externalization, append its bytes
+    /// to the currently-open pack buffer (opening a new pack first if
+    /// adding the value would exceed `target_pack_size_bytes`) and rewrite
+    /// `entry.value` to a `BlobRef`. Tombstones, merges, existing
+    /// `BlobRef`s, and small values are left untouched.
+    fn maybe_externalize(&mut self, entry: &mut RowEntry) {
+        let Some(opts) = self.blob_options else {
+            return;
+        };
+        let value = match &entry.value {
+            ValueDeletable::Value(v) if v.len() >= opts.min_value_size => v.clone(),
+            _ => return,
+        };
+        let target_pack_size = opts.target_pack_size_bytes.max(1);
+        let need_new_pack = self
+            .pack_buffers
+            .last()
+            .map(|buf| buf.len() + value.len() > target_pack_size)
+            .unwrap_or(true);
+        if need_new_pack {
+            self.pack_buffers.push(BytesMut::new());
+            self.pack_ids
+                .push(self.db.rand.rng().gen_ulid(self.db.system_clock.as_ref()));
+        }
+        let pack_idx = self.pack_buffers.len() - 1;
+        let offset =
+            u32::try_from(self.pack_buffers[pack_idx].len()).expect("pack offset overflows u32");
+        let length = u32::try_from(value.len()).expect("blob value size overflows u32");
+        self.pack_buffers[pack_idx].extend_from_slice(&value);
+        let pack_id = self.pack_ids[pack_idx];
+        entry.value = ValueDeletable::BlobRef(BlobRef::new(pack_id, offset, length));
+    }
+
+    /// Upload every assembled pack concurrently and return the matching
+    /// `PackFile` records. `live_bytes` is initialized to `total_bytes`
+    /// because every byte is backed by exactly one freshly-stamped
+    /// `BlobRef` in the SSTs being built. Concurrency is bounded by
+    /// `blob_options.flush_concurrency`.
+    async fn upload_all(self) -> Result<Vec<PackFile>, SlateDBError> {
+        if self.pack_buffers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let opts = self
+            .blob_options
+            .expect("non-empty pack_buffers implies blob_options is set");
+        let concurrency = opts.flush_concurrency.max(1);
+
+        let pack_files: Vec<PackFile> = self
+            .pack_ids
+            .iter()
+            .zip(self.pack_buffers.iter())
+            .map(|(id, buf)| {
+                let total_bytes = buf.len() as u64;
+                PackFile {
+                    pack_id: *id,
+                    total_bytes,
+                    live_bytes: total_bytes,
+                }
+            })
+            .collect();
+
+        let table_store = Arc::clone(&self.db.table_store);
+        let uploads = self
+            .pack_ids
+            .into_iter()
+            .zip(self.pack_buffers.into_iter().map(BytesMut::freeze))
+            .map(move |(id, data)| {
+                let table_store = Arc::clone(&table_store);
+                Ok::<_, SlateDBError>(async move { table_store.put_pack(id, data).await })
+            });
+
+        let mut upload_stream = std::pin::pin!(stream::iter(uploads).try_buffered(concurrency));
+        while upload_stream.try_next().await?.is_some() {}
+
+        Ok(pack_files)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::BuiltMemtable;
     use crate::block_iterator::BlockIteratorLatest;
-    use crate::config::Settings;
+    use crate::config::{BlobOptions, Settings};
     use crate::db::Db;
     use crate::db_state::{SsTableHandle, SsTableId};
     use crate::error::SlateDBError;
@@ -246,7 +375,7 @@ mod tests {
     use crate::test_utils::{
         lookup_merge_operator_operands, FixedThreeBytePrefixExtractor, StringConcatMergeOperator,
     };
-    use crate::types::{RowEntry, ValueDeletable};
+    use crate::types::{BlobRef, RowEntry, ValueDeletable};
     use bytes::Bytes;
     use rstest::rstest;
     use slatedb_common::metrics::test_recorder_helper;
@@ -267,8 +396,8 @@ mod tests {
 
     async fn setup_test_db_with_settings(set_merge_operator: bool, settings: Settings) -> Db {
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let builder = Db::builder("/tmp/test_flush_unsegmented_sst", object_store)
-            .with_settings(settings);
+        let builder =
+            Db::builder("/tmp/test_flush_unsegmented_sst", object_store).with_settings(settings);
         let builder = if set_merge_operator {
             builder.with_merge_operator(Arc::new(StringConcatMergeOperator))
         } else {
@@ -726,14 +855,14 @@ mod tests {
         table.put(RowEntry::new_value(b"k1", b"v1", 1));
         table.put(RowEntry::new_value(b"k2", b"v2", 2));
 
-        let ssts = db
+        let built = db
             .inner
             .build_imm_ssts(table.table().clone())
             .await
             .unwrap();
 
-        assert_eq!(ssts.len(), 1);
-        assert!(ssts[0].prefix.is_empty());
+        assert_eq!(built.ssts.len(), 1);
+        assert!(built.ssts[0].prefix.is_empty());
         db.close().await.unwrap();
     }
 
@@ -750,13 +879,13 @@ mod tests {
         db.inner.oracle.advance_durable_seq(u64::MAX);
         let table = WritableKVTable::new();
 
-        let ssts = db
+        let built = db
             .inner
             .build_imm_ssts(table.table().clone())
             .await
             .unwrap();
 
-        assert!(ssts.is_empty());
+        assert!(built.ssts.is_empty());
         db.close().await.unwrap();
     }
 
@@ -769,13 +898,13 @@ mod tests {
         db.inner.oracle.advance_durable_seq(u64::MAX);
         let table = WritableKVTable::new();
 
-        let ssts = db
+        let built = db
             .inner
             .build_imm_ssts(table.table().clone())
             .await
             .unwrap();
 
-        assert!(ssts.is_empty());
+        assert!(built.ssts.is_empty());
         db.close().await.unwrap();
     }
 
@@ -795,13 +924,13 @@ mod tests {
         table.put(RowEntry::new_value(b"ccc-1", b"v4", 4));
         table.put(RowEntry::new_value(b"ccc-2", b"v5", 5));
 
-        let ssts = db
+        let built = db
             .inner
             .build_imm_ssts(table.table().clone())
             .await
             .unwrap();
 
-        let prefixes: Vec<&[u8]> = ssts.iter().map(|s| s.prefix.as_ref()).collect();
+        let prefixes: Vec<&[u8]> = built.ssts.iter().map(|s| s.prefix.as_ref()).collect();
         assert_eq!(prefixes, vec![&b"aaa"[..], &b"bbb"[..], &b"ccc"[..]]);
 
         // Upload each SST and verify it carries exactly its prefix's entries.
@@ -836,7 +965,7 @@ mod tests {
                 ),
             ],
         ];
-        for (sst, entries) in ssts.into_iter().zip(expected.into_iter()) {
+        for (sst, entries) in built.ssts.into_iter().zip(expected.into_iter()) {
             let id = SsTableId::Compacted(Ulid::new());
             let handle = db
                 .inner
@@ -860,15 +989,293 @@ mod tests {
         table.put(RowEntry::new_value(b"aaa-1", b"v1", 1));
         table.put(RowEntry::new_value(b"aaa-2", b"v2", 2));
 
-        let ssts = db
+        let built = db
             .inner
             .build_imm_ssts(table.table().clone())
             .await
             .unwrap();
 
-        assert_eq!(ssts.len(), 1);
-        assert_eq!(ssts[0].prefix.as_ref(), b"aaa");
+        assert_eq!(built.ssts.len(), 1);
+        assert_eq!(built.ssts[0].prefix.as_ref(), b"aaa");
         db.close().await.unwrap();
     }
 
+    async fn setup_test_db_with_blob_options(blob_options: BlobOptions) -> Db {
+        let settings = Settings {
+            blob_options: Some(blob_options),
+            ..Settings::default()
+        };
+        // Snapshots/transactions otherwise block retention from passing the
+        // memtable contents through unchanged in tests; advance durable seq
+        // happens explicitly per-test.
+        setup_test_db_with_settings(false, settings).await
+    }
+
+    /// Collect the entries in the first SST handle returned by uploading the
+    /// first segment of `built`. Only used by the pack-assembly tests, which
+    /// always produce at most one segment.
+    async fn build_and_upload_single_sst(
+        db: &Db,
+        table: &WritableKVTable,
+    ) -> (BuiltMemtable, Option<SsTableHandle>) {
+        let built = db
+            .inner
+            .build_imm_ssts(table.table().clone())
+            .await
+            .unwrap();
+        let handle = match built.ssts.first() {
+            Some(sst) => {
+                let id = SsTableId::Compacted(Ulid::new());
+                Some(
+                    db.inner
+                        .upload_sst(&id, table.table().clone(), &sst.encoded, false)
+                        .await
+                        .unwrap(),
+                )
+            }
+            None => None,
+        };
+        (built, handle)
+    }
+
+    /// Verify a pack file matches the expected bytes via a full-range GET
+    /// against the table store. Catches both wrong content and wrong
+    /// total_bytes accounting in `PackFile`.
+    async fn assert_pack_contents(db: &Db, pack_id: Ulid, expected: &[u8]) {
+        let fetched = db
+            .inner
+            .table_store
+            .get_pack_range(pack_id, 0, expected.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(fetched.as_ref(), expected);
+    }
+
+    #[tokio::test]
+    async fn pack_assembler_externalizes_only_large_values() {
+        // min_value_size=8 forces the boundary between inline (Value) and
+        // externalized (BlobRef) values: anything <8 bytes must stay inline,
+        // anything >=8 bytes must externalize.
+        let db = setup_test_db_with_blob_options(BlobOptions {
+            min_value_size: 8,
+            ..BlobOptions::default()
+        })
+        .await;
+        db.inner.oracle.advance_durable_seq(u64::MAX);
+
+        let small_a: &[u8] = b"abc";
+        let small_b: &[u8] = b"de";
+        let large_a: &[u8] = b"0123456789ABCDEF";
+        let large_b: &[u8] = b"GHIJKLMNOPQRSTUV";
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"k1", small_a, 1));
+        table.put(RowEntry::new_value(b"k2", large_a, 2));
+        table.put(RowEntry::new_value(b"k3", small_b, 3));
+        table.put(RowEntry::new_value(b"k4", large_b, 4));
+
+        let (built, handle) = build_and_upload_single_sst(&db, &table).await;
+        let handle = handle.expect("expected one SST from non-empty flush");
+
+        // Exactly one pack — total externalized bytes (32) fit in the
+        // default target_pack_size_bytes (64 MiB).
+        assert_eq!(built.pack_files.len(), 1);
+        let pack = &built.pack_files[0];
+        assert_eq!(pack.total_bytes, (large_a.len() + large_b.len()) as u64);
+        assert_eq!(pack.live_bytes, pack.total_bytes);
+
+        let entries = read_sst_entries(&db, &handle).await;
+        // Sorted ascending by key — k1, k2, k3, k4.
+        assert_eq!(entries[0].2, ValueDeletable::Value(Bytes::from(small_a)));
+        assert_eq!(entries[2].2, ValueDeletable::Value(Bytes::from(small_b)));
+        let ValueDeletable::BlobRef(ref br_a) = entries[1].2 else {
+            panic!("k2 expected BlobRef, got {:?}", entries[1].2);
+        };
+        let ValueDeletable::BlobRef(ref br_b) = entries[3].2 else {
+            panic!("k4 expected BlobRef, got {:?}", entries[3].2);
+        };
+        assert_eq!(br_a.pack_id, pack.pack_id);
+        assert_eq!(br_b.pack_id, pack.pack_id);
+        assert_eq!(br_a.length, large_a.len() as u32);
+        assert_eq!(br_b.length, large_b.len() as u32);
+        // The retention iterator yields keys in sorted order, so large_a is
+        // packed first (offset=0) and large_b follows immediately after.
+        assert_eq!(br_a.offset, 0);
+        assert_eq!(br_b.offset, large_a.len() as u32);
+
+        let mut expected_pack = Vec::new();
+        expected_pack.extend_from_slice(large_a);
+        expected_pack.extend_from_slice(large_b);
+        assert_pack_contents(&db, pack.pack_id, &expected_pack).await;
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pack_assembler_splits_pack_at_target_size() {
+        // target_pack_size_bytes=20 with three 10-byte values:
+        //   buf=10  → add 10 → 20 (== target, not > target) fits.
+        //   buf=20  → add 10 → 30  > 20 → seal, open new pack.
+        // Expected: 2 packs, the first holding two values (20 bytes), the
+        // second holding the trailing value (10 bytes).
+        let db = setup_test_db_with_blob_options(BlobOptions {
+            min_value_size: 4,
+            target_pack_size_bytes: 20,
+            ..BlobOptions::default()
+        })
+        .await;
+        db.inner.oracle.advance_durable_seq(u64::MAX);
+
+        let v1 = b"v1_aaaaaa".to_vec();
+        let v1 = {
+            let mut v = v1;
+            v.push(b'!');
+            v
+        }; // 10 bytes
+        let v2 = b"v2_bbbbbbb!".as_slice()[..10].to_vec(); // 10 bytes
+        let v3 = b"v3_ccccccc!".as_slice()[..10].to_vec(); // 10 bytes
+        assert_eq!(v1.len(), 10);
+        assert_eq!(v2.len(), 10);
+        assert_eq!(v3.len(), 10);
+
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"k1", &v1, 1));
+        table.put(RowEntry::new_value(b"k2", &v2, 2));
+        table.put(RowEntry::new_value(b"k3", &v3, 3));
+
+        let (built, handle) = build_and_upload_single_sst(&db, &table).await;
+        let handle = handle.expect("expected one SST");
+
+        assert_eq!(built.pack_files.len(), 2);
+        let pack1 = &built.pack_files[0];
+        let pack2 = &built.pack_files[1];
+        assert_eq!(pack1.total_bytes, 20);
+        assert_eq!(pack1.live_bytes, 20);
+        assert_eq!(pack2.total_bytes, 10);
+        assert_eq!(pack2.live_bytes, 10);
+
+        let entries = read_sst_entries(&db, &handle).await;
+        let refs: Vec<&BlobRef> = entries
+            .iter()
+            .map(|(_, _, v)| match v {
+                ValueDeletable::BlobRef(br) => br,
+                other => panic!("expected BlobRef, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(refs[0].pack_id, pack1.pack_id);
+        assert_eq!(refs[0].offset, 0);
+        assert_eq!(refs[1].pack_id, pack1.pack_id);
+        assert_eq!(refs[1].offset, 10);
+        assert_eq!(refs[2].pack_id, pack2.pack_id);
+        assert_eq!(refs[2].offset, 0);
+
+        let mut pack1_expected = Vec::new();
+        pack1_expected.extend_from_slice(&v1);
+        pack1_expected.extend_from_slice(&v2);
+        assert_pack_contents(&db, pack1.pack_id, &pack1_expected).await;
+        assert_pack_contents(&db, pack2.pack_id, &v3).await;
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pack_assembler_oversized_value_gets_own_pack() {
+        // A single value larger than `target_pack_size_bytes` still gets
+        // externalized — the seal condition only opens a new pack, it never
+        // refuses to store a value. The pack ends up larger than the
+        // target, which is the expected behavior per the doc on
+        // `BlobOptions::target_pack_size_bytes`.
+        let db = setup_test_db_with_blob_options(BlobOptions {
+            min_value_size: 4,
+            target_pack_size_bytes: 10,
+            ..BlobOptions::default()
+        })
+        .await;
+        db.inner.oracle.advance_durable_seq(u64::MAX);
+
+        let big = vec![0xABu8; 64];
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"k", &big, 1));
+
+        let (built, handle) = build_and_upload_single_sst(&db, &table).await;
+        let handle = handle.expect("expected one SST");
+
+        assert_eq!(built.pack_files.len(), 1);
+        let pack = &built.pack_files[0];
+        assert_eq!(pack.total_bytes, big.len() as u64);
+        assert_eq!(pack.live_bytes, big.len() as u64);
+
+        let entries = read_sst_entries(&db, &handle).await;
+        let ValueDeletable::BlobRef(ref br) = entries[0].2 else {
+            panic!("expected BlobRef, got {:?}", entries[0].2);
+        };
+        assert_eq!(br.pack_id, pack.pack_id);
+        assert_eq!(br.offset, 0);
+        assert_eq!(br.length, big.len() as u32);
+
+        assert_pack_contents(&db, pack.pack_id, &big).await;
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pack_assembler_disabled_when_blob_options_unset() {
+        // No `blob_options` in Settings → `PackAssembler::maybe_externalize`
+        // is a no-op, values stay inline, and no packs are uploaded.
+        let db = setup_test_db_without_merge_operator().await;
+        db.inner.oracle.advance_durable_seq(u64::MAX);
+
+        let big = vec![0xCDu8; 128];
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_value(b"k", &big, 1));
+
+        let (built, handle) = build_and_upload_single_sst(&db, &table).await;
+        let handle = handle.expect("expected one SST");
+
+        assert!(built.pack_files.is_empty());
+        let entries = read_sst_entries(&db, &handle).await;
+        assert_eq!(entries[0].2, ValueDeletable::Value(Bytes::from(big)));
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pack_assembler_does_not_externalize_merges_or_tombstones() {
+        // Only `ValueDeletable::Value` payloads count toward externalization.
+        // A merge operand or tombstone — even one larger than
+        // `min_value_size` — must pass through untouched and contribute
+        // nothing to packs.
+        let settings = Settings {
+            blob_options: Some(BlobOptions {
+                min_value_size: 4,
+                ..BlobOptions::default()
+            }),
+            ..Settings::default()
+        };
+        let db = setup_test_db_with_settings(true, settings).await;
+        db.inner.oracle.advance_durable_seq(u64::MAX);
+
+        let big_merge = vec![0x11u8; 32];
+        let table = WritableKVTable::new();
+        table.put(RowEntry::new_merge(b"k_merge", &big_merge, 1));
+        table.put(RowEntry::new_tombstone(b"k_tomb", 2));
+
+        let built = db
+            .inner
+            .build_imm_ssts(table.table().clone())
+            .await
+            .unwrap();
+        assert!(built.pack_files.is_empty());
+
+        let id = SsTableId::Compacted(Ulid::new());
+        let handle = db
+            .inner
+            .upload_sst(&id, table.table().clone(), &built.ssts[0].encoded, false)
+            .await
+            .unwrap();
+        let entries = read_sst_entries(&db, &handle).await;
+        assert_eq!(entries[0].2, ValueDeletable::Merge(Bytes::from(big_merge)));
+        assert_eq!(entries[1].2, ValueDeletable::Tombstone);
+
+        db.close().await.unwrap();
+    }
 }
