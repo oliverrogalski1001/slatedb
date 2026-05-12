@@ -21,6 +21,7 @@ use slatedb::admin;
 use slatedb::compaction_execute_bench::CompactionExecuteBench;
 use slatedb::config::WriteOptions;
 use slatedb::Db;
+use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
@@ -120,36 +121,56 @@ async fn exec_benchmark_blob_db(
 ) {
     let (mut config, memory_cache) = args.db_args.config().unwrap();
 
-    if args.blob_threshold > 0 {
+    if args.kv_sep {
         config.blob_options = Some(slatedb::config::BlobOptions {
             min_value_size: args.blob_threshold,
             ..Default::default()
         });
     }
 
+    let workload = args.workload_pattern();
     let write_options = slatedb::config::WriteOptions {
         await_durable: false,
+        ..Default::default()
     };
 
-    let mut builder = Db::builder(path.clone(), object_store.clone()).with_settings(config);
+    // Wire a default metrics recorder so the bencher can read counters like
+    // USER_WRITE_BYTES / WAL_FLUSH_BYTES for write-amp computation.
+    let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
+
+    let mut builder = Db::builder(path.clone(), object_store.clone())
+        .with_settings(config)
+        .with_metrics_recorder(metrics_recorder.clone());
     if let Some(cache) = memory_cache {
         builder = builder.with_db_cache(cache);
     }
 
     let db = Arc::new(builder.build().await.unwrap());
+    // Insert and Overwrite are count-bounded; everything else is time-bounded.
+    // Insert stops when each task finishes its chunk of the keyspace.
+    // Overwrite stops after `key_count` total puts across all tasks.
+    let (duration, num_rows) = match workload {
+        blob_db::WorkloadPattern::Insert => (None, None),
+        blob_db::WorkloadPattern::Overwrite => (None, Some(args.key_count)),
+        _ => (
+            Some(std::time::Duration::from_secs(args.duration as u64)),
+            None,
+        ),
+    };
     let bench = BlobDbBench::new(
-        args.key_gen_supplier(),
-        args.workload_pattern(),
-        args.value_distribution(),
+        workload,
+        args.val_size_bytes,
         write_options,
         args.concurrency,
-        None,
-        Some(std::time::Duration::from_secs(args.duration as u64)),
+        args.key_len,
+        args.key_count,
+        num_rows,
+        duration,
         args.scan_width,
+        args.kv_sep,
         args.blob_threshold,
         db.clone(),
-        object_store,
-        path,
+        metrics_recorder,
     );
 
     let result = bench.run().await;

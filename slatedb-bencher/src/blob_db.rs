@@ -5,8 +5,8 @@
 //! **stdout** with all result fields; tracing/logging goes to stderr.
 //!
 //! ## Primary metrics
-//! - **Write amplification**: bytes physically present in object storage at
-//!   the end of the run ÷ bytes written by the application.
+//! - **Write amplification**: bytes written on the WAL/L0/compaction paths ÷
+//!   bytes written by the application.
 //! - Write/read throughput (ops/s and MiB/s)
 //! - p50/p99 put and get latency (µs)
 //!
@@ -21,37 +21,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures::TryStreamExt;
 use hdrhistogram::Histogram;
-use object_store::path::Path;
-use object_store::ObjectStore;
 use rand::{Rng, RngCore, SeedableRng};
 use rand_xorshift::XorShiftRng;
 use serde::Serialize;
+use slatedb::compactor::stats::BYTES_COMPACTED;
 use slatedb::config::{PutOptions, WriteOptions};
+use slatedb::db_stats::{BLOB_FLUSH_BYTES, L0_FLUSH_BYTES, USER_WRITE_BYTES, WAL_FLUSH_BYTES};
 use slatedb::Db;
-use slatedb::DbRead as _;
+use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-use crate::db::KeyGenerator;
+use crate::db::{KeyGenerator, RangeKeyGenerator};
 use crate::stats::{StatsRecorder, WindowStats};
 
 const STAT_DUMP_INTERVAL: Duration = Duration::from_secs(10);
 const STAT_DUMP_LOOKBACK: Duration = Duration::from_secs(60);
 const REPORT_INTERVAL: Duration = Duration::from_millis(100);
 
-pub const DEFAULT_SCAN_WIDTH: usize = 100;
-pub const SMALL_VALUE_BYTES: usize = 512;
-pub const LARGE_VALUE_BYTES: usize = 5 * 1024 * 1024;
-
-/// Cumulative probability thresholds for the `Mixed` distribution:
-/// 50% small (512 B), 25% medium (16 KiB), 25% large (5 MiB).
-const MIXED_SIZES: &[(usize, u32)] = &[
-    (SMALL_VALUE_BYTES, 50),
-    (16 * 1024, 75),
-    (LARGE_VALUE_BYTES, 100),
-];
+pub const DEFAULT_SCAN_WIDTH: usize = 10;
 
 const MAX_LATENCY_US: u64 = 10_000_000;
 
@@ -61,61 +50,41 @@ const MAX_LATENCY_US: u64 = 10_000_000;
 
 #[derive(Clone, Debug)]
 pub enum WorkloadPattern {
-    WriteHeavy,
-    ReadHeavy,
+    /// 100% puts walking `[0, key_count)` once, partitioned across tasks.
+    /// Used to populate a fresh DB; untimed.
+    Insert,
+    /// 100% puts overwriting random existing keys; timed.
+    Overwrite,
+    /// 50% puts (overwrites) + 50% point gets — "point lookup/write mix".
     UpdateHeavy,
+    /// 5% puts (overwrites) + 95% range scans — "range scan/write mix".
+    RangeMix,
+    /// 100% point gets.
+    PointLookup,
+    /// 100% range scans.
     RangeScan,
 }
 
 impl WorkloadPattern {
     fn put_percentage(&self) -> u32 {
         match self {
-            WorkloadPattern::WriteHeavy => 95,
-            WorkloadPattern::ReadHeavy => 5,
+            WorkloadPattern::Insert => 100,
+            WorkloadPattern::Overwrite => 100,
             WorkloadPattern::UpdateHeavy => 50,
-            WorkloadPattern::RangeScan => 5,
+            WorkloadPattern::RangeMix => 5,
+            WorkloadPattern::PointLookup => 0,
+            WorkloadPattern::RangeScan => 0,
         }
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            WorkloadPattern::WriteHeavy => "write_heavy",
-            WorkloadPattern::ReadHeavy => "read_heavy",
+            WorkloadPattern::Insert => "insert",
+            WorkloadPattern::Overwrite => "overwrite",
             WorkloadPattern::UpdateHeavy => "update_heavy",
+            WorkloadPattern::RangeMix => "range_mix",
+            WorkloadPattern::PointLookup => "point_lookup",
             WorkloadPattern::RangeScan => "range_scan",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum ValueDistribution {
-    Small,
-    Large,
-    Mixed,
-}
-
-impl ValueDistribution {
-    fn value_len(&self, rng: &mut XorShiftRng) -> usize {
-        match self {
-            ValueDistribution::Small => SMALL_VALUE_BYTES,
-            ValueDistribution::Large => LARGE_VALUE_BYTES,
-            ValueDistribution::Mixed => {
-                let roll: u32 = rng.random_range(0..100);
-                for &(size, threshold) in MIXED_SIZES {
-                    if roll < threshold {
-                        return size;
-                    }
-                }
-                LARGE_VALUE_BYTES
-            }
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ValueDistribution::Small => "small",
-            ValueDistribution::Large => "large",
-            ValueDistribution::Mixed => "mixed",
         }
     }
 }
@@ -127,7 +96,7 @@ impl ValueDistribution {
 #[derive(Debug, Serialize)]
 pub struct BlobDbResult {
     pub workload: String,
-    pub val_dist: String,
+    pub val_size_bytes: usize,
     pub blob_enabled: bool,
     pub blob_threshold: usize,
     pub elapsed_secs: f64,
@@ -135,7 +104,11 @@ pub struct BlobDbResult {
     pub total_gets: u64,
     pub total_scans: u64,
     pub total_puts_bytes: u64,
-    pub s3_bytes_written: u64,
+    pub user_write_bytes: u64,
+    pub wal_flush_bytes: u64,
+    pub l0_flush_bytes: u64,
+    pub blob_flush_bytes: u64,
+    pub bytes_compacted: u64,
     pub write_amp: f64,
     pub write_ops_per_sec: f64,
     pub write_mibps: f64,
@@ -152,69 +125,107 @@ pub struct BlobDbResult {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct BlobDbBench {
-    key_gen_supplier: Box<dyn Fn() -> Box<dyn KeyGenerator>>,
     workload: WorkloadPattern,
-    val_dist: ValueDistribution,
+    val_size_bytes: usize,
     write_options: WriteOptions,
     concurrency: u32,
+    key_len: usize,
+    key_count: u64,
     num_rows: Option<u64>,
     duration: Option<Duration>,
     scan_width: usize,
+    kv_sep: bool,
     blob_threshold: usize,
     db: Arc<Db>,
-    object_store: Arc<dyn ObjectStore>,
-    db_path: Path,
+    metrics_recorder: Arc<DefaultMetricsRecorder>,
 }
 
 impl BlobDbBench {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        key_gen_supplier: Box<dyn Fn() -> Box<dyn KeyGenerator>>,
         workload: WorkloadPattern,
-        val_dist: ValueDistribution,
+        val_size_bytes: usize,
         write_options: WriteOptions,
         concurrency: u32,
+        key_len: usize,
+        key_count: u64,
         num_rows: Option<u64>,
         duration: Option<Duration>,
         scan_width: usize,
+        kv_sep: bool,
         blob_threshold: usize,
         db: Arc<Db>,
-        object_store: Arc<dyn ObjectStore>,
-        db_path: Path,
+        metrics_recorder: Arc<DefaultMetricsRecorder>,
     ) -> Self {
         Self {
-            key_gen_supplier,
             workload,
-            val_dist,
+            val_size_bytes,
             write_options,
             concurrency,
+            key_len,
+            key_count,
             num_rows,
             duration,
             scan_width,
+            kv_sep,
             blob_threshold,
             db,
-            object_store,
-            db_path,
+            metrics_recorder,
+        }
+    }
+
+    /// Compute disjoint, contiguous chunks of `[0, key_count)` for the load
+    /// phase. Each of `concurrency` tasks gets one chunk; the last absorbs the
+    /// remainder so the union is exact.
+    fn insert_chunks(&self) -> Vec<Range<u64>> {
+        let concurrency = self.concurrency.max(1) as u64;
+        let base = self.key_count / concurrency;
+        let rem = self.key_count % concurrency;
+        let mut chunks = Vec::with_capacity(concurrency as usize);
+        let mut cursor: u64 = 0;
+        for i in 0..concurrency {
+            let extra = if i < rem { 1 } else { 0 };
+            let end = cursor + base + extra;
+            chunks.push(cursor..end);
+            cursor = end;
+        }
+        chunks
+    }
+
+    /// Build a per-task key generator. Insert mode partitions the keyspace
+    /// across tasks; all other workloads sample uniformly from `[0, key_count)`.
+    fn build_generator(&self, task_idx: usize, chunks: &[Range<u64>]) -> Box<dyn KeyGenerator> {
+        match self.workload {
+            WorkloadPattern::Insert => {
+                Box::new(RangeKeyGenerator::insert(self.key_len, chunks[task_idx].clone()))
+            }
+            _ => Box::new(RangeKeyGenerator::sample(self.key_len, self.key_count)),
         }
     }
 
     pub async fn run(&self) -> BlobDbResult {
-        let app_bytes_written = Arc::new(AtomicU64::new(0));
         let stats_recorder = Arc::new(BlobDbStatsRecorder::new());
         let bench_start = Instant::now();
+
+        let chunks = self.insert_chunks();
         let mut tasks = Vec::new();
 
-        for _ in 0..self.concurrency {
+        for task_idx in 0..self.concurrency as usize {
+            let key_generator = self.build_generator(task_idx, &chunks);
+            let insert_target = match self.workload {
+                WorkloadPattern::Insert => Some(chunks[task_idx].end - chunks[task_idx].start),
+                _ => None,
+            };
             let mut task = BlobDbTask::new(
-                (*self.key_gen_supplier)(),
+                key_generator,
                 self.workload.clone(),
-                self.val_dist.clone(),
+                self.val_size_bytes,
                 self.write_options.clone(),
                 self.num_rows,
                 self.duration,
                 self.scan_width,
+                insert_target,
                 stats_recorder.clone(),
-                app_bytes_written.clone(),
                 self.db.clone(),
             );
             tasks.push(tokio::spawn(async move { task.run().await }));
@@ -227,11 +238,35 @@ impl BlobDbBench {
             task.await.unwrap();
         }
 
+        // Drain everything still buffered (WAL queue, memtables, pending blob
+        // packs) to object storage before sampling counters — otherwise the
+        // physical-byte counters lag behind `user_write_bytes` and write_amp
+        // comes out artificially low.
+        if let Err(e) = self
+            .db
+            .flush_with_options(slatedb::config::FlushOptions {
+                flush_type: slatedb::config::FlushType::MemTable,
+            })
+            .await
+        {
+            warn!("final flush before metrics read failed [error={}]", e);
+        }
+
         let elapsed_secs = bench_start.elapsed().as_secs_f64();
-        let app_bytes = app_bytes_written.load(Ordering::Relaxed);
-        let storage_bytes = compute_storage_bytes(self.object_store.clone(), &self.db_path).await;
-        let write_amp = if app_bytes > 0 {
-            storage_bytes as f64 / app_bytes as f64
+        let user_write_bytes = read_counter(&self.metrics_recorder, USER_WRITE_BYTES);
+        let wal_flush_bytes = read_counter(&self.metrics_recorder, WAL_FLUSH_BYTES);
+        let l0_flush_bytes = read_counter(&self.metrics_recorder, L0_FLUSH_BYTES);
+        let blob_flush_bytes = read_counter(&self.metrics_recorder, BLOB_FLUSH_BYTES);
+        let bytes_compacted = read_counter(&self.metrics_recorder, BYTES_COMPACTED);
+        // Total write amplification: all bytes written to object storage on the
+        // write path (WAL flushes + memtable→L0 flushes + blob pack uploads +
+        // compaction outputs) ÷ user-supplied key+value bytes accepted by the
+        // DB. The Python orchestrator may recompute this from the raw byte
+        // fields.
+        let physical_write_bytes =
+            wal_flush_bytes + l0_flush_bytes + blob_flush_bytes + bytes_compacted;
+        let write_amp = if user_write_bytes > 0 {
+            physical_write_bytes as f64 / user_write_bytes as f64
         } else {
             0.0
         };
@@ -263,15 +298,19 @@ impl BlobDbBench {
 
         let result = BlobDbResult {
             workload: self.workload.as_str().to_string(),
-            val_dist: self.val_dist.as_str().to_string(),
-            blob_enabled: self.blob_threshold > 0,
+            val_size_bytes: self.val_size_bytes,
+            blob_enabled: self.kv_sep,
             blob_threshold: self.blob_threshold,
             elapsed_secs,
             total_puts,
             total_gets,
             total_scans,
             total_puts_bytes,
-            s3_bytes_written: storage_bytes,
+            user_write_bytes,
+            wal_flush_bytes,
+            l0_flush_bytes,
+            blob_flush_bytes,
+            bytes_compacted,
             write_amp,
             write_ops_per_sec,
             write_mibps,
@@ -284,9 +323,9 @@ impl BlobDbBench {
         };
 
         info!(
-            "blob-db final [workload={}, val_dist={}, blob_threshold={}, elapsed={:.1}s, write_amp={:.3}x, puts={}, write_ops_per_sec={:.1}, write_mibps={:.3}, put_p50={}µs, put_p99={}µs, get_p50={}µs, get_p99={}µs]",
+            "blob-db final [workload={}, val_size_bytes={}, blob_threshold={}, elapsed={:.1}s, write_amp={:.3}x, puts={}, write_ops_per_sec={:.1}, write_mibps={:.3}, put_p50={}µs, put_p99={}µs, get_p50={}µs, get_p99={}µs]",
             result.workload,
-            result.val_dist,
+            result.val_size_bytes,
             result.blob_threshold,
             result.elapsed_secs,
             result.write_amp,
@@ -310,13 +349,16 @@ impl BlobDbBench {
 struct BlobDbTask {
     key_generator: Box<dyn KeyGenerator>,
     workload: WorkloadPattern,
-    val_dist: ValueDistribution,
+    val_size_bytes: usize,
     write_options: WriteOptions,
     num_rows: Option<u64>,
     duration: Option<Duration>,
     scan_width: usize,
+    /// If `Some`, the task terminates after this many puts, ignoring the
+    /// global `num_rows` and `duration` caps. Used for the load phase, where
+    /// each task owns a disjoint chunk and must write every key in it.
+    insert_target: Option<u64>,
     stats_recorder: Arc<BlobDbStatsRecorder>,
-    app_bytes_written: Arc<AtomicU64>,
     db: Arc<Db>,
 }
 
@@ -325,25 +367,25 @@ impl BlobDbTask {
     fn new(
         key_generator: Box<dyn KeyGenerator>,
         workload: WorkloadPattern,
-        val_dist: ValueDistribution,
+        val_size_bytes: usize,
         write_options: WriteOptions,
         num_rows: Option<u64>,
         duration: Option<Duration>,
         scan_width: usize,
+        insert_target: Option<u64>,
         stats_recorder: Arc<BlobDbStatsRecorder>,
-        app_bytes_written: Arc<AtomicU64>,
         db: Arc<Db>,
     ) -> Self {
         Self {
             key_generator,
             workload,
-            val_dist,
+            val_size_bytes,
             write_options,
             num_rows,
             duration,
             scan_width,
+            insert_target,
             stats_recorder,
-            app_bytes_written,
             db,
         }
     }
@@ -364,15 +406,28 @@ impl BlobDbTask {
         let mut get_latencies_us: Vec<u64> = Vec::new();
         let mut put_latencies_us: Vec<u64> = Vec::new();
 
-        while self.stats_recorder.puts() < num_rows && start.elapsed() < duration {
+        // Cumulative per-task put count for insert-mode termination. The
+        // `puts` counter above resets every flush, so we can't reuse it here.
+        let mut task_puts_done: u64 = 0;
+        let insert_target = self.insert_target;
+
+        loop {
+            let should_continue = if let Some(target) = insert_target {
+                task_puts_done < target
+            } else {
+                self.stats_recorder.puts() < num_rows && start.elapsed() < duration
+            };
+            if !should_continue {
+                break;
+            }
             let op_roll: u32 = rng.random_range(0..100);
 
             if op_roll < put_pct {
                 let key = match &self.workload {
-                    WorkloadPattern::UpdateHeavy => self.key_generator.used_key(),
-                    _ => self.key_generator.next_key(),
+                    WorkloadPattern::Insert => self.key_generator.next_key(),
+                    _ => self.key_generator.used_key(),
                 };
-                let val_len = self.val_dist.value_len(&mut rng);
+                let val_len = self.val_size_bytes;
                 let mut value = vec![0u8; val_len];
                 rng.fill_bytes(value.as_mut_slice());
 
@@ -385,14 +440,16 @@ impl BlobDbTask {
                     Ok(_) => {
                         let elapsed_us = op_start.elapsed().as_micros() as u64;
                         puts += 1;
+                        task_puts_done += 1;
                         puts_bytes += val_len as u64;
-                        self.app_bytes_written
-                            .fetch_add(val_len as u64, Ordering::Relaxed);
                         put_latencies_us.push(elapsed_us);
                     }
                     Err(e) => warn!("put failed [error={}]", e),
                 }
-            } else if matches!(self.workload, WorkloadPattern::RangeScan) {
+            } else if matches!(
+                self.workload,
+                WorkloadPattern::RangeMix | WorkloadPattern::RangeScan
+            ) {
                 let start_key = self.key_generator.used_key();
                 let scan_width = self.scan_width;
 
@@ -460,6 +517,21 @@ impl BlobDbTask {
                 get_latencies_us.clear();
                 put_latencies_us.clear();
             }
+        }
+
+        // Flush any remaining unreported counters so totals don't undercount
+        // the final partial window when the loop exits.
+        if puts > 0 || gets > 0 || scans > 0 {
+            self.stats_recorder.record(
+                Instant::now(),
+                puts,
+                gets,
+                scans,
+                puts_bytes,
+                gets_bytes,
+                &get_latencies_us,
+                &put_latencies_us,
+            );
         }
     }
 }
@@ -704,21 +776,15 @@ async fn dump_stats(stats: Arc<BlobDbStatsRecorder>) {
 // Write amplification helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn compute_storage_bytes(object_store: Arc<dyn ObjectStore>, path: &Path) -> u64 {
-    match object_store
-        .list(Some(path))
-        .try_fold(0u64, |acc, meta| async move {
-            Ok(acc + meta.size as u64)
+fn read_counter(recorder: &DefaultMetricsRecorder, name: &str) -> u64 {
+    let snapshot = recorder.snapshot();
+    snapshot
+        .by_name(name)
+        .into_iter()
+        .filter_map(|m| match m.value {
+            MetricValue::Counter(v) => Some(v),
+            _ => None,
         })
-        .await
-    {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            warn!(
-                "failed to list objects for write-amplification measurement [error={}]",
-                e
-            );
-            0
-        }
-    }
+        .sum()
 }
+

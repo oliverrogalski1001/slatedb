@@ -15,7 +15,7 @@ use slatedb::{
 };
 use tracing::info;
 
-use crate::blob_db::{ValueDistribution, WorkloadPattern};
+use crate::blob_db::WorkloadPattern;
 use crate::db::{FixedSetKeyGenerator, KeyGenerator, RandomKeyGenerator};
 
 #[derive(Parser, Clone)]
@@ -269,23 +269,29 @@ pub(crate) struct BenchmarkBlobDbArgs {
 
     #[arg(
         long,
-        help = "Workload: write-heavy | read-heavy | update-heavy | range-scan",
-        default_value = "write-heavy"
+        help = "Workload: insert | overwrite | update-heavy | range-mix | point-lookup | range-scan",
+        default_value = "overwrite"
     )]
     pub(crate) workload: String,
 
     #[arg(
-        long,
-        help = "Value distribution: small | large | mixed",
-        default_value = "small"
+        long = "val-size",
+        help = "Value size in bytes (uniform per put).",
+        default_value_t = 1024
     )]
-    pub(crate) val_dist: String,
+    pub(crate) val_size_bytes: usize,
 
-    /// 0 means blob storage disabled (baseline).
     #[arg(
         long,
-        help = "Blob threshold in bytes. 0 = baseline (no blob separation).",
-        default_value_t = 0
+        help = "Enable key-value separation (blob storage). When false, --blob-threshold is ignored.",
+        default_value_t = false
+    )]
+    pub(crate) kv_sep: bool,
+
+    #[arg(
+        long,
+        help = "Blob threshold in bytes. Only used when --kv-sep is set.",
+        default_value_t = 1024
     )]
     pub(crate) blob_threshold: usize,
 
@@ -305,34 +311,15 @@ pub(crate) struct BenchmarkBlobDbArgs {
 impl BenchmarkBlobDbArgs {
     pub(crate) fn workload_pattern(&self) -> WorkloadPattern {
         match self.workload.to_lowercase().replace('-', "_").as_str() {
-            "read_heavy" => WorkloadPattern::ReadHeavy,
+            "insert" => WorkloadPattern::Insert,
             "update_heavy" => WorkloadPattern::UpdateHeavy,
+            "range_mix" => WorkloadPattern::RangeMix,
+            "point_lookup" => WorkloadPattern::PointLookup,
             "range_scan" => WorkloadPattern::RangeScan,
-            _ => WorkloadPattern::WriteHeavy,
+            _ => WorkloadPattern::Overwrite,
         }
     }
 
-    pub(crate) fn value_distribution(&self) -> ValueDistribution {
-        match self.val_dist.to_lowercase().as_str() {
-            "large" => ValueDistribution::Large,
-            "mixed" => ValueDistribution::Mixed,
-            _ => ValueDistribution::Small,
-        }
-    }
-}
-
-impl KeyGeneratorSupplier for BenchmarkBlobDbArgs {
-    fn key_generator(&self) -> KeyGeneratorType {
-        KeyGeneratorType::FixedSet
-    }
-
-    fn key_len(&self) -> usize {
-        self.key_len
-    }
-
-    fn key_count(&self) -> u64 {
-        self.key_count
-    }
 }
 
 fn parse_isolation_level(s: &str) -> Result<IsolationLevel, String> {

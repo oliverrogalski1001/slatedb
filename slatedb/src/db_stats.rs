@@ -30,6 +30,7 @@ pub const SST_FILTER_POSITIVE_COUNT: &str = db_stat_name!("sst_filter_positive_c
 pub const SST_FILTER_NEGATIVE_COUNT: &str = db_stat_name!("sst_filter_negative_count");
 pub const USER_WRITE_BYTES: &str = db_stat_name!("user_write_bytes");
 pub const WAL_FLUSH_BYTES: &str = db_stat_name!("wal_flush_bytes");
+pub const BLOB_FLUSH_BYTES: &str = db_stat_name!("blob_flush_bytes");
 
 /// Label key distinguishing filter metrics for point lookups from those for
 /// prefix scans. Value is one of [`FILTER_KIND_POINT`] or
@@ -62,6 +63,7 @@ pub(crate) struct DbStatsInner {
     pub(crate) merge_operator_flush_operands: Arc<dyn CounterFn>,
     pub(crate) user_write_bytes: Arc<dyn CounterFn>,
     pub(crate) wal_flush_bytes: Arc<dyn CounterFn>,
+    pub(crate) blob_flush_bytes: Arc<dyn CounterFn>,
 }
 
 #[derive(Clone)]
@@ -139,6 +141,7 @@ impl DbStats {
                 .register(),
             user_write_bytes: recorder.counter(USER_WRITE_BYTES).register(),
             wal_flush_bytes: recorder.counter(WAL_FLUSH_BYTES).register(),
+            blob_flush_bytes: recorder.counter(BLOB_FLUSH_BYTES).register(),
         };
         DbStats {
             inner: Arc::new(inner),

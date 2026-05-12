@@ -157,6 +157,80 @@ impl KeyGenerator for FixedSetKeyGenerator {
     }
 }
 
+/// A key generator whose keys are a deterministic function of an integer index
+/// in `[0, key_count)`. The same index always produces the same key bytes, so
+/// separate bencher invocations (e.g. an insert phase followed by a read phase)
+/// can agree on the keyspace without sharing RNG state.
+///
+/// Two modes:
+/// - **Insert mode** (`insert_cursor = Some(range)`): `next_key` walks `range`
+///   sequentially and returns one key per index, in order. Used by the insert
+///   workload to populate `[0, key_count)` exactly once across all tasks.
+/// - **Sample mode** (`insert_cursor = None`): both `next_key` and `used_key`
+///   return `key_at(rng.gen_range(sample_range))`. Used by the measure
+///   workloads; every key is guaranteed to be present in the DB if the insert
+///   phase finished.
+pub struct RangeKeyGenerator {
+    key_len: usize,
+    sample_range: Range<u64>,
+    insert_cursor: Option<Range<u64>>,
+    rng: XorShiftRng,
+}
+
+impl RangeKeyGenerator {
+    /// Build a sample-mode generator that draws keys uniformly from
+    /// `[0, key_count)`. Use this for read/update/scan/write-heavy workloads
+    /// against a DB that was already populated with the same `key_count`.
+    pub fn sample(key_len: usize, key_count: u64) -> Self {
+        Self {
+            key_len,
+            sample_range: 0..key_count,
+            insert_cursor: None,
+            rng: XorShiftRng::from_os_rng(),
+        }
+    }
+
+    /// Build an insert-mode generator that walks `chunk` sequentially. Each
+    /// load task should get a disjoint chunk so the union covers
+    /// `[0, key_count)` exactly once.
+    pub fn insert(key_len: usize, chunk: Range<u64>) -> Self {
+        Self {
+            key_len,
+            sample_range: chunk.clone(),
+            insert_cursor: Some(chunk),
+            rng: XorShiftRng::from_os_rng(),
+        }
+    }
+
+    /// Deterministic key derivation. Same `idx` → same `key_len` bytes, in any
+    /// process, regardless of RNG seeding.
+    fn key_at(&self, idx: u64) -> Bytes {
+        let mut r = XorShiftRng::seed_from_u64(idx);
+        let mut bytes = vec![0u8; self.key_len];
+        r.fill_bytes(bytes.as_mut_slice());
+        Bytes::from(bytes)
+    }
+}
+
+impl KeyGenerator for RangeKeyGenerator {
+    fn next_key(&mut self) -> Bytes {
+        if let Some(cursor) = self.insert_cursor.as_mut() {
+            if let Some(idx) = cursor.next() {
+                return self.key_at(idx);
+            }
+            // Chunk exhausted; fall through to sample mode for any further calls.
+            self.insert_cursor = None;
+        }
+        let idx = self.rng.random_range(self.sample_range.clone());
+        self.key_at(idx)
+    }
+
+    fn used_key(&mut self) -> Bytes {
+        let idx = self.rng.random_range(self.sample_range.clone());
+        self.key_at(idx)
+    }
+}
+
 /// The database benchmarker.
 pub struct DbBench {
     key_gen_supplier: Box<dyn Fn() -> Box<dyn KeyGenerator>>,

@@ -349,6 +349,10 @@ impl<'a> PackAssembler<'a> {
             .zip(self.pack_buffers.into_iter().map(BytesMut::freeze))
             .map(move |(id, data)| {
                 let table_store = Arc::clone(&table_store);
+                self.db
+                    .db_stats
+                    .blob_flush_bytes
+                    .increment(data.len() as u64);
                 Ok::<_, SlateDBError>(async move { table_store.put_pack(id, data).await })
             });
 
